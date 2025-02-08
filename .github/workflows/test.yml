@@ -1,0 +1,34 @@
+name: Test
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - src/**
+      - test/**
+  pull_request:
+    branches:
+      - master
+    paths:
+      - src/**
+      - test/**
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Luau zip
+        uses: robinraju/release-downloader@v1.6
+        with:
+          repository: Roblox/luau
+          tag: "0.679"
+          fileName: luau-ubuntu.zip
+          out-file-path: bin
+
+      - name: Unzip Luau
+        run: unzip bin/luau-ubuntu.zip -d bin
+
+      - name: Run unit tests
+        run: bin/luau test/_runTests.luau
