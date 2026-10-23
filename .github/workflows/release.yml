@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Pack only; no GitHub release
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONPATH: python
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.MY_RELEASE_PLEASE_TOKEN || github.token }}
+
+      - name: Release PR or Release
+        id: release
+        uses: kohltastrophe/release@v1.0.0
+        with:
+          token: ${{ secrets.MY_RELEASE_PLEASE_TOKEN || github.token }}
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+      - name: Wait for CI
+        if: steps.release.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          empty=0
+          api_errors=0
+          while true; do
+            if ! RESULT=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA" \
+              --jq '.workflow_runs | sort_by(.run_number) | last | "\(.status // "none") \(.conclusion // "none")"'); then
+              api_errors=$((api_errors + 1))
+              if [ "$api_errors" -ge 8 ]; then
+                echo "::error::Failed to query CI workflow status after $api_errors consecutive gh api errors"
+                exit 1
+              fi
+              echo "gh api error ($api_errors/8); retrying in 15s..."
+              sleep 15
+              continue
+            fi
+            api_errors=0
+            STATUS="${RESULT%% *}"
+            CONCLUSION="${RESULT##* }"
+            echo "CI status=$STATUS conclusion=$CONCLUSION"
+            if [ "$STATUS" = "completed" ]; then
+              [ "$CONCLUSION" = "success" ] && exit 0
+              echo "::error::CI concluded '$CONCLUSION' for $GITHUB_SHA"
+              exit 1
+            elif [ "$STATUS" = "none" ]; then
+              empty=$((empty + 1))
+              if [ "$empty" -ge 8 ]; then
+                echo "::error::No CI workflow run found for $GITHUB_SHA after 2 minutes"
+                exit 1
+              fi
+            else
+              empty=0
+            fi
+            echo "CI not finished yet; waiting 15s..."
+            sleep 15
+          done
+
+      - name: Pack release
+        if: steps.release.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python3 -m sert release pack --out dist/
+          python3 -m sert release pack --out "$RUNNER_TEMP/again/"
+          for f in "sert-$VERSION.zip" "sert-$VERSION.pyz"; do
+            [ -f "dist/$f" ] || { echo "::error::pack did not write $f"; exit 1; }
+            cmp "dist/$f" "$RUNNER_TEMP/again/$f" || { echo "::error::$f is not reproducible"; exit 1; }
+          done
+          (
+            cd dist
+            [ -f SHA256SUMS ] || sha256sum "sert-$VERSION.zip" "sert-$VERSION.pyz" > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+            python3 "sert-$VERSION.pyz" --help > /dev/null
+            { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          )
+
+      - name: Create GitHub release
+        if: steps.release.outputs.should_release == 'true'
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          NOTES_FILE: ${{ steps.release.outputs.notes_file }}
+        run: |
+          sha256sum --check --strict SHA256SUMS
+          assets=("sert-$VERSION.zip" "sert-$VERSION.pyz" SHA256SUMS)
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --title "sert $VERSION" --notes-file "$NOTES_FILE"
+          elif [ "$PRERELEASE" = true ]; then
+            gh release create "$TAG" "${assets[@]}" --target "$GITHUB_SHA" --title "sert $VERSION" --notes-file "$NOTES_FILE" --prerelease
+          else
+            gh release create "$TAG" "${assets[@]}" --target "$GITHUB_SHA" --title "sert $VERSION" --notes-file "$NOTES_FILE"
+          fi

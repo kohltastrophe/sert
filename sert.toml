@@ -1,0 +1,47 @@
+# sert's own configuration: the toolkit tests itself with its own CLI (PYTHONPATH=python python3 -m sert ...).
+# The luau and luau-lsp pins equal LUAU and LUAU_LSP in python/sert/__init__.py and rokit.toml's luau-lsp (a unittest
+# checks); bump all three in sert.toml, python/sert/__init__.py, and rokit.toml.
+[tools]
+luau = "0.724"
+luau_lsp = "1.70.0"
+
+[test]
+entries = ["test/run.luau"]
+
+[coverage]
+include = ["src"]
+min = 90
+
+[mutate]
+include = ["src"]
+
+# Compile-time probes of the public types (run by `sert lint` or `sert lint --only types`): pass files analyze clean,
+# fail files error on exactly their `-- expect-error` lines, under both solvers.
+[types]
+pass = ["test/types"]
+fail = ["test/types/fail"]
+
+[studio]
+project = "test/roblox/default.project.json"
+config = "ReplicatedStorage/Tests/Config"
+specs = ["test/roblox/specs/**/*.spec.luau"]
+sides = ["server", "client", "overlap"]
+
+[lint]
+paths = ["src", "test"]
+project = "test/roblox/default.project.json"
+solvers = ["new", "old"]
+selene = true
+stub = false
+
+[release]
+prefix = "v"
+versions = [
+    { file = "python/sert/__init__.py", pattern = '^VERSION = "([^"]*)"' },
+    { file = "actions/setup/action.yml", pattern = '^\s*SERT_ACTION_VERSION: "([^"]*)"' },
+    { file = "actions/setup/action.yml", pattern = '^#.*uses: kohltastrophe/sert/actions/setup@v(\S+)' },
+    { file = "README.md", pattern = 'sert/v(\S+)/tools/sert\.py' },
+    { file = "README.md", pattern = 'actions/setup@v(\S+)' },
+    { file = "docs/ci.md", pattern = 'actions/setup@v(\S+)' },
+    { file = "docs/cli.md", pattern = '^version = "([^"]*)"' },
+]

@@ -6,3 +6,15 @@
 /*.rbxmx
 
 /sourcemap.json
+
+/.sert/
+/sert.local.toml
+/coverage.out
+/coverage.json
+/build/
+/dist/
+__pycache__/
+
+# plexer's local graph cache — regenerable, not committed (run `plexer build`).
+/plexer/
+/.claude/

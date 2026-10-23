@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONPATH: python
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  check:
+    name: Lint, Test, Coverage & Mutation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Conventional Commits and version check
+        uses: kohltastrophe/release@v1.0.0
+        with:
+          mode: check
+          pr-title: ${{ github.event.pull_request.title }}
+
+      - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+        with:
+          version: v1.2.0
+          cache: true
+
+      - name: Fetch tools and types
+        run: |
+          python3 -m sert fetch
+          echo "${{ github.workspace }}/.sert/bin" >> "$GITHUB_PATH"
+
+      - name: sert lint
+        run: |
+          python3 -m sert lint
+          python3 scripts/gen_api.py --check
+
+      - name: Python tests
+        run: python3 -m unittest discover -v python/tests
+
+      - name: sert run
+        run: python3 -m sert run --coverage --junit sert-junit.xml
+
+      - name: sert coverage
+        run: python3 -m sert coverage
+
+      - name: sert mutate
+        run: python3 -m sert mutate --no-coverage-run
+
+      - name: lute suite
+        run: lute run test/run.luau

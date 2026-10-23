@@ -1,210 +1,163 @@
-<h1 align="center">Simple and Expressive Roblox Testing</h1>
-<p align="center">Sert is a lightweight, easy-to-use testing framework for Roblox, designed for simplicity and clarity.</p>
+# sert
 
-## ✨ Key Features
+A testing and deterministic simulation toolkit for Luau and Roblox. Run unit tests, property tests, stateful models, and multi-server simulations in standalone Luau, Roblox Studio, or Open Cloud.
 
-- **Simple API:** Write tests with minimal boilerplate.
-- **Asynchronous Support:** Run tests concurrently; Promises are supported for asynchronous assertions.
-- **Lifecycle Hooks:** `beforeEach`, `afterEach`, and `after` hooks for setup and teardown.
-- **Focused and Skipped Tests:** Run only specific tests or skip others during development.
-- **Informative Output:** Clear, concise test results in the output.
-- **Global Variable Injection:** Mock services and control the test environment.
-- **Flexible Configuration:** Control asynchronous behavior globally or per-test module.
-- **No External Dependencies:** Sert is a single module – easy to install and manage.
+- **Assertions and Spies:** Write unit tests with value-returning assertions, `expect` matchers, and auto-restoring spies.
+- **Property Shrinking and Law Suites:** Generate adversarial inputs, boundary values, and command sequences with `sert.gen`, `sert.model`, and reusable contract suites (`laws.codec`, `laws.remote`, `laws.algebra`, `laws.differential`, `laws.ui`).
+- **Headless Roblox Environment:** Test `Instance` trees, UI container layouts (`UIListLayout`, `UIGridLayout`, `UIPadding`, `AutomaticSize`, `Layout.audit`), `RunService` frames, `TweenService`, input, `ProximityPrompt`, and DataStores on a virtual clock without launching Studio.
+- **VOPR Multi-Server Simulation:** Run multiple servers and clients on one deterministic scheduler with swarm fault matrices (`Sim.vopr`), remote packet drop/reorder/duplicate faults, TLA+-style state specs (`Sim.spec`), negative invariants (`never`), and trace refinement (`spec:verifyTrace`).
+- **Built-in CLI:** Run `sert check`, lint, execute tests with inline failure snippets, inspect diff-scoped coverage (`--uncovered`, `--diff`), and run mutation testing (`--diff`) from a single Python script.
 
-## ⏱️ Getting Started
+```luau
+local sert = require("@sert")
 
-### Installation
+sert.test("string.rep repeats", function()
+	sert.expect(string.rep("ab", 3)).toBe("ababab")
+end)
 
-#### 1. Copy the provided `src/init.luau` code into a new module named `Sert`.
+sert.prop("string.rep multiplies the length", function(g: sert.Gen)
+	local s, n = g:string(), g:int(0, 20)
+	sert.eq(#string.rep(s, n), #s * n)
+end)
 
-#### 2. Create a new Script (or LocalScript) and add:
-
-```lua
-local Sert = require "../Sert" -- Adjust path if needed
-local results = Sert.run("../Tests") -- Or the path containing your tests
+return {}
 ```
 
-### Writing tests
+## Install
 
-#### 1. **Create a module to test:** `Greeter`
+The `sert` CLI only requires Python 3.11 or newer. The `lint` command also uses `luau-lsp`, StyLua, and `rojo`, which you can install from `rokit.toml` with [rokit](https://github.com/rojo-rbx/rokit).
 
-```lua
-local Greeter = {}
-
-function Greeter:greet(person)
-	return "Hello, " .. person
-end
-
-return Greeter
+```sh
+curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.0/tools/sert.py
+python3 tools/sert.py init
+python3 tools/sert.py run
 ```
 
-#### 2. **Create a test module:** `Greeter.test`
+On Windows, download the stub with PowerShell and run `python` instead of `python3`.
 
-```lua
-local Greeter = require "../Greeter"
+```powershell
+mkdir -Force tools; iwr https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.0/tools/sert.py -OutFile tools/sert.py
+```
 
-return {
-	-- Optional: Configure test behaviour
-	_async = nil, -- true = force async, false = force sync, nil = use global setting
-	_focus = nil, -- true = hides tests that are not focused
-	_skip = nil, -- true = skips this test
+`tools/sert.py` is a small bootstrap script that you commit to your repository. It runs the `sert` version pinned in `sert.toml`.
 
-	-- Optional: Lifecycle hooks
-	after = function()
-		-- Cleanup after all tests
-	end,
-	afterEach = function()
-		-- Runs after each test
-	end,
-	beforeEach = function()
-		-- Runs before each test
-	end,
+Running `init` creates `sert.toml`, adds the `"sert": "./.sert/sert/src"` alias to `.luaurc`, updates `.gitignore`, and writes `test/Example.spec.luau`. Your first `run` downloads `sert` and `luau` into `.sert/`. See [docs/cli.md](docs/cli.md) for all commands and `sert.toml` options.
 
-	-- Test cases
-	["should include greeting"] = function()
-		local greeting = Greeter:greet("X")
-		assert(greeting:match("Hello"), "expected string to contain 'Hello', got " .. greeting)
-	end,
-	["should include name"] = function()
-		local greeting = Greeter:greet("Joe")
-		assert(greeting:match("Joe"), "expected string to contain 'Joe', got " .. greeting)
-	end,
-	["should fail"] = function()
-		error("Example error")
-	end,
-	["should skip"] = function()
-		return "SKIP"
-	end,
+## Your first test
+
+Spec files live under `test/` and end in `.spec.luau`. Each spec requires `@sert`, registers its tests, and ends with `return {}` because the Luau CLI requires modules to return a value.
+
+Here is a spec for a `src/Queue.luau` module with `new`, `push`, and `pop`:
+
+```luau
+local sert = require("@sert")
+local Queue = require("../src/Queue")
+
+sert.describe("queue", function()
+	sert.test("pops in push order", function()
+		local q = Queue.new()
+		q:push("a")
+		q:push("b")
+		sert.expect(q:pop()).toBe("a")
+		sert.expect(q:pop()).toBe("b")
+		sert.expect(q:pop()).toBeNil()
+	end)
+
+	sert.prop("pops what was pushed", function(g: sert.Gen)
+		local items = g:list(sert.gen.int(-100, 100))
+		g:note("items: %s", sert.format.repr(items))
+		local q = Queue.new()
+		for _, item in items do
+			q:push(item)
+		end
+		for _, item in items do
+			sert.eq(q:pop(), item)
+		end
+	end)
+end)
+
+return {}
+```
+
+Run your suite with `python3 tools/sert.py run`:
+
+```text
+sert · 2 tests · Luau CLI
+✅ queue > pops in push order · 0 ms
+✅ queue > pops what was pushed · 6 ms · 200 cases
+
+2 passed · 0 failed · 0 skipped · 6 ms
+```
+
+The property test ran 200 generated lists. If `pop` returned the last item instead of the first, both tests would fail and the property test would shrink the failing input to a two-item list:
+
+```text
+❌ queue > pops in push order · 0 ms
+   ⚠️ ./test/Queue.spec.luau:9: values differ: expected "a", got "b"
+❌ queue > pops what was pushed · 2 ms
+   ⚠️ property "queue > pops what was pushed" failed: ./test/Queue.spec.luau:22: values differ: expected 1, got 0
+   first failure: ./test/Queue.spec.luau:22: values differ: expected 69, got 94
+   seed: base 24301 · run 1 of 200 · case seed 3622492770
+   tape: 85 draws → 7 after shrinking (73 attempts): { 1, 0, 1, 1, 0, 0, 0 }
+   trace:
+      items: { 1, 0 }
+   replay: python3 tools/sert.py run --filter "queue > pops what was pushed" --replay=3622492770
+
+0 passed · 2 failed · 0 skipped · 2 ms
+.sert/run.luau: failed (exit 1, 0.1s)
+```
+
+The `tape:` line shows the internal random draws that produced the failure. Calling `g:note` prints your generated values under `trace:`. Copy the `replay:` command to rerun and shrink that exact failing case.
+
+You can filter tests by file path or by a case-insensitive name substring:
+
+```sh
+python3 tools/sert.py run test/Queue.spec.luau
+python3 tools/sert.py run --filter "push order"
+python3 tools/sert.py run --filter "queue > pops what was pushed" --replay=3622492770
+```
+
+`run` exits with `0` when all tests pass and `1` when any test fails. See [docs/cli.md](docs/cli.md#sert-run) for flags like `--fail-fast`, `--seed`, `--runs`, and `--list`.
+
+## Guides
+
+| Guide | What it covers |
+| --- | --- |
+| [docs/api.md](docs/api.md) | Assertions, `expect`, spies, hooks, properties, generators, models, laws, and `sert.run`. |
+| [docs/env.md](docs/env.md) | Headless DataModel testing with `sert.env`, virtual clocks, `RunService`, `TweenService`, input, and DataStores. |
+| [docs/sim.md](docs/sim.md) | Multi-server and multi-client VOPR simulation with `sert.sim`, swarm fault injection, `Sim.spec`, `Sim.vopr`, `Sim.prop`, `Sim.model`, and `Sim.explore`. |
+| [docs/roblox.md](docs/roblox.md) | Running specs in Roblox Studio and Open Cloud, plus the `Runner`, `Layout`, and `Flicker` helpers. |
+| [docs/cli.md](docs/cli.md) | CLI commands, flags, entry scripts, output markers, `sert.toml` configuration, and exit codes. |
+| [docs/ci.md](docs/ci.md) | GitHub Actions setup, caching, annotations, and Open Cloud secrets. |
+
+## Roblox
+
+Map `.sert/sert` into your Rojo project to use `sert` inside Roblox:
+
+```json
+"ReplicatedStorage": {
+	"sert": { "$path": ".sert/sert" }
 }
 ```
 
-#### Promises
+Then require it with `require(ReplicatedStorage.sert)`. Run `python3 tools/sert.py studio` to execute your suite in a local Roblox Studio session, or `python3 tools/sert.py cloud` to run it on Open Cloud Luau Execution. See [docs/roblox.md](docs/roblox.md) for setup details.
 
-Return a [promise](https://github.com/evaera/roblox-lua-promise) in your test and Sert will wait for it to resolve. If the promise is rejected, the test will fail.
+## CI
 
-For example, let's consider a promise with a fetchData function. We could test it with:
-
-```lua
-["the data is hello world"] = function()
-	return Promise.resolve()
-		:andThen(function()
-			local data = fetchData()
-			assert(data == "Hello world!", "expected 'Hello world!', got" .. greeting)
-		end)
-end,
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - run: python3 tools/sert.py run --coverage
+      - run: python3 tools/sert.py coverage --min 90
+      - run: python3 tools/sert.py lint
 ```
 
-### Test Output
+See [docs/ci.md](docs/ci.md) for action inputs, scheduled exhaustive runs, and Open Cloud setup.
 
-Sert provides detailed output including:
+## License
 
-- Test status (✅ pass, ❌ fail, or 🟡 skip)
-- Test execution time
-- Error messages for failed tests
-- Summary of total passed/failed/skipped tests
-
-Example output:
-
-```
-Test Results:
-Tests
-  Greeter.test  3 ms
-    ✅ should include greeting  2 ms
-    ✅ should include name      1 ms
-    ❌ should fail              0 ms
-      ⚠️ Example error
-    🟡 should skip              0 ms
-
-⚠️ Some tests failed! Check output for details. | 2 passed | 1 failed | 1 skipped
-```
-
-## ⚙️ Configuration
-
-### Async Behavior
-
-Tests run asynchronously by default. You can control this behavior:
-
-- **Globally:** In `Sert.run` set the `async` parameter to `false` to run tests synchronously by default
-- **Per Test:** Set `_async` in your test module return table:
-  - `_async = true`: Force async execution for this module
-  - `_async = false`: Force sync execution for this module
-  - `_async = nil`: Use global setting
-
-### Focus Behaviour
-
-Tests can be focused for debugging, **hiding other unfocused tests**:
-
-- **Per Test:** Set `_focus` to `true` in your test module return table
-
-### Skip Behaviour
-
-Tests can be skipped for debugging:
-
-- **Per Test Case:** Return `"SKIP"` in your test case
-- **Per Test:** Set `_skip` to `true` in your test module return table
-
-### Sert.run Parameters
-
-The `Sert.run` function accepts four parameters:
-
-```lua
-Sert.run(object: Instance | Set, globals: Set?, async: boolean?, silent: boolean?)
-```
-
-1. `object`: The `Instance` or `table` to test or search for test modules in (required)
-2. `globals`: A `table` of global variables to inject into test functions (optional)
-3. `async`: If `false`, runs tests synchronously, defaults to `true` (optional)
-4. `silent`: If `true`, suppresses console output and only returns results (optional)
-
-#### Using globals
-
-The `globals` parameter allows you to inject global variables into your test functions. This can be useful for mocking global services or providing test-specific utilities:
-
-```lua
-local Sert = require(script.Parent.Sert)
-
-local mockGlobals = {
-	game = {}, -- Mock game service
-	warn = function() end, -- Silent warning function
-	-- Add other global variables/functions
-}
-
-Sert.run(script.Parent.Tests, mockGlobals)
-```
-
-> [!WARNING]
-> Using `globals` can impact performance as it disables some Luau optimizations. Use it only when necessary.
-
-## 📁 File Organization
-
-### Recommended Structure
-
-```
-MyProject
-├─┬ TestRunner
-│ └── Sert
-├─┬ Modules
-│ ├── Greeter
-│ └── Greeter.test
-└─┬ Tests
-  └─┬ Features
-    ├── Login.test
-    └── Profile.test
-```
-
-- Tests can be placed alongside modules or organized in a dedicated test directory
-- Test modules must end with `.test`
-
-## ✍️ Best Practices
-
-- Use descriptive test names that explain the expected behavior
-- Make specific assertions that test one behavior at a time
-- Keep test modules close to the code they're testing
-- Focus and skip tests to speed up the debug process
-- Use lifecycle hooks to ensure proper cleanup between tests
-- Consider disabling async for tests that may have race conditions
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE.txt).
+MIT. See [LICENSE.txt](LICENSE.txt).

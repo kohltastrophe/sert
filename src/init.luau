@@ -1,400 +1,247 @@
-local scheduler = {}
-scheduler.__index = scheduler
+--!strict
+--[[
+Testing and deterministic simulation toolkit for Luau and Roblox.
 
-do
-	local FRAME_TIME = 2e-5
-	local tasks = {}
+Runs unit tests, property tests, stateful models, and multi-server simulations in standalone Luau, a headless
+DataModel (`[sert.env]`), Roblox Studio, or Open Cloud. Tests run sequentially in registration order on isolated
+coroutines.
 
-	local function step()
-		local now = os.clock()
-		for task, taskData in tasks do
-			if now >= taskData.wakeUpTime then
-				local status = coroutine.status(task)
-				if status == "suspended" then
-					taskData.wakeUpTime = math.huge
-					local ok, err = coroutine.resume(task, unpack(taskData.args))
-					if not ok then
-						print("Task error:", err)
-					end
-				elseif status == "dead" then
-					tasks[task] = nil
-				end
-			end
-		end
+```luau
+local sert = require("@sert")
 
-		local napEnd = os.clock() + FRAME_TIME
-		while os.clock() < napEnd do
-		end
-	end
+sert.test("math works", function()
+	sert(1 + 1 == 2, "addition")
+	sert.eq({ a = 1 }, { a = 1 }, "deep equality")
+	sert.near(0.1 + 0.2, 0.3)
+	sert.fails(function()
+		error("boom")
+	end, "boom")
+end)
 
-	function scheduler.spawn(func, ...)
-		local task = coroutine.create(func)
+sert.prop("reverse twice is the identity", function(g: sert.Gen)
+	local list = g:list(sert.gen.int(-5, 5))
+	sert.eq(reverse(reverse(list)), list)
+end, { runs = 200 })
 
-		tasks[task] = {
-			args = { ... },
-			wakeUpTime = 0,
-		}
+sert.check("abs is non-negative", { sert.gen.int(-100, 100) }, function(n)
+	sert(math.abs(n) >= 0)
+end)
 
-		return task
-	end
+return {}
+```
+]]
 
-	function scheduler.wait(seconds: number?): number
-		local startTime = os.clock()
-		local currentTask = coroutine.running()
-		local taskData = currentTask and tasks[currentTask]
+local assert = require("@self/core/assert")
+local bytes = require("@self/bytes")
+local doubles = require("@self/doubles")
+local env = require("@self/env")
+local expect = require("@self/core/expect")
+local format = require("@self/format")
+local gen = require("@self/gen")
+local laws = require("@self/laws")
+local model = require("@self/model")
+local prop = require("@self/prop")
+local registry = require("@self/core/registry")
+local rng = require("@self/rng")
+local roblox = require("@self/roblox")
+local runner = require("@self/core/runner")
+local sim = require("@self/sim")
 
-		local wakeUpTime = startTime + math.max(FRAME_TIME, seconds or 0)
-		if taskData then
-			taskData.wakeUpTime = wakeUpTime
-			coroutine.yield()
-		else
-			while os.clock() < wakeUpTime do
-				step()
-			end
-		end
-
-		return os.clock() - startTime
-	end
+-- cast: Roblox's definitions type `game` as a DataModel, which the old solver will not compare with nil
+local IS_ROBLOX = (game :: any) ~= nil
+if not IS_ROBLOX then
+	doubles.Datatypes.installGlobals()
+	doubles.Datatypes.installCallerGlobals()
+	registry.onRegister = doubles.Datatypes.installCallerGlobals
 end
 
-type List = { any }
-type Set = { [string]: any }
-type Closure = (...any) -> ...any
+export type RunOptions = registry.RunOptions
+export type PropOptions = registry.PropOptions
+export type TestOptions = registry.TestOptions
+export type Gen = prop.Gen
+export type PropResult = prop.PropResult
+export type Generator<T> = gen.Generator<T>
+export type ModelSpec = model.Spec
+export type ModelCommand = model.Command
+export type ModelOptions = model.Options
+export type CodecSpec<T = any, E = any> = laws.CodecSpec<T, E>
+export type ChunkSpec<T = any, C = any> = laws.ChunkSpec<T, C>
+export type OrderSpec<T = any> = laws.OrderSpec<T>
+export type RegistrySpec = laws.RegistrySpec
+export type RemoteSpec = laws.RemoteSpec
+export type AlgebraSpec<T = any> = laws.AlgebraSpec<T>
+export type DifferentialSpec<A = any, B = any> = laws.DifferentialSpec<A, B>
+export type UiSpec = laws.UiSpec
+export type ViewportPreset = laws.ViewportPreset
+export type Env = env.Env
+export type EnvNamespace = env.EnvNamespace
+export type EnvOptions = env.Options
+export type EnvHost = env.Host
+export type EnvInput = env.Input
+export type EnvKick = env.Kick
+export type SimWorld = sim.World
+export type SimWorldOptions = sim.WorldOptions
+export type SimServer = sim.Server
+export type SimClient = sim.Client
+export type SimScheduler = sim.Scheduler
+export type SimModelSpec = sim.ModelSpec
+export type SimModelCommand = sim.ModelCommand
+export type SimSpec = sim.Spec
+export type SimSpecDef = sim.SpecDef
+export type SimActionSpec = sim.ActionSpec
+export type SimTraceEntry = sim.TraceEntry
+export type SimSpecCheckOptions = sim.SpecCheckOptions
+export type SimSpecCheckResult = sim.SpecCheckResult
+export type RobloxConfig = roblox.Config
+export type RobloxContext = roblox.Context
+export type RobloxVerdict = roblox.Verdict
+export type SettleOptions = roblox.SettleOptions
+export type FlickerOptions = roblox.FlickerOptions
+export type FlickerResult = roblox.FlickerResult
+export type FloatOptions = gen.FloatOptions
+export type JsonOptions = format.JsonOptions
+export type Rng = rng.Rng
+export type Spy = registry.Spy
+export type Matchers = expect.Matchers
+export type Matcher = expect.Matcher
+export type MatcherResult = expect.MatcherResult
+export type Results = runner.Results
+export type Setup = registry.Setup
+export type Current = registry.Current
+export type EachOptions<T> = registry.EachOptions<T>
+export type DescribeOptions = registry.DescribeOptions
+export type Shard = registry.Shard
 
-local robloxTaskLibrary = task
-local warn = warn or print
-local task = task or scheduler
+local api = registry.api
+local checks = assert.api
+local output = registry.output
+local spy = registry.spy
 
-local Tasks = {}
-Tasks.__index = Tasks
+local sert = {
+	--[[ `true` inside Roblox and `false` under standalone Luau or Lute. ]]
+	isRoblox = IS_ROBLOX,
+	--[[ Roblox Studio and Open Cloud `Runner`, `Layout`, and `Flicker` helpers. ]]
+	roblox = roblox,
+	--[[ Standalone engine doubles (`Signal`, `Datatypes`, `Instance`, `DataStore`, `MemoryStore`, `HttpService`, `EncodingService`). ]]
+	doubles = doubles,
+	--[[ Composable property generators. ]]
+	gen = gen,
+	--[[ Seeded `xorshift32` random stream and FNV-1a hashing (`@sert/rng`). ]]
+	rng = rng,
+	--[[ Buffer hex formatting and byte equality assertions (`@sert/bytes`). ]]
+	bytes = bytes,
+	--[[ Luau value formatting (`repr`), structural diffing (`diff`), and JSON codecs (`json`, `jsonDecode`). ]]
+	format = format,
+	--[[ Headless Roblox DataModel, virtual clock sandbox, and runtime-adaptive datatypes and services (`new`, `active`, `current`, `configure`, `reset`, `install`, `getService`, `hooks`). ]]
+	env = env :: env.EnvNamespace,
+	--[[ Deterministic multi-server and multi-client simulator (`World`, `Scheduler`, `Runner`, `prop`, `model`, `vopr`, `spec`, `checkSpec`, `explore`). ]]
+	sim = sim,
 
-function Tasks.new(async: boolean?)
-	return setmetatable({ num = 0, async = async, main = async and coroutine.running(), running = {} }, Tasks)
-end
+	-- output
+	--[[ Prints values through the active test output sink so `quiet` and `capture` can intercept them. ]]
+	print = output.print,
+	--[[ Emits a warning through the active test output sink. ]]
+	warn = output.warn,
+	--[[ Runs `fn(...)` with `sert.print` and `sert.warn` output suppressed. ]]
+	quiet = output.quiet,
+	--[[ Runs `fn(...)` and returns the lines written to `sert.print` and `sert.warn`. ]]
+	capture = output.capture,
 
-function Tasks:run(label: string, callback: Closure, ...)
-	callback(...)
-	self:taskDone(label)
-end
+	-- assertions
+	--[[ Asserts deep equality between `v` and `expected` (honoring `__eq` on tables with metatables) and returns `v`. ]]
+	eq = checks.eq,
+	--[[ Asserts deep equality between `v` and `expected`, comparing raw fields of tables with metatables, and returns `v`. ]]
+	rawEq = checks.rawEq,
+	--[[ Asserts that `v` is not deep-equal to `unexpected` and returns `v`. ]]
+	neq = checks.neq,
+	--[[ Returns `true` when `a` and `b` are deep-equal under `sert.eq` without raising. ]]
+	equals = checks.equals,
+	--[[ Asserts that `v` and `expected` are within `eps` (default `1e-6`) component-wise and returns `v`. ]]
+	near = checks.near,
+	--[[ Asserts that `tostring(text)` contains the plain substring `fragment` and returns the string. ]]
+	contains = checks.contains,
+	--[[ Asserts that `tostring(text)` matches the Luau pattern `pattern` and returns the string. ]]
+	matches = checks.matches,
+	--[[ Asserts that `fn` raises an error (optionally matching `matcher`) and returns the error message. ]]
+	fails = checks.fails,
+	--[[ Steps up to `frames` frames (default `60`) until `done()` returns truthy. ]]
+	frames = checks.frames,
+	--[[ Polls `predicate()` until it returns truthy or `timeout` seconds pass (default `1`), returning the result. ]]
+	waitFor = checks.waitFor,
+	--[[ Wraps `value` in `[Matchers]` with `.never` negation. ]]
+	expect = expect.expect,
+	--[[ Adds custom matchers to `sert.expect`. ]]
+	extend = expect.extend,
 
-function Tasks:spawn(label: string, callback: Closure, ...)
-	self.num += 1
-	self.running[label] = true
-	local process = if self.async then task.spawn else pcall
-	local ok, err = process(Tasks.run, self, label, callback, ...)
-	if not ok then
-		warn(err)
-	end
-end
+	-- spies
+	--[[ Creates a callable `[Spy]`, optionally delegating to `impl`. ]]
+	fn = spy.fn,
+	--[[ Replaces `target[key]` with a `[Spy]` and restores it when the current test ends. ]]
+	spy = spy.spy,
 
-function Tasks:taskDone(label: string)
-	self.num -= 1
-	self.running[label] = nil
-	if (self.async or self.defer == label) and self.num == 0 then
-		coroutine.resume(self.main)
-	end
-end
+	-- registration
+	--[[ Registers a test case. ]]
+	test = api.test,
+	--[[ Registers a Roblox-only test case (skipped under standalone Luau and Lute). ]]
+	rtest = api.rtest,
+	--[[ Registers a skipped test case. ]]
+	skip = api.skip,
+	--[[ Registers a placeholder `todo` test entry. ]]
+	todo = api.todo,
+	--[[ Registers a focused test case. When any test is focused, unfocused tests are skipped. ]]
+	focus = api.focus,
+	--[[ Registers one test per entry in `cases`. ]]
+	each = api.each,
+	--[[ Registers a tape-shrinking property test, or runs it immediately inside a test. ]]
+	prop = api.prop,
+	--[[ Registers a property test drawing arguments from one generator or a list of generators. ]]
+	check = api.check,
+	--[[ Registers a stateful command-sequence model test. ]]
+	model = api.model,
+	--[[ Groups tests and hooks under a shared name prefix (`prefix > name`). ]]
+	describe = api.describe,
+	--[[ Runs `fn` once before the first selected test in the current `describe` block or file. ]]
+	beforeAll = api.beforeAll,
+	--[[ Runs `fn` once after the last selected test in the current `describe` block or file. ]]
+	afterAll = api.afterAll,
+	--[[ Runs `fn` before each selected test in the current `describe` block or file. ]]
+	beforeEach = api.beforeEach,
+	--[[ Runs `fn` after each selected test in the current `describe` block or file. ]]
+	afterEach = api.afterEach,
+	--[[ Sets global `beforeAll`, `afterAll`, `beforeEach`, and `afterEach` hooks across all spec files. ]]
+	setup = api.setup,
+	--[[ Returns `[Current]` metadata (`{ name, file, last }`) for the running test, or `nil` outside a test. ]]
+	current = api.current,
+	--[[ Queues `fn` to run in LIFO order when the current test (or file `afterAll`) finishes. ]]
+	defer = api.defer,
+	--[[ Runs `fn` against an isolated test registry and returns `pcall` results. ]]
+	isolate = api.isolate,
+	--[[ Raises any load error string returned by `require` under the Luau CLI, or returns the module. ]]
+	loaded = api.loaded,
 
-function Tasks:wait()
-	if (self.async or self.defer) and self.num > 0 then
-		if robloxTaskLibrary then
-			coroutine.yield()
-		else
-			while self.num > 0 do
-				task.wait()
-			end
-		end
-	end
-	table.clear(self.running)
-	table.clear(self)
-end
-
-function Tasks:watch(name: string)
-	local endTime = os.clock() + 1
-	while os.clock() < endTime do
-		task.wait()
-	end
-	while self.num and self.num > 0 do
-		print(`Waiting for {name}`)
-		for label in self.running do
-			print("  ⏳ " .. label)
-		end
-		endTime = os.clock() + 5
-		while os.clock() < endTime do
-			task.wait()
-		end
-	end
-end
-
-local FOCUS = table.freeze({ type = "FOCUS" })
-local SKIP = table.freeze({ type = "SKIP" })
-local TIME = table.freeze({ type = "TIME" })
-
-local reservedKeys = {
-	[FOCUS] = true,
-	[SKIP] = true,
-	[TIME] = true,
-
-	after = true,
-	afterEach = true,
-	beforeEach = true,
-	_async = true,
-	_focus = true,
-	_skip = true,
-	_name = true,
+	-- running
+	--[[ Runs registered tests with `[RunOptions]`, prints the report, and returns `[Results]`. ]]
+	run = runner.run,
+	--[[ Returns the active `[Shard]` (`_G.__SERT_SHARD`) under `sert cloud`, or `nil`. ]]
+	shard = runner.shard.get,
+	--[[ Returns `true` when test `name` belongs to the active cloud `[Shard]`. ]]
+	shardSelects = runner.shard.selects,
+	--[[ Parses CLI arguments (`...`) into `[RunOptions]`. ]]
+	parseCliArgs = runner.parseCliArgs,
 }
 
-local function isPromise(object: Set)
-	return type(object) == "table" and type(object.andThen) == "function" and type(object.awaitStatus) == "function"
-end
+-- annotated: the old solver leaves a field added after the table literal `any` otherwise
+local boundLaws: laws.Laws = laws.bind(sert)
+--[[ Reusable property contract suites (`codec`, `chunk`, `order`, `registry`). ]]
+sert.laws = boundLaws
+roblox.Runner.setDefaultSert(sert)
 
-local function runCase(key: string, case: Closure, test: Set, tasks: Set, results: Set)
-	if test.beforeEach then
-		local success, err = pcall(test.beforeEach)
-		if not success then
-			results.beforeEach = { _status = err }
-			return
-		end
-	end
-
-	local testStart = os.clock()
-	local ok, result = pcall(case)
-	if ok and isPromise(result) then
-		local status, rejection = result:awaitStatus()
-		if status == "Rejected" then
-			ok, result = false, rejection
-		end
-	end
-
-	results[key] = if result == "SKIP" then SKIP else { _status = ok or result, [TIME] = os.clock() - testStart }
-
-	if test.afterEach then
-		local success, err = pcall(test.afterEach)
-		if not success then
-			results.afterEach = { _status = err }
-			results[key] = nil
-		end
-	end
-end
-
-local function runTest(test: Set, name: string, globals: Set?, globalAsync: boolean): Set | string
-	if test.beforeEach and type(test.beforeEach) ~= "function" then
-		return `function expected for {name}.beforeEach, got {type(test.beforeEach)}`
-	end
-	if test.afterEach and type(test.afterEach) ~= "function" then
-		return `function expected for {name}.afterEach, got {type(test.afterEach)}`
-	end
-	if test.after and type(test.after) ~= "function" then
-		return `function expected for {name}.after, got {type(test.after)}`
-	end
-
-	local results = {}
-	local moduleStart = os.clock()
-	local tasks = Tasks.new(globalAsync and test._async ~= false)
-	task.spawn(tasks.watch, tasks, name)
-
-	for key, case in test do
-		if reservedKeys[key] then
-			continue
-		end
-		if test._skip then
-			results[key] = SKIP
-			continue
-		end
-		if type(case) ~= "function" then
-			results[key] = `{name} > {key}: function expected for test case, got {type(case)}`
-			continue
-		end
-		if globals then -- PERF: DISABLES LUAU OPTIMIZATIONS
-			setfenv(case, globals)
-		end
-		tasks:spawn(key, runCase, key, case, test, tasks, results)
-	end
-
-	tasks:wait()
-	results[TIME] = os.clock() - moduleStart
-
-	if test._focus then
-		results[FOCUS] = true
-	end
-
-	if test.after then
-		local success, err = pcall(test.after)
-		if not success then
-			results.after = { _status = err }
-		end
-	end
-
-	return results
-end
-
-local function getResult(results: Set, globals: Set?, async: boolean, name: string, ok: boolean, test: any, tasks: Set)
-	if test._focus or not results[FOCUS] then
-		results[name] = if ok then runTest(test, name, globals, async) else test
-	end
-	tasks:taskDone(name)
-end
-
-local function run(object: Instance & List & Set, results: Set, globals: Set?, async: boolean?, focus: boolean?): Set
-	local isInstance = typeof(object) == "Instance"
-	local isTable = typeof(object) == "table"
-	local name = if isInstance then object.Name elseif isTable then object._name or "Test" else "Test"
-	local tasks = Tasks.new(async)
-	local test
-
-	if isInstance and object:IsA("ModuleScript") and string.find(name, "%.test$") then
-		_, test = pcall(require, object)
-	elseif isTable then
-		for k, v in object :: Set do
-			if typeof(v) == "function" then
-				test = object
-				break
-			end
-		end
-	end
-
-	if test then
-		local isTest = typeof(test) == "table"
-		if isTest and test._focus then
-			focus = true
-			results[FOCUS] = true
-		end
-		tasks.num += 1
-		tasks.defer = name
-		tasks.running[name] = true
-		tasks.main = tasks.main or coroutine.running()
-		task.spawn(getResult, results, globals, async, name, isTest, test, tasks)
-	end
-
-	local childResults = { [FOCUS] = focus }
-	local children = if isInstance then object:GetChildren() elseif isTable then object else nil
-	if children then
-		for key, child in children do
-			if typeof(child) == "Instance" then
-				key = child.Name
-			elseif typeof(child) == "table" then
-				child._name = key
-			else
-				continue
-			end
-			tasks:spawn(key, run, child, childResults, globals, async, focus)
-		end
-	end
-	tasks:wait()
-
-	if next(childResults) then
-		local existing = results[name]
-		if type(existing) == "table" then
-			for k, v in childResults do
-				existing[k] = v
-			end
-		else
-			results[name] = childResults
-		end
-		if childResults[FOCUS] then
-			results[FOCUS] = true
-		end
-	end
-
-	return results
-end
-
-local function statusCount(results: Set): (number, number)
-	local passed, failed, skipped = 0, 0, 0
-
-	for _, value in results do
-		if value == SKIP then
-			skipped += 1
-			continue
-		end
-
-		if typeof(value) == "table" then
-			if value._status then
-				if value._status == true then
-					passed += 1
-				else
-					failed += 1
-				end
-			else
-				local a, b, c = statusCount(value)
-				passed += a
-				failed += b
-				skipped += c
-			end
-		elseif typeof(value) == "string" then
-			failed += 1
-		end
-	end
-
-	return passed, failed, skipped
-end
-
--- Sert API
-
-local Sert = { FOCUS = FOCUS, SKIP = SKIP, TIME = TIME, spawn = task.spawn, wait = task.wait }
-
-function Sert.formatResults(results: Set, lines: { string }, depth: number): string
-	local indent = string.rep(" ", depth * 2)
-	local maxLength = 0
-	for key in results do
-		maxLength = math.max(maxLength, #tostring(key))
-	end
-	maxLength += 2
-
-	for key, value in results do
-		if typeof(value) == "table" then
-			if value == SKIP then
-				table.insert(lines, `{indent}  🟡 {key}`)
-				continue
-			end
-
-			local elapsed = value[TIME]
-			local time = if elapsed then tostring(math.round(elapsed * 1000)) .. " ms" else ""
-			if value._status then
-				local ok = value._status == true
-				local status = if ok then "✅" else "❌"
-				local err = ok and "" or `\n{indent}    ⚠️ {value._status}`
-				local spacer = string.rep(" ", maxLength - #tostring(key))
-				table.insert(lines, `{indent}  {status} {key}{spacer}{time}{err}`)
-			else
-				table.insert(lines, `{indent}{key}  {time}\n{Sert.formatResults(value, {}, depth + 1)}`)
-			end
-		elseif typeof(value) == "string" then
-			table.insert(lines, `{indent}❌ {key}\n  {indent}⚠️ {value}`)
-		end
-	end
-
-	table.sort(lines)
-
-	return table.concat(lines, "\n")
-end
-
-function Sert.run(tests: Instance | List | Set, globals: Set?, async: boolean?, silent: boolean?): Set
-	if not silent then
-		print("Running Tests...")
-	end
-
-	local results = if typeof(tests) == "Instance" or typeof(tests) == "table"
-		then run(tests :: any, {}, globals, if async == false then false else true)
-		else SKIP
-
-	local passed, failed, skipped = statusCount(results)
-	results.PASSED, results.FAILED, results.SKIPPED = passed, failed, skipped
-
-	if silent then
-		return results
-	end
-
-	print("Test Results:\n" .. Sert.formatResults(results, {}, 0))
-
-	local status = ` | {passed} passed | {failed} failed | {skipped} skipped`
-	if failed > 0 then
-		warn("⚠️ Some tests failed! Check output for details." .. status)
-	else
-		print("✅ All tests passed!" .. status)
-	end
-
-	return results
-end
-
-return Sert
+--[[
+Asserts that `condition` is truthy (`not nil` and `not false`) and returns `condition`.
+]]
+return setmetatable(sert, {
+	__call = function(_, condition: any, why: string?): any
+		if not condition then error(why or "expected condition to be true", 2) end
+		return condition
+	end,
+})
