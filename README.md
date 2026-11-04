@@ -1,5 +1,7 @@
 # sert
 
+[![CI](https://img.shields.io/github/actions/workflow/status/kohltastrophe/sert/ci.yml?style=for-the-badge)](https://github.com/kohltastrophe/sert/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kohltastrophe/sert/badges/coverage.json&style=for-the-badge)](https://github.com/kohltastrophe/sert/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/kohltastrophe/sert?style=for-the-badge)](LICENSE.txt) [![GitHub Release](https://img.shields.io/github/v/release/kohltastrophe/sert?style=for-the-badge)](https://github.com/kohltastrophe/sert/releases)
+
 A testing and deterministic simulation toolkit for Luau and Roblox. Run unit tests, property tests, stateful models, and multi-server simulations in standalone Luau, Roblox Studio, or Open Cloud.
 
 - **Assertions and Spies:** Write unit tests with value-returning assertions, `expect` matchers, and auto-restoring spies.

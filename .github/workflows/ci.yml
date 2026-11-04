@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -62,10 +62,14 @@ jobs:
         run: python3 -m sert run --coverage --junit sert-junit.xml
 
       - name: sert coverage
-        run: python3 -m sert coverage
+        run: python3 -m sert coverage --badge
 
       - name: sert mutate
         run: python3 -m sert mutate --no-coverage-run
 
       - name: lute suite
         run: lute run test/run.luau
+
+      - name: Update coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: python3 -m sert coverage --badge-branch --badge-push
