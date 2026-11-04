@@ -452,7 +452,9 @@ api.model = (
 				error(`sert.model("{name}"): expected a spec table, got {typeof(spec)}`, 2)
 			end
 			checkOptions("model", name, opts, MODEL_OPTIONS)
-			registry.define("prop", name, model.property(spec, opts), model.propOptions(opts))
+			local propOpts = model.propOptions(opts)
+			if propOpts.runs == nil then propOpts.runs = 50 end
+			registry.define("prop", name, model.property(spec, opts), propOpts)
 		end,
 	}) :: any
 ) :: ModelApi

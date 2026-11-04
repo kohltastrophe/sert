@@ -310,18 +310,40 @@ class Lint:
     def say(self, message: str) -> None:
         print(message, flush=True)
 
-    def command(self, name: str, argv: list[str]) -> None:
+    def _run_command(self, make_argv) -> tuple[list[str], subprocess.CompletedProcess | None, Exception | None]:
+        try:
+            argv = make_argv()
+        except Exception as err:
+            return [], None, err
+        if self.dry_run:
+            return argv, None, None
+        try:
+            res = subprocess.run(argv, cwd=self.cfg.root, timeout=300, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            return argv, res, None
+        except (OSError, subprocess.TimeoutExpired) as err:
+            return argv, None, err
+
+    def _finish_command(self, name: str, argv: list[str], res: subprocess.CompletedProcess | None, err: Exception | None) -> None:
+        if isinstance(err, Exception) and not isinstance(err, (OSError, subprocess.TimeoutExpired)):
+            raise err
         self.say("$ " + " ".join(argv))
         if self.dry_run:
             return
-        try:
-            result = subprocess.run(argv, cwd=self.cfg.root, timeout=300)
-        except (OSError, subprocess.TimeoutExpired) as err:
+        if err is not None:
             note(f"{name}: {err}")
             self.failed.append(name)
             return
-        if result.returncode != 0 and name not in self.failed:
-            self.failed.append(name)
+        if res is not None:
+            if res.stdout:
+                print(res.stdout, end="" if res.stdout.endswith("\n") else "\n", flush=True)
+            if res.stderr:
+                print(res.stderr, end="" if res.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            if res.returncode != 0 and name not in self.failed:
+                self.failed.append(name)
+
+    def command(self, name: str, argv: list[str]) -> None:
+        _, res, err = self._run_command(lambda: argv)
+        self._finish_command(name, argv, res, err)
 
     def fail(self, name: str, message: str, file: str | None = None, line: int | None = None) -> None:
         print(f"error: {message}", file=sys.stderr, flush=True)
@@ -333,6 +355,8 @@ class Lint:
         return (name in self.only and name not in self.skip) if self.only else (name not in self.skip)
 
     def run(self) -> int:
+        from concurrent.futures import ThreadPoolExecutor
+
         cfg, table = self.cfg, self.cfg.table("lint")
         paths = [str(p) for p in as_list(table.get("paths", ["src"]))]
         from sert import fetch
@@ -348,39 +372,58 @@ class Lint:
                 defs = fetch.types_path(cfg.root) if self.dry_run else fetch.ensure_types(cfg)
             return defs
 
-        with Workspace(cfg, dry_run=self.dry_run) as ws:
-            need_sourcemap = self.wants("sourcemap") or ((self.wants("analyze") or (self.wants("types") and bool(cfg.get("types")))) and "sourcemap" not in self.skip)
-            if need_sourcemap:
-                command, ok = ws.build_sourcemap()
-                if command:
-                    self.say("$ " + " ".join(command))
-                if not ok:
-                    self.fail("sourcemap", "rojo sourcemap failed")
-            if self.wants("analyze"):
-                for group in analyze_groups(cfg):
-                    self.analyze(ws, group, get_defs() if group.get("defs", True) else None)
-            if self.wants("types"):
-                if not cfg.get("types"):
-                    if self.only and "types" in self.only:
-                        raise SertError("sert.toml: no [types] table")
-                elif check_types(cfg, ws, get_defs(), out=self.say) != 0:
-                    self.failed.append("types")
-        if self.wants("registration"):
-            for entry in as_list(table.get("registration")):
-                for file, problem in registration_findings(cfg.root, entry):
+        want_reg = self.wants("registration")
+        want_stylua = self.wants("stylua") and table.get("stylua", True)
+        want_selene = self.wants("selene") and table.get("selene", (cfg.root / "selene.toml").is_file())
+        want_extra = self.wants("extra")
+        want_stub = self.wants("stub") and table.get("stub", True)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            reg_fut = pool.submit(
+                lambda: [(file, problem) for entry in as_list(table.get("registration")) for file, problem in registration_findings(cfg.root, entry)]
+            ) if (want_reg and not self.dry_run) else None
+            stylua_fut = pool.submit(self._run_command, lambda: [self.tool("stylua"), "--check", *paths]) if want_stylua else None
+            selene_fut = pool.submit(self._run_command, lambda: [self.tool("selene"), *paths]) if want_selene else None
+            extra_futs = [
+                (f"extra: {' '.join(argv)}", pool.submit(self._run_command, lambda a=argv: a))
+                for raw in (as_list(table.get("extra")) if want_extra else [])
+                for argv in [[str(a) for a in as_list(raw)]]
+            ]
+            stub_fut = pool.submit(stub_problem, cfg.root) if (want_stub and not self.dry_run) else None
+
+            with Workspace(cfg, dry_run=self.dry_run) as ws:
+                need_sourcemap = self.wants("sourcemap") or ((self.wants("analyze") or (self.wants("types") and bool(cfg.get("types")))) and "sourcemap" not in self.skip)
+                if need_sourcemap:
+                    command, ok = ws.build_sourcemap()
+                    if command:
+                        self.say("$ " + " ".join(command))
+                    if not ok:
+                        self.fail("sourcemap", "rojo sourcemap failed")
+                if self.wants("analyze"):
+                    for group in analyze_groups(cfg):
+                        self.analyze(ws, group, get_defs() if group.get("defs", True) else None)
+                if self.wants("types"):
+                    if not cfg.get("types"):
+                        if self.only and "types" in self.only:
+                            raise SertError("sert.toml: no [types] table")
+                    elif check_types(cfg, ws, get_defs(), out=self.say) != 0:
+                        self.failed.append("types")
+            if want_reg:
+                findings = reg_fut.result() if reg_fut is not None else [
+                    (file, problem) for entry in as_list(table.get("registration")) for file, problem in registration_findings(cfg.root, entry)
+                ]
+                for file, problem in findings:
                     self.fail("registration", problem, file=file)
-        if self.wants("stylua") and table.get("stylua", True):
-            self.command("stylua", [self.tool("stylua"), "--check", *paths])
-        if self.wants("selene") and table.get("selene", (cfg.root / "selene.toml").is_file()):
-            self.command("selene", [self.tool("selene"), *paths])
-        if self.wants("extra"):
-            for argv in as_list(table.get("extra")):
-                argv = [str(a) for a in as_list(argv)]
-                self.command(f"extra: {' '.join(argv)}", argv)
-        if self.wants("stub") and table.get("stub", True):
-            self.say("$ compare tools/sert.py with the shipped stub")
-            if not self.dry_run and (problem := stub_problem(cfg.root)):
-                self.fail("stub", problem)
+            if stylua_fut is not None:
+                self._finish_command("stylua", *stylua_fut.result())
+            if selene_fut is not None:
+                self._finish_command("selene", *selene_fut.result())
+            for extra_name, fut in extra_futs:
+                self._finish_command(extra_name, *fut.result())
+            if want_stub:
+                self.say("$ compare tools/sert.py with the shipped stub")
+                if not self.dry_run and (problem := (stub_fut.result() if stub_fut is not None else stub_problem(cfg.root))):
+                    self.fail("stub", problem)
         if self.dry_run:
             return 0
         if self.failed:

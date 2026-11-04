@@ -69,7 +69,7 @@ export type Scheduler = {
 	cancel: (self: Scheduler, thread: thread) -> (),
 	crash: (self: Scheduler, owner: any) -> (),
 	crashed: (self: Scheduler, owner: any) -> boolean,
-	onFrame: (self: Scheduler, fn: (dt: number) -> (), owner: any) -> () -> (),
+	onFrame: (self: Scheduler, fn: (dt: number) -> (), owner: any, fast: boolean?) -> () -> (),
 	drain: (self: Scheduler) -> (),
 	frame: (self: Scheduler, dt: number?) -> number,
 	runFor: (self: Scheduler, seconds: number) -> (),
@@ -99,7 +99,7 @@ type Deferred = {
 	depth: number,
 	cancelled: boolean,
 }
-type Hook = { fn: (dt: number) -> (), owner: any, active: boolean }
+type Hook = { fn: (dt: number) -> (), owner: any, active: boolean, fast: boolean? }
 
 type State = {
 	now: number,
@@ -515,8 +515,8 @@ end
 
 function Scheduler.crashed(s: State, owner: any): boolean return s.dead[keyOf(owner)] == true end
 
-function Scheduler.onFrame(s: State, fn: (dt: number) -> (), owner: any): () -> ()
-	local hook: Hook = { fn = fn, owner = keyOf(owner), active = true }
+function Scheduler.onFrame(s: State, fn: (dt: number) -> (), owner: any, fast: boolean?): () -> ()
+	local hook: Hook = { fn = fn, owner = keyOf(owner), active = true, fast = fast }
 	table.insert(s.hooks, hook)
 	return function()
 		hook.active = false
@@ -602,7 +602,24 @@ function Scheduler.frame(s: State, dt: number?): number
 		local hooks = table.clone(s.hooks)
 		if s.random then permute(s, hooks, 1, #hooks, "hooks") end
 		for _, hook in hooks do
-			if hook.active then resume(s, coroutine.create(hook.fn), hook.owner, nextSeq(s), step) end
+			if hook.active then
+				if hook.fast then
+					local owner = hook.owner
+					local tag = nextSeq(s)
+					if not s.dead[owner] then
+						foldInt(s, 114, tag)
+						local previous = s.current
+						s.current = ownerOf(owner)
+						s.depth += 1
+						hook.fn(step)
+						s.depth -= 1
+						s.current = previous
+						if s.depth == 0 then drain(s) end
+					end
+				else
+					resume(s, coroutine.create(hook.fn), hook.owner, nextSeq(s), step)
+				end
+			end
 		end
 	end
 	drain(s)

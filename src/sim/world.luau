@@ -398,7 +398,7 @@ function World.new(options: Options?, class: any?): any
 					end
 				end
 			end
-		end, nil)
+		end, nil, true)
 	end
 	s:trace(`world {mode} faults={name}`)
 	return w
@@ -1306,7 +1306,7 @@ function World.server(w: any, options: { [string]: any }?): any
 		MessagingService = w.messaging:facade(server),
 	}
 	if not w.instant and not w.coarse then
-		server.stopFrame = s:onFrame(function(dt: number) RunService.step(server.run, dt, s.now) end, server)
+		server.stopFrame = s:onFrame(function(dt: number) RunService.step(server.run, dt, s.now) end, server, true)
 	end
 	if slot ~= nil and w.servers[slot] ~= nil and w.servers[slot].state ~= "up" then
 		w.servers[slot] = server

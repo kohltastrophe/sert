@@ -305,7 +305,8 @@ function model.property(rawSpec: Spec, options: Options?): (Gen) -> ()
 					return false
 				end
 				index += 1
-				stepGen:note("{ %q, %s },", command.name :: string, format.repr(arg))
+				local cmdName = command.name :: string
+				stepGen:note(function() return string.format("{ %q, %s },", cmdName, format.repr(arg)) end)
 				state = execute(spec, neverKeys, invKeys, command, sut, state, arg, index)
 				return true
 			end, 0, length)

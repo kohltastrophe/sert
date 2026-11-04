@@ -275,7 +275,7 @@ class RunReportTest(Case):
     def test_junit_json_markers_and_selection_flags(self):
         root = self.runner_project()
         code, out, err = self.sert("run", "--root", root, "--junit", "out/junit.xml", "--json-out", "out/r.json")
-        self.assertEqual((code, (root / "args.txt").read_text().strip()), (1, "a.luau -a --markers"), err)
+        self.assertEqual((code, (root / "args.txt").read_text().strip()), (1, "--codegen a.luau -a --markers"), err)
         self.assertTrue("plain output line" in out and "[sert-test]" not in out)
         tree = ElementTree.parse(root / "out/junit.xml").getroot()
         self.assertEqual((tree.tag, tree.get("tests"), tree.get("failures"), tree.get("skipped")), ("testsuites", "3", "1", "1"))
@@ -292,7 +292,7 @@ class RunReportTest(Case):
         self.sert("run", "--root", root, "--filter", "a b", "-x", "--list", "--exhaustive", "--seed", "random",
                   "--runs", "3", "--replay=7", "--budget", "1.5", "-a", "--test-timeout=5")
         self.assertEqual((root / "args.txt").read_text().strip(),
-                         "a.luau -a --filter=a b --fail-fast --list --exhaustive --seed=random --runs=3 --replay=7 --budget=1.5 --test-timeout=5 --markers")
+                         "--codegen a.luau -a --filter=a b --fail-fast --list --exhaustive --seed=random --runs=3 --replay=7 --budget=1.5 --test-timeout=5 --markers")
         for argv in (["--seed", "soon"], ["--filter", "a", "--filter", "b"]):
             with self.assertRaises(SystemExit) as raised, contextlib.redirect_stderr(io.StringIO()):
                 cli.main(["run", "--root", str(root), *argv])

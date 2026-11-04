@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import io
 from pathlib import Path
+import sys
 
 from sert import config as config_mod, coverage, lint, run, studio
 
@@ -32,16 +36,7 @@ if not hasattr(studio, "cmd_studio"):
     studio.cmd_studio = _default_cmd_studio  # type: ignore[attr-defined]
 
 
-def cmd_check(args, root: Path | None = None, cfg: dict | None = None) -> int:
-    if cfg is None:
-        cfg = config_mod.from_args(args)
-    if root is None:
-        root = getattr(cfg, "root", None) or config_mod.find_root(getattr(args, "root", None))
-
-    code = int(lint.cmd_lint(args, root, cfg) or 0)
-    if code != 0:
-        return code
-
+def _build_run_args(args, root: Path | None) -> argparse.Namespace:
     run_args = argparse.Namespace(**(vars(args) if hasattr(args, "__dict__") else {}))
     run_args.coverage = True
     run_args.compact = bool(getattr(args, "compact", False))
@@ -67,10 +62,49 @@ def cmd_check(args, root: Path | None = None, cfg: dict | None = None) -> int:
             setattr(run_args, attr, default)
     if getattr(run_args, "root", None) is None and root is not None:
         run_args.root = str(root)
+    return run_args
 
-    code = int(run.cmd_run(run_args, root, cfg) or 0)
-    if code != 0:
-        return code
+
+def cmd_check(args, root: Path | None = None, cfg: dict | None = None) -> int:
+    if cfg is None:
+        cfg = config_mod.from_args(args)
+    if root is None:
+        root = getattr(cfg, "root", None) or config_mod.find_root(getattr(args, "root", None))
+
+    run_args = _build_run_args(args, root)
+    can_parallel = (
+        lint.cmd_lint is _default_cmd_lint
+        and getattr(run.cmd_run, "__module__", "") == "sert.run"
+        and not bool(getattr(args, "dry_run", False))
+    )
+    if can_parallel:
+        run_out, run_err = io.StringIO(), io.StringIO()
+
+        def _run_buffered() -> int:
+            with contextlib.redirect_stdout(run_out), contextlib.redirect_stderr(run_err):
+                return int(run.cmd_run(run_args, root, cfg) or 0)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            lint_fut = pool.submit(lint.cmd_lint, args, root, cfg)
+            run_fut = pool.submit(_run_buffered)
+            lint_code = int(lint_fut.result() or 0)
+            if lint_code != 0:
+                run_fut.cancel()
+                return lint_code
+            code = int(run_fut.result() or 0)
+        if run_out.getvalue():
+            sys.stdout.write(run_out.getvalue())
+        if run_err.getvalue():
+            sys.stderr.write(run_err.getvalue())
+        if code != 0:
+            return code
+    else:
+        code = int(lint.cmd_lint(args, root, cfg) or 0)
+        if code != 0:
+            return code
+        code = int(run.cmd_run(run_args, root, cfg) or 0)
+        if code != 0:
+            return code
 
     cov_args = argparse.Namespace(**(vars(args) if hasattr(args, "__dict__") else {}))
     cov_args.diff = getattr(args, "diff", None)

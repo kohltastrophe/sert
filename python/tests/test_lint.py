@@ -197,7 +197,7 @@ class CoverageVersionRunTest(ToolCase):
             "if 'slow' in args: time.sleep(5)\n",
         )
         code, _, err = self.sert("run", "--root", root, "-a", "--filter", "x")
-        self.assertEqual((code, (root / "args.txt").read_text().strip(), "$ " in err), (0, "a.luau -a --filter x --markers", False))
+        self.assertEqual((code, (root / "args.txt").read_text().strip(), "$ " in err), (0, "--codegen a.luau -a --filter x --markers", False))
         self.assertEqual(self.sert("run", "--root", root, "-a", "fail")[0], 1)
         self.assertEqual(self.sert("run", "--root", root, "--timeout", "0.3", "-a", "slow")[0], 3)
         self.assertEqual(self.sert("run", "--root", root, "--entry", "missing.luau")[0], 2)

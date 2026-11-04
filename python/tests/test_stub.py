@@ -64,10 +64,10 @@ class StubTest(Case):
             (release / "SHA256SUMS").unlink()
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(ReleaseHandler, directory=str(server_dir)))
         server.latest = latest
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        return {"SERT_GITHUB_URL": f"http://127.0.0.1:{server.server_port}", "SERT_CACHE": str(self.tmp / "cache")}
+        return {"SERT_GITHUB_URL": f"http://127.0.0.1:{server.server_port}", "SERT_CACHE": str(self.tmp / "cache"), "SERT_RETRY_DELAY": "0"}
 
     def test_stub_constraints_sources_and_toml_errors(self):
         text = (REPO / "tools/sert.py").read_text()

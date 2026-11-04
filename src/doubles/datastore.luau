@@ -6,7 +6,6 @@
 
 local Datatypes = require("./datatypes")
 local Rng = require("../rng")
-local format = require("../format")
 local util = require("../util")
 
 local deepCopy = util.copy
@@ -139,21 +138,43 @@ local function checkKey(key: any)
 	end
 end
 
--- Raises the engine's error for the first part of `value` a data store can't hold.
-local function checkValue(value: any, seen: { [any]: boolean })
+local function quotedJsonLen(text: string): number
+	if string.find(text, '[%c"\\]') == nil then return #text + 2 end
+	local extra = 2
+	for i = 1, #text do
+		local b = string.byte(text, i)
+		if b == 34 or b == 92 or b == 8 or b == 9 or b == 10 or b == 12 or b == 13 then
+			extra += 1
+		elseif b < 32 or b == 127 then
+			extra += 5
+		end
+	end
+	return #text + extra
+end
+
+-- Raises the engine's error for the first part of `value` a data store can't hold and computes its JSON byte size.
+local function checkValue(value: any, seen: { [any]: boolean }, depth: number): (number, boolean)
+	local tooDeep = depth > 100
 	local kind = type(value)
-	if kind == "nil" or kind == "boolean" or kind == "buffer" then
-		return
+	if kind == "nil" then
+		return 4, tooDeep
+	elseif kind == "boolean" then
+		return if value then 4 else 5, tooDeep
+	elseif kind == "buffer" then
+		return 35 + 4 * math.ceil(buffer.len(value) / 3), tooDeep
 	elseif kind == "number" then
 		if value ~= value or value == math.huge or value == -math.huge then
 			error("104: Cannot store NaN or infinity in data store.", 0)
 		end
-		return
+		local numLen = if value % 1 == 0 and math.abs(value) < 2 ^ 53
+			then #string.format("%d", value)
+			else #tostring(value)
+		return numLen, tooDeep
 	elseif kind == "string" then
 		if utf8.len(value) == nil then
 			error("104: Cannot store string in data store. Data stores can only accept valid UTF-8 characters.", 0)
 		end
-		return
+		return quotedJsonLen(value), tooDeep
 	elseif kind ~= "table" then
 		error(`103: {Datatypes.typeof(value)} is not allowed in data stores.`, 0)
 	end
@@ -166,7 +187,8 @@ local function checkValue(value: any, seen: { [any]: boolean })
 		error("104: Cannot store cyclic tables in data store.", 0)
 	end
 	seen[value] = true
-	local count, strings = 0, 0
+	local count, strings, totalBytes = 0, 0, 2
+	local nextDepth = depth + 1
 	for key, item in value do
 		count += 1
 		if type(key) == "string" then
@@ -177,32 +199,30 @@ local function checkValue(value: any, seen: { [any]: boolean })
 					0
 				)
 			end
+			totalBytes += quotedJsonLen(key) + 1
 		elseif type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
 			error(`104: Cannot store a table with {Datatypes.typeof(key)} keys in data store.`, 0)
 		end
-		checkValue(item, seen)
+		local itemBytes, childDeep = checkValue(item, seen, nextDepth)
+		totalBytes += itemBytes
+		if childDeep then tooDeep = true end
 	end
 	if strings > 0 and strings < count then
 		error("104: Cannot store mixed tables in data store.", 0)
 	elseif strings == 0 and count ~= #value then
 		error("104: Cannot store arrays with holes in data store.", 0)
 	end
+	if count > 1 then
+		totalBytes += count - 1
+	end
 	seen[value] = nil
+	return totalBytes, tooDeep
 end
-
-local SIZE_JSON: format.JsonOptions = {
-	strict = true,
-	prefix = "104: Cannot store value in data store: ",
-	buffer = function(value: buffer): string
-		-- The engine's uncompressed buffer form, {"m":null,"t":"buffer","base64":"..."}: only its length matters.
-		return string.rep("x", 35 + 4 * math.ceil(buffer.len(value) / 3))
-	end,
-}
 
 --- Raises the engine's error when `value` can't be stored (see the header); returns its serialized size.
 function DataStore.check(value: any): number
-	checkValue(value, {})
-	local size = #format.json(value, SIZE_JSON)
+	local size, tooDeep = checkValue(value, {}, 0)
+	if tooDeep then error("104: Cannot store value in data store: nesting too deep", 0) end
 	if size > MAX_VALUE then error(`105: Serialized value exceeds 4MB limit.`, 0) end
 	return size
 end

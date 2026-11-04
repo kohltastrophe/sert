@@ -90,11 +90,12 @@ def filter_diff_files(files: dict[str, dict[int, bool]], diff_lines: dict[str, s
     return filtered
 
 
-def norm(name: str, root: Path | None = None) -> str:
+def norm(name: str, root: Path | None = None, *, _resolved_root: Path | None = None) -> str:
     clean = name.replace("\\", "/")
-    if root is not None and (clean.startswith("/") or _DRIVE_RE.match(clean) or os.path.isabs(name)):
+    if (root is not None or _resolved_root is not None) and (clean.startswith("/") or _DRIVE_RE.match(clean) or os.path.isabs(name)):
         try:
-            resolved, base = Path(name).resolve(), Path(root).resolve()
+            resolved = Path(name).resolve()
+            base = _resolved_root if _resolved_root is not None else Path(root).resolve()  # type: ignore[arg-type]
             if os.path.normcase(os.path.commonpath([resolved, base])) == os.path.normcase(str(base)):
                 clean = os.path.relpath(resolved, base).replace(os.sep, "/")
         except (OSError, ValueError):
@@ -105,10 +106,17 @@ def norm(name: str, root: Path | None = None) -> str:
 def parse(path, root: Path | None = None) -> dict[str, dict[int, bool]]:
     files: dict[str, dict[int, bool]] = {}
     current = None
+    resolved_root = Path(root).resolve() if root is not None else None
+    norm_cache: dict[str, str] = {}
     with open(path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if line.startswith("SF:"):
-                current = files.setdefault(norm(line[3:].strip(), root), {})
+                raw_sf = line[3:].strip()
+                norm_sf = norm_cache.get(raw_sf)
+                if norm_sf is None:
+                    norm_sf = norm(raw_sf, root, _resolved_root=resolved_root)
+                    norm_cache[raw_sf] = norm_sf
+                current = files.setdefault(norm_sf, {})
             elif line.startswith("DA:") and current is not None:
                 number, hits = line[3:].split(",")[:2]
                 num = int(number)

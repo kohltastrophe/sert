@@ -270,10 +270,10 @@ class MutateSchemaTest(Case):
         slow = self._alias_project(
             '[test]\nentries = ["test/spec.luau"]\n[mutate]\ninclude = ["src"]\n',
             "local Target = {}\nfunction Target.apply(state)\n\tstate.a = true\nend\nreturn Target\n",
-            ['sert.test("slow", function()', "\tlocal state = {}", "\tTarget.apply(state)", "\tlocal t = os.clock()", "\twhile os.clock() - t < 0.5 do end", "\tsert.eq(state.a, true)", "end)"],
+            ['sert.test("slow", function()', "\tlocal state = {}", "\tTarget.apply(state)", "\tlocal t = os.clock()", "\twhile os.clock() - t < 0.15 do end", "\tsert.eq(state.a, true)", "end)"],
             alias_abs=False, name="slow",
         )
-        code_s, _, err_s = self.sert("mutate", "--root", slow, "-j", "1", "--timeout", "0.2")
+        code_s, _, err_s = self.sert("mutate", "--root", slow, "-j", "1", "--timeout", "0.05")
         self.assertEqual((code_s, "raise --timeout" in err_s), (2, True))
 
         summary = self.tmp / "summary.md"
@@ -284,7 +284,7 @@ class MutateSchemaTest(Case):
             ['sert.test("count", function()', "\tsert.eq(Target.count({}), 3)", "end)"],
             alias_abs=False, name="hang",
         )
-        code_h, out_h, err_h = self.sert("mutate", "--root", hang, "-j", "2", "--timeout", "1")
+        code_h, out_h, err_h = self.sert("mutate", "--root", hang, "-j", "2", "--timeout", "0.15")
         self.assertEqual((code_h, out_h.strip(), "Timed-out mutants (1, counted as detected):" in err_h), (0, "66.7", True))
         self.assertIn("(1 killed, 1 timed out, 1 survived, 3 total)", summary.read_text())
 

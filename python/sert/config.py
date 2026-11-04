@@ -98,7 +98,7 @@ SCHEMA = {
     "deps": {"*": {"repo", "tag", "asset", "strip", "paths"}},
     "tools": dict.fromkeys(("luau", "lute", "luau_lsp")),
     "override": {"*": str},
-    "test": {"entries": (list, str), "specs": (list, str), "setup": str, "runner": str, "codegen": bool, "stage": str},
+    "test": {"entries": (list, str), "specs": (list, str), "setup": str, "runner": str, "codegen": bool, "stage": str, "jobs": int},
     "studio": {**STUDIO_KEYS, "suites": {"*": {**STUDIO_KEYS, "default": bool}}},
     "cloud": {"project": str, "script": str, "shards": list, "shard_limit": (int, float)},
     "lint": {

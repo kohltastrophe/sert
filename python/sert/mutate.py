@@ -1147,13 +1147,14 @@ def main(args) -> int:
     prev_sigterm = signal.signal(signal.SIGTERM, interrupt) if threading.current_thread() is threading.main_thread() else None
 
     try:
+        staged_tasks: list[tuple[Path, Path, str, str, list[Mutant]]] = []
         for rel_path in target_files:
-            if max_mutants is not None and len(all_mutants) >= max_mutants:
+            if max_mutants is not None and next_id - 1 >= max_mutants:
                 break
             src_path = _guard_inside(work_root, work_root / rel_path)
             staged_path = _guard_inside(work_root, stage_files_dir / rel_path)
             source_text = (cfg.root / rel_path).read_text(encoding="utf-8", errors="replace")
-            remaining = (max_mutants - len(all_mutants)) if max_mutants is not None else None
+            remaining = (max_mutants - (next_id - 1)) if max_mutants is not None else None
             instrumented, file_mutants = instrument_source(
                 source_text, cov_files[rel_path], file_path=rel_path, start_id=next_id, operators=operators,
                 max_mutants=remaining, spec_filter=resolve_spec_filter(rel_path, specs_map),
@@ -1161,28 +1162,42 @@ def main(args) -> int:
             )
             if not file_mutants:
                 continue
-            extra_kw = {"runner": runner} if runner != "luau" else {}
-            valid_mutants = compile_and_stage_file(luau_bin, source_text, instrumented, file_mutants, staged_path, wrap=wrap_staged, **extra_kw)
-            if wrap_staged and valid_mutants:
-                if len(valid_mutants) == len(file_mutants):
-                    merged_source = instrumented
-                else:
-                    valid_lines = {m.line for m in valid_mutants}
-                    orig_lines, inst_lines = source_text.split("\n"), instrumented.split("\n")
-                    merged_source = "\n".join(inst_lines[idx] if (idx + 1) in valid_lines else orig_lines[idx] for idx in range(len(orig_lines)))
-                _guard_inside(work_root, src_path).write_text(_direct_source(merged_source), encoding="utf-8")
-            all_mutants.extend(valid_mutants)
+            staged_tasks.append((src_path, staged_path, source_text, instrumented, file_mutants))
             next_id = file_mutants[-1].id + 1
-
-        if not all_mutants:
-            raise SertError(f"mutate: no mutable covered statements found under {', '.join(include)}")
-
-        by_filter: dict[str, list[Mutant]] = {}
-        for m in all_mutants:
-            by_filter.setdefault(m.spec_filter or "", []).append(m)
 
         pool = ThreadPoolExecutor(max_workers=max(1, jobs))
         try:
+            extra_kw = {"runner": runner} if runner != "luau" else {}
+            if len(staged_tasks) == 1:
+                src_path, staged_path, source_text, instrumented, file_mutants = staged_tasks[0]
+                compiled_lists = [
+                    compile_and_stage_file(luau_bin, source_text, instrumented, file_mutants, staged_path, wrap=wrap_staged, **extra_kw)
+                ]
+            else:
+                stage_futs = [
+                    pool.submit(compile_and_stage_file, luau_bin, source_text, instrumented, file_mutants, staged_path, wrap=wrap_staged, **extra_kw)
+                    for _src_path, staged_path, source_text, instrumented, file_mutants in staged_tasks
+                ]
+                compiled_lists = [fut.result() for fut in stage_futs]
+
+            for (src_path, _staged_path, source_text, instrumented, file_mutants), valid_mutants in zip(staged_tasks, compiled_lists):
+                if wrap_staged and valid_mutants:
+                    if len(valid_mutants) == len(file_mutants):
+                        merged_source = instrumented
+                    else:
+                        valid_lines = {m.line for m in valid_mutants}
+                        orig_lines, inst_lines = source_text.split("\n"), instrumented.split("\n")
+                        merged_source = "\n".join(inst_lines[idx] if (idx + 1) in valid_lines else orig_lines[idx] for idx in range(len(orig_lines)))
+                    _guard_inside(work_root, src_path).write_text(_direct_source(merged_source), encoding="utf-8")
+                all_mutants.extend(valid_mutants)
+
+            if not all_mutants:
+                raise SertError(f"mutate: no mutable covered statements found under {', '.join(include)}")
+
+            by_filter: dict[str, list[Mutant]] = {}
+            for m in all_mutants:
+                by_filter.setdefault(m.spec_filter or "", []).append(m)
+
             baseline_futures = {
                 (filt, entry): pool.submit(baseline_run, runner, luau_bin, entry, filt or None, work_root, timeout_sec, codegen, program_args)
                 for filt in sorted(by_filter)
@@ -1197,10 +1212,12 @@ def main(args) -> int:
                 filt: max(timeout_sec, BASELINE_FACTOR * elapsed)
                 for filt, elapsed in baseline_by_filter.items()
             }
+            worker_count = max(1, jobs)
+            dynamic_batch_size = max(1, min(BATCH_SIZE, (len(all_mutants) + worker_count - 1) // worker_count))
             batches = [
-                (filt_mutants[i : i + BATCH_SIZE], timeout_by_filter[filt])
+                (filt_mutants[i : i + dynamic_batch_size], timeout_by_filter[filt])
                 for filt, filt_mutants in sorted(by_filter.items(), key=lambda kv: -baseline_by_filter.get(kv[0], 0.0))
-                for i in range(0, len(filt_mutants), BATCH_SIZE)
+                for i in range(0, len(filt_mutants), dynamic_batch_size)
             ]
             futures = [
                 pool.submit(_evaluate_mutant_batch, batch, work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args)

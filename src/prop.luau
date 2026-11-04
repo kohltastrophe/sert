@@ -860,7 +860,7 @@ local function runProperty(
 		for index, seed in (options.regressions or {}) :: { number } do
 			table.insert(cases, { label = `regression {index}`, index = index, seed = seed })
 		end
-		runs = run.runs or options.runs or 200
+		runs = run.runs or options.runs or 100
 		if isMutant then runs = math.min(runs, MUTANT_RUNS) end
 		local nameHash = fnv1a32(name)
 		for index = 1, runs do

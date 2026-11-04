@@ -209,23 +209,26 @@ local function execute(
 	opts: RunOptions,
 	withLast: boolean,
 	report: (Outcome) -> boolean,
-	pass: ((Test, string) -> ())?
+	pass: ((Test, string) -> ())?,
+	chainByIndex: { [number]: { Hooks } }?
 ): { string }
 	local tests = state.tests
-	local globals = registry.globalChain()
+	local globals = if chainByIndex == nil then registry.globalChain() else nil
 	local chains: { [number]: { Hooks } } = {}
 	local first: { [Hooks]: number }, last: { [Hooks]: number } = {}, {}
 	local lastOfFile: { [string]: number } = {}
 	for position, index in order do
 		if plan == nil or plan[index] == "run" then
 			local test = tests[index]
-			local chain = registry.chainOf(test, globals)
+			local chain: { Hooks } = if chainByIndex ~= nil
+				then chainByIndex[index]
+				else registry.chainOf(test, globals :: { Hooks })
 			chains[position] = chain
 			for _, hooks in chain do
 				first[hooks] = first[hooks] or position
 				last[hooks] = position
 			end
-			lastOfFile[test.file] = position
+			if withLast then lastOfFile[test.file] = position end
 		end
 	end
 
@@ -444,8 +447,10 @@ local function selectionText(opts: RunOptions, shard: Shard?): string
 	return if #selection > 0 then " · " .. table.concat(selection, " · ") else ""
 end
 
-local function planTests(opts: RunOptions, selected: (Test) -> boolean): ({ string }, boolean)
+local function planTests(opts: RunOptions, selected: (Test) -> boolean, shard: Shard?): ({ string }, boolean)
 	local activeSide = state.side
+	local modShard = shard ~= nil and shard.only == nil and shard.except == nil and shard.count > 1
+	local shardMatched = 0
 	local plan: { string }, properties = {}, false
 	for index, test in state.tests do
 		local mode = test.mode
@@ -458,13 +463,21 @@ local function planTests(opts: RunOptions, selected: (Test) -> boolean): ({ stri
 			plan[index] = "ignore"
 		elseif unfocused or not selected(test) then
 			plan[index] = "out"
-		elseif mode == "todo" then
-			plan[index] = "todo"
-		elseif headless or sampled or mode == "skip" then
-			plan[index] = "skip"
+		elseif modShard and shard ~= nil and ((shardMatched % shard.count) + 1 ~= shard.index) then
+			shardMatched += 1
+			plan[index] = "ignore"
 		else
-			plan[index] = "run"
-			properties = properties or test.prop ~= nil
+			if modShard then
+				shardMatched += 1
+			end
+			if mode == "todo" then
+				plan[index] = "todo"
+			elseif headless or sampled or mode == "skip" then
+				plan[index] = "skip"
+			else
+				plan[index] = "run"
+				properties = properties or test.prop ~= nil
+			end
 		end
 	end
 	return plan, properties
@@ -500,20 +513,28 @@ local function listTests(plan: { string }, results: Results, out: (...any) -> ()
 end
 
 local function runBatch(batch: { number }, order: { number }, plan: { string }, opts: RunOptions, results: Results)
+	local tests = state.tests
+	local globals = registry.globalChain()
 	local runnable: { number } = {}
+	local chainByIndex: { [number]: { Hooks } } = {}
 	for _, index in order do
-		if plan[index] == "run" then table.insert(runnable, index) end
+		if plan[index] == "run" then
+			table.insert(runnable, index)
+			chainByIndex[index] = registry.chainOf(tests[index], globals)
+		end
 	end
 	local verdicts, lastKiller: number?, fastKillers: { number } = {}, nil, {}
+	local inFast: { [number]: boolean } = {}
 	results.total = 0
 	for _, id in batch do
 		mutant.set(id)
-		local sequence: { number } = if lastKiller ~= nil then { lastKiller } else {}
+		local sequence = table.create(#runnable) :: { number }
+		if lastKiller ~= nil then table.insert(sequence, lastKiller) end
 		for _, index in fastKillers do
 			if index ~= lastKiller then table.insert(sequence, index) end
 		end
 		for _, index in runnable do
-			if index ~= lastKiller and table.find(fastKillers, index) == nil then table.insert(sequence, index) end
+			if index ~= lastKiller and not inFast[index] then table.insert(sequence, index) end
 		end
 		local killed = false
 		local leftovers = execute(sequence, nil, opts, false, function(outcome: Outcome): boolean
@@ -528,13 +549,15 @@ local function runBatch(batch: { number }, order: { number }, plan: { string }, 
 				local existing = table.find(fastKillers, outcome.index)
 				if existing ~= nil then
 					table.remove(fastKillers, existing)
-				elseif #fastKillers >= 3 then
-					table.remove(fastKillers)
+				elseif #fastKillers >= 8 then
+					local evicted = table.remove(fastKillers)
+					if evicted ~= nil then inFast[evicted] = nil end
 				end
 				table.insert(fastKillers, 1, outcome.index)
+				inFast[outcome.index] = true
 			end
 			return true
-		end)
+		end, nil, chainByIndex)
 		killed = killed or #leftovers > 0
 		table.insert(verdicts, { id = id, killed = killed })
 		output.printFlush(`[sert-mutant] {id}={if killed then "KILLED" else "SURVIVED"}`)
@@ -682,14 +705,21 @@ function runner.run(options: RunOptions?): Results
 	end
 
 	local shard, selected = selector(opts)
-	local plan, properties = planTests(opts, selected)
+	local plan, properties = planTests(opts, selected, shard)
 	if opts.list then
 		listTests(plan, results, out)
 		finish()
 		return results
 	end
 
-	if #tests == 0 then return abort("sert.run: no tests registered") end
+	local isSharded = (shard ~= nil and (shard.count or 1) > 1) or (opts :: any)._specSharded == true
+	if #tests == 0 then
+		if isSharded then
+			out(`[sert-done] {format.json(results)}`)
+			return results
+		end
+		return abort("sert.run: no tests registered")
+	end
 
 	local selection = selectionText(opts, shard)
 	local runtime = if IS_ROBLOX then "Roblox" else "Luau CLI"
@@ -698,7 +728,13 @@ function runner.run(options: RunOptions?): Results
 
 	results.total -= count(plan, "ignore")
 	if properties and not opts.exhaustive then out(`[sert-seed] run {opts.seed or prop.DEFAULT_BASE}`) end
-	if opts.requireTests and not table.find(plan, "run") and not table.find(plan, "skip") then
+	if
+		opts.requireTests
+		and not isSharded
+		and results.total > 0
+		and not table.find(plan, "run")
+		and not table.find(plan, "skip")
+	then
 		results.skipped = results.total
 		local hint = filterHint(opts.filter, tests)
 		return abort(`sert.run: requireTests: the selection{selection} matched none of the {results.total} tests{hint}`)
@@ -742,7 +778,7 @@ local function idList(csv: string): { number }
 end
 
 local KNOWN_FLAGS = "--filter, --seed, --replay, --runs, --budget, --test-timeout, --exhaustive, --list, --markers, --silent, --compact, "
-	.. "-x/--fail-fast, --mutant, --mutants"
+	.. "-x/--fail-fast, --mutant, --mutants, --shard"
 local NUMERIC_FLAGS: { [string]: string } = {
 	seed = "seed",
 	replay = "replay",
@@ -824,6 +860,19 @@ function runner.parseCliArgs(...: any): RunOptions
 			opts[SWITCH_FLAGS[flag]] = true
 		elseif flag == "filter" then
 			setFilter(takeValue())
+		elseif flag == "shard" then
+			local val = takeValue()
+			local idxStr, cntStr = string.match(val, "^(%d+)/(%d+)$")
+			local idx, cnt = tonumber(idxStr), tonumber(cntStr)
+			if idx == nil or cnt == nil or idx < 1 or cnt < 1 or idx > cnt then
+				failCli(`--shard expects INDEX/COUNT with 1 <= INDEX <= COUNT, got "{val}"`)
+			end
+			opts.shard = {
+				name = `{idx}/{cnt}`,
+				index = idx,
+				count = cnt,
+				runLimit = 0,
+			}
 		elseif NUMERIC_FLAGS[flag] ~= nil then
 			local val = takeValue()
 			if flag == "seed" and val == "random" then

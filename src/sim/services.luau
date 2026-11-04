@@ -41,10 +41,13 @@ end
 
 function RunService.step(run: any, dt: number, now: number)
 	for _, phase in run._phases do
-		if phase == "Stepped" then
-			run.Stepped:Fire(now, dt)
-		else
-			run[phase]:Fire(dt)
+		local sig = run[phase]
+		if #sig._listeners > 0 then
+			if phase == "Stepped" then
+				sig:Fire(now, dt)
+			else
+				sig:Fire(dt)
+			end
 		end
 	end
 end
@@ -1135,7 +1138,7 @@ function Remotes.new(world: any, server: any): any
 	end
 
 	function net.flush(_: any) flushRemoteQueue(net, server, s.now) end
-	if not world.instant and not world.coarse then world:onFrame(function() net:flush() end) end
+	if not world.instant and not world.coarse then world.scheduler:onFrame(function() net:flush() end, nil, true) end
 
 	net.remotes = {}
 	for _, channel in { "reliable", "unreliable" } do
@@ -1194,7 +1197,7 @@ function Remotes.new(world: any, server: any): any
 		local stream = s:stream(`random/{client.name}`)
 		client.run = RunService.new(world, client, true)
 		if not world.instant and not world.coarse then
-			client.stopFrame = s:onFrame(function(dt: number) RunService.step(client.run, dt, s.now) end, client)
+			client.stopFrame = s:onFrame(function(dt: number) RunService.step(client.run, dt, s.now) end, client, true)
 		end
 		client.host = {
 			clock = hooks.clock,

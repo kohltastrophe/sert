@@ -299,7 +299,16 @@ local InstanceDouble: { [string]: any } = {}
 
 -- GUI geometry (defined with setParent below): the properties that move a GuiObject, and the re-layout pass.
 local LAYOUT_KEYS: { [string]: boolean }
+local LAYOUT_MODIFIER_CLASSES: { [string]: boolean }
+local GEOMETRY_PROPS: { [string]: boolean }
 local relayout: (inst: any) -> ()
+local flushLayouts: () -> ()
+local markGeomSig: (inst: any) -> ()
+local parentDependsOnChildren: (parent: any) -> boolean
+local hasDirtyLayouts = false
+local anyGeomSig = false
+local dirtyLayouts: { [any]: boolean } = {}
+local flushingLayouts = false
 
 local NONE = table.freeze({})
 
@@ -549,6 +558,7 @@ local function makeEnvSignal(env: any): any
 end
 
 local function getSignal(inst: any, name: string): any
+	if name == "Changed" and rawget(inst, "_isGui") == true then markGeomSig(inst) end
 	local sigs = rawget(inst, "_signals")
 	if sigs == nil then
 		sigs = {}
@@ -699,6 +709,20 @@ local function setParent(inst: any, newParent: any?, allowDestroyedDetach: boole
 			rawset(newParent, "_children", newChildren)
 		end
 		table.insert(newChildren, inst)
+		if rawget(inst, "_hasGui") == true then
+			local anc = newParent
+			while anc ~= nil and rawget(anc, "_hasGui") ~= true do
+				rawset(anc, "_hasGui", true)
+				anc = rawget(anc, "_parent")
+			end
+		end
+		if rawget(inst, "_subtreeGeomSig") == true then
+			local anc = newParent
+			while anc ~= nil and rawget(anc, "_subtreeGeomSig") ~= true do
+				rawset(anc, "_subtreeGeomSig", true)
+				anc = rawget(anc, "_parent")
+			end
+		end
 	end
 	local nowInDataModel = if env ~= nil then isInDataModel(env, inst) else false
 	if oldParent ~= nil then
@@ -780,11 +804,13 @@ local function setParent(inst: any, newParent: any?, allowDestroyedDetach: boole
 		end
 	end
 	if rawget(inst, "_reparentGen") ~= myGen then return end
-	if oldParent ~= nil and not rawget(oldParent, "_destroying") then relayout(oldParent) end
-	if newParent ~= nil then
-		relayout(newParent)
-	elseif rawget(inst, "_children") ~= nil or isClass(inst._props.ClassName, "GuiBase2d") then
-		relayout(inst)
+	if rawget(inst, "_hasGui") == true then
+		if oldParent ~= nil and not rawget(oldParent, "_destroying") then
+			if LAYOUT_MODIFIER_CLASSES[inst._props.ClassName] or parentDependsOnChildren(oldParent) then
+				relayout(oldParent)
+			end
+		end
+		if not rawget(inst, "_destroying") then relayout(inst) end
 	end
 	if env ~= nil then
 		local onReparent: ((any, any) -> ())? = env._onReparent
@@ -843,13 +869,25 @@ local TEXT_CLASSES: { [string]: boolean } = {
 	TextBox = true,
 }
 
-local LAYOUT_MODIFIER_CLASSES: { [string]: boolean } = {
+LAYOUT_MODIFIER_CLASSES = {
 	UIListLayout = true,
 	UIGridLayout = true,
 	UIPadding = true,
 	UIScale = true,
 	UISizeConstraint = true,
 	UIAspectRatioConstraint = true,
+}
+
+GEOMETRY_PROPS = {
+	AbsoluteSize = true,
+	AbsolutePosition = true,
+	AbsoluteContentSize = true,
+	AbsoluteCellSize = true,
+	AbsoluteCanvasSize = true,
+	AbsoluteWindowSize = true,
+	ContentText = true,
+	TextBounds = true,
+	TextFits = true,
 }
 
 local function enumName(val: any, default: string): string
@@ -1123,6 +1161,7 @@ end
 local layoutSubtree: (node: any, positionedByParentLayout: boolean?) -> ()
 
 function layoutSubtree(node: any, positionedByParentLayout: boolean?)
+	if rawget(node, "_hasGui") ~= true then return end
 	local props = node._props
 	local className = props.ClassName
 	local V2 = vectorOf(node)
@@ -1213,7 +1252,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 		for _, child in ordered do
 			local cSize = computeChildSize(child, contentW, contentH)
 			setGeometry(child, "AbsoluteSize", cSize)
-			layoutSubtree(child, true)
+			if enumName(child._props.AutomaticSize, "None") ~= "None" then layoutSubtree(child, true) end
 		end
 		local lProps = listLayout._props
 		local isHoriz = enumName(lProps.FillDirection, "Vertical") == "Horizontal"
@@ -1501,32 +1540,38 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 	end
 end
 
--- Finds the highest GuiBase2d ancestor whose layout could be affected by `inst` changing, and re-lays out from there.
-function relayout(inst: any)
+function parentDependsOnChildren(parent: any): boolean
+	local pClass = parent._props.ClassName
+	if not isClass(pClass, "GuiBase2d") then return false end
+	if isClass(pClass, "ScrollingFrame") or enumName(parent._props.AutomaticSize, "None") ~= "None" then return true end
+	local pChildren = rawget(parent, "_children")
+	if pChildren ~= nil then
+		for _, ch in pChildren do
+			local cName = ch._props.ClassName
+			if cName == "UIListLayout" or cName == "UIGridLayout" then return true end
+		end
+	end
+	return false
+end
+
+-- Finds the highest GuiBase2d ancestor whose layout could be affected by `inst` changing.
+local function findLayoutRoot(inst: any): any
 	local root = inst
 	if LAYOUT_MODIFIER_CLASSES[root._props.ClassName] then
 		local p = rawget(root, "_parent")
 		if p ~= nil then root = p end
 	end
+	local startRoot = root
 	local cur = root
 	while cur ~= nil do
+		if cur ~= startRoot then
+			local curClass = cur._props.ClassName
+			if isClass(curClass, "GuiBase2d") and enumName(cur._props.AutomaticSize, "None") == "None" then break end
+		end
 		local parent = rawget(cur, "_parent")
 		if parent == nil then break end
-		local pClass = parent._props.ClassName
-		if isClass(pClass, "GuiBase2d") then
-			local pChildren = rawget(parent, "_children")
-			local parentNeedsRelayout = isClass(pClass, "ScrollingFrame")
-				or enumName(parent._props.AutomaticSize, "None") ~= "None"
-			if not parentNeedsRelayout and pChildren ~= nil then
-				for _, ch in pChildren do
-					local cName = ch._props.ClassName
-					if cName == "UIListLayout" or cName == "UIGridLayout" or cName == "UIPadding" then
-						parentNeedsRelayout = true
-						break
-					end
-				end
-			end
-			if parentNeedsRelayout then
+		if isClass(parent._props.ClassName, "GuiBase2d") then
+			if parentDependsOnChildren(parent) then
 				root = parent
 				cur = parent
 			else
@@ -1536,10 +1581,60 @@ function relayout(inst: any)
 			cur = parent
 		end
 	end
-	layoutSubtree(root, false)
+	return root
 end
 
-InstanceDouble.relayout = relayout
+function flushLayouts()
+	if not hasDirtyLayouts or flushingLayouts then return end
+	flushingLayouts = true
+	while hasDirtyLayouts do
+		hasDirtyLayouts = false
+		local batch = dirtyLayouts
+		dirtyLayouts = {}
+		local roots: { [any]: boolean } = {}
+		for inst in batch do
+			if rawget(inst, "_destroyed") ~= true and rawget(inst, "_destroying") ~= true then
+				roots[findLayoutRoot(inst)] = true
+			end
+		end
+		for root in roots do
+			local hasAncestor = false
+			local anc = rawget(root, "_parent")
+			while anc ~= nil do
+				if roots[anc] then
+					hasAncestor = true
+					break
+				end
+				anc = rawget(anc, "_parent")
+			end
+			if not hasAncestor then layoutSubtree(root, false) end
+		end
+	end
+	flushingLayouts = false
+end
+
+function markGeomSig(inst: any)
+	if hasDirtyLayouts then flushLayouts() end
+	anyGeomSig = true
+	rawset(inst, "_hasGeomSig", true)
+	local cur = inst
+	while cur ~= nil and rawget(cur, "_subtreeGeomSig") ~= true do
+		rawset(cur, "_subtreeGeomSig", true)
+		cur = rawget(cur, "_parent")
+	end
+end
+
+function relayout(inst: any)
+	if rawget(inst, "_hasGui") ~= true or rawget(inst, "_destroyed") == true then return end
+	dirtyLayouts[inst] = true
+	hasDirtyLayouts = true
+	if anyGeomSig and rawget(findLayoutRoot(inst), "_subtreeGeomSig") == true then flushLayouts() end
+end
+
+InstanceDouble.relayout = function(inst: any)
+	relayout(inst)
+	flushLayouts()
+end
 
 --[=[
 	Pins a GuiBase2d's AbsoluteSize and/or AbsolutePosition (a nil argument leaves that one computed; both nil unpins
@@ -1578,6 +1673,7 @@ local selectorAccess: SelectorAccess = {
 		return if attributes ~= nil then attributes[name] else nil
 	end,
 	property = function(inst: any, name: string): any
+		if hasDirtyLayouts and GEOMETRY_PROPS[name] then flushLayouts() end
 		local value = inst._props[name]
 		return if value == NONE then nil else value
 	end,
@@ -1855,6 +1951,7 @@ local function cloneSubtree(self: any, clonedMap: { [any]: any }): any
 end
 
 function BaseMethods.Clone(self: any): any
+	if hasDirtyLayouts and rawget(self, "_hasGui") == true then flushLayouts() end
 	local clonedMap: { [any]: any } = {}
 	local rootCopy = cloneSubtree(self, clonedMap)
 	if rootCopy == nil then return nil end
@@ -1877,6 +1974,7 @@ end
 
 --- `Instance.fromExisting(existing)`: a copy of `existing` without its descendants, whatever its Archivable.
 function InstanceDouble.fromExisting(existing: any): any
+	if hasDirtyLayouts and rawget(existing, "_hasGui") == true then flushLayouts() end
 	local copy = copyNode(existing)
 	for k, v in existing._props do
 		if k ~= "ClassName" and k ~= "Parent" and customTypeof(v) == "Instance" then copy._props[k] = v end
@@ -1892,6 +1990,7 @@ function BaseMethods.GetPropertyChangedSignal(self: any, prop: string): any
 		local member = if schema ~= nil then schema.members[prop] else nil
 		if member == nil or member.kind ~= "property" then error(`{prop} is not a valid property name.`, 2) end
 	end
+	if GEOMETRY_PROPS[prop] and rawget(self, "_isGui") == true then markGeomSig(self) end
 	local pSigs = rawget(self, "_propSignals")
 	if pSigs == nil then
 		pSigs = {}
@@ -3166,6 +3265,7 @@ function InstanceMeta.__tostring(self: any): string return tostring(self._props.
 
 function InstanceMeta.__index(self: any, key: any): any
 	if key == "Parent" then return rawget(self, "_parent") end
+	if hasDirtyLayouts and GEOMETRY_PROPS[key] then flushLayouts() end
 	local overrides = rawget(self, "_overrides")
 	if overrides ~= nil and overrides[key] ~= nil then return overrides[key] end
 	local customMethods = rawget(self, "_methods")
@@ -3480,13 +3580,16 @@ function InstanceDouble.createInstance(env: any?, className: string, parent: any
 			error(`Unable to create an Instance of type "{className}"`, 2)
 		end
 	end
+	local isGui = isClass(className, "GuiBase2d") or LAYOUT_MODIFIER_CLASSES[className] == true
 	local inst: any = setmetatable({
 		_isInstance = true,
+		_isGui = if isGui then true else nil,
+		_hasGui = if isGui then true else nil,
 		_env = env,
 		_props = buildDefaultProps(className, isStrict, if env ~= nil then env.datatypes else nil, env),
 		_parent = nil,
 	}, InstanceMeta)
-	if isClass(className, "GuiBase2d") then layoutSubtree(inst, false) end
+	if isGui then relayout(inst) end
 
 	if parent ~= nil then setParent(inst, parent) end
 	return inst

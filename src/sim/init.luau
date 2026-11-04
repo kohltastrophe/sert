@@ -375,6 +375,8 @@ local function defineModel(
 		})
 	end
 
+	local needTraceVerify = boundSpec ~= nil and opts.verifyTrace ~= false
+
 	local currentWorld: any = nil
 	local currentState: any = nil
 	local currentSut: any = nil
@@ -411,8 +413,20 @@ local function defineModel(
 			run = function(sut: any, arg: any, _state: any): any
 				currentWorld:maybeCrashStep()
 				local res = runFn(sut, arg, currentWorld, currentState)
-				local projected = if projectFn ~= nil then projectFn(sut, currentWorld) else nil
-				currentWorld:action(cmdName, arg, projected, res)
+				if needTraceVerify then
+					local projected = if projectFn ~= nil then projectFn(sut, currentWorld) else nil
+					currentWorld:action(cmdName, arg, projected, res)
+				else
+					local step = #currentWorld.actions + 1
+					table.insert(currentWorld.actions, {
+						step = step,
+						t = currentWorld.scheduler.now,
+						action = cmdName,
+						arg = arg,
+						result = res,
+					})
+					currentWorld:trace(`action #{step} {cmdName}`)
+				end
 				if not opts.allowErrors and not allowRemoteErrors then currentWorld:assertNoRemoteErrors(caller) end
 				return res
 			end,
@@ -453,7 +467,7 @@ local function defineModel(
 				if state == nil then state = {} end
 				currentState = state
 				currentSut = if sut ~= nil then sut else state
-				initialSpecState = util.copy(state)
+				initialSpecState = if needTraceVerify then util.copy(state) else nil
 				initialized = true
 				return currentState
 			end,

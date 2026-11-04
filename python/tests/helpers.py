@@ -107,7 +107,7 @@ class Case(unittest.TestCase):
     def serve(self, handler) -> str:
         """Serves `handler` (a BaseHTTPRequestHandler class) on 127.0.0.1 until the test ends; returns its base URL."""
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return f"http://127.0.0.1:{server.server_port}"
