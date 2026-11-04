@@ -445,9 +445,25 @@ sys.exit(main())
 """
 
 
+WINDOWS_CMD_SHIM = b'@echo off\r\npython "%~dp0sert" %*\r\n'
+
+
 def _write_executable(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(path, data, 0o755)
+
+
+def write_launcher(target: Path, data: bytes) -> bool:
+    changed = False
+    if not target.is_file() or target.read_bytes() != data:
+        _write_executable(target, data)
+        changed = True
+    if os.name == "nt":
+        cmd = target.parent / "sert.cmd"
+        if not cmd.is_file() or cmd.read_bytes() != WINDOWS_CMD_SHIM:
+            write_atomic(cmd, WINDOWS_CMD_SHIM)
+            changed = True
+    return changed
 
 
 def _sert_stamp(repo: str, tag: str) -> str:
@@ -463,7 +479,7 @@ def fetch_sert(cfg: config_mod.Config, overrides: dict[str, Path], out=print) ->
     source = _sert_source_env() or overrides.get("sert")
     if source is not None:
         copied = mirror(source, dot / "sert", override_paths("sert", source, None))
-        _write_executable(dot / "bin" / "sert", LAUNCHER.format(python=str(source / "python"), root=str(cfg.root)).encode())
+        write_launcher(dot / "bin" / "sert", LAUNCHER.format(python=str(source / "python"), root=str(cfg.root)).encode())
         out(f"sert: mirrored {source} ({copied} files)")
         return
     if not cfg.get("sert.version"):
@@ -475,9 +491,7 @@ def fetch_sert(cfg: config_mod.Config, overrides: dict[str, Path], out=print) ->
     archive = fetch_blob(repo, tag, zip_name)
     changed = install_zip(archive, _sert_stamp(repo, tag), dot / "sert")
     pyz = fetch_blob(repo, tag, pyz_name)
-    target = dot / "bin" / "sert"
-    if not target.is_file() or target.read_bytes() != pyz.read_bytes():
-        _write_executable(target, pyz.read_bytes())
+    if write_launcher(dot / "bin" / "sert", pyz.read_bytes()):
         changed = True
     out(f"sert {table['version']}: {'installed' if changed else 'up to date'}")
 

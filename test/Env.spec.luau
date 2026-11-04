@@ -1292,6 +1292,4 @@ test(
 	end
 )
 
-require("./layout_headless.spec")
-
-return nil
+return {}

@@ -44,6 +44,13 @@ class FetchAndHttpTest(Case):
         code, _, err = self.sert("fetch", "--root", ci_root, "--only", "deps")
         self.assertEqual(code, 0, err)
 
+        win_bin = self.tmp / "win-bin/sert"
+        with mock.patch.object(fetch.os, "name", "nt"):
+            self.assertTrue(fetch.write_launcher(win_bin, SERT_PYZ))
+            self.assertFalse(fetch.write_launcher(win_bin, SERT_PYZ))
+        self.assertEqual(win_bin.read_bytes(), SERT_PYZ)
+        self.assertEqual((win_bin.parent / "sert.cmd").read_bytes(), b'@echo off\r\npython "%~dp0sert" %*\r\n')
+
     def test_override_mirror_and_archive_safety(self):
         sibling, sert_checkout = self.tmp / "flux-checkout", self.tmp / "sert-checkout"
         for p, text in ((sibling / "src/init.luau", "return 'local'\n"), (sibling / "src/__pycache__/x.pyc", "x"),

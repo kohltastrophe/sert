@@ -95,15 +95,7 @@ local COMMAND_FIELDS = {
 	"weight",
 }
 
-local function sortedKeys(tbl: { [string]: any }?): { string }
-	local keys: { string } = {}
-	if tbl == nil then return keys end
-	for key in tbl do
-		table.insert(keys, key)
-	end
-	table.sort(keys)
-	return keys
-end
+local sortedKeys = util.sortedKeys
 
 local function unwrapAndValidateSpec(rawSpec: any, caller: string?, requireInit: boolean): Spec
 	local where = caller or "sert.model"
@@ -260,7 +252,7 @@ function model.property(rawSpec: Spec, options: Options?): (Gen) -> ()
 	local commands = commandList(spec, "sert.model")
 	local neverKeys = sortedKeys(spec.never)
 	local invKeys = sortedKeys(spec.invariants)
-	local length = opts.length or 30
+	local length = opts.length or 25
 	local redraw = opts.redraw == true
 	local maxRedraws = opts.maxRedraws
 	local weighted = {}

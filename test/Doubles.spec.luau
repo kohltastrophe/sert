@@ -1454,4 +1454,4 @@ test("doubles · DataStore, OrderedDataStore, EncodingService, HttpService, and 
 	sert.eq(eqQueue:GetSizeAsync(false), 1)
 end)
 
-return nil
+return {}

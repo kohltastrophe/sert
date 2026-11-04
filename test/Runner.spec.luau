@@ -1240,4 +1240,4 @@ test("roblox.Runner · marker, phase, request, sides, args, runHere, and edit/se
 	end)
 end)
 
-return nil
+return {}

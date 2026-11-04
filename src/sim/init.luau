@@ -280,15 +280,7 @@ function Sim.prop(nameOrFn: string | (world: any, g: any) -> (), fnOrOptions: an
 	registry.define("prop", name, runSimProp, propOpts)
 end
 
-local function sortedKeys(tbl: { [string]: any }?): { string }
-	local keys: { string } = {}
-	if tbl == nil then return keys end
-	for k in tbl do
-		table.insert(keys, k)
-	end
-	table.sort(keys)
-	return keys
-end
+local sortedKeys = util.sortedKeys
 
 local function defineModel(
 	caller: string,

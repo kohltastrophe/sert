@@ -13,8 +13,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: "ci-${{ github.ref }}-${{ startsWith(github.event.head_commit.message, 'chore: release') && github.sha || '' }}"
+  cancel-in-progress: "${{ !startsWith(github.event.head_commit.message, 'chore: release') }}"
 
 defaults:
   run:
@@ -65,6 +65,7 @@ jobs:
         run: python3 -m sert coverage --badge
 
       - name: sert mutate
+        if: "!startsWith(github.event.head_commit.message, 'chore: release')"
         run: python3 -m sert mutate --no-coverage-run
 
       - name: lute suite

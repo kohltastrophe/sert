@@ -1051,4 +1051,4 @@ test(
 	end
 )
 
-return nil
+return {}

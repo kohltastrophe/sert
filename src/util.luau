@@ -131,4 +131,15 @@ function util.copy(value: any, options: CopyOptions?): any
 	return walk(value, 0)
 end
 
+--- Returns the string keys of `tbl` in ascending lexicographic order (or `{}` when `tbl` is `nil`).
+function util.sortedKeys(tbl: { [string]: any }?): { string }
+	local keys: { string } = {}
+	if tbl == nil then return keys end
+	for k in tbl do
+		table.insert(keys, k)
+	end
+	table.sort(keys)
+	return keys
+end
+
 return table.freeze(util)

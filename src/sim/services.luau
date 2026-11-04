@@ -121,6 +121,11 @@ local function pushHistory(bucket: { any }, entry: any)
 	if #bucket > HISTORY_LIMIT then table.remove(bucket, 1) end
 end
 
+local function pickStaleSnapshot(world: any, bucket: { any }?, label: string): any?
+	if bucket == nil or #bucket == 0 then return nil end
+	return if world.mode == "random" then world.scheduler:pick(bucket, label) else bucket[#bucket]
+end
+
 local DataStore = {}
 
 function DataStore.new(world: any, options: { [string]: any }?, backing: Scheduler.Backing?): any
@@ -237,11 +242,8 @@ function DataStore.new(world: any, options: { [string]: any }?, backing: Schedul
 				end
 				local value, keyInfo = callOpts("GetAsync", {
 					stale = function(): (boolean, any, any)
-						local bucket = storeHist[key]
-						if bucket == nil or #bucket == 0 then return false, nil, nil end
-						local snap = if world.mode == "random"
-							then world.scheduler:pick(bucket, "ds.stale")
-							else bucket[#bucket]
+						local snap = pickStaleSnapshot(world, storeHist[key], "ds.stale")
+						if snap == nil then return false, nil, nil end
 						return true, clone(snap.value), snap.info
 					end,
 				}, function(): ...any return raw:GetAsync(key, FRESH) end)
@@ -540,11 +542,8 @@ function MemoryStore.facade(service: any, world: any, server: any): any
 		function p.GetAsync(_self: any, key: string): ...any
 			return callOpts("GetAsync", {
 				stale = function(): (boolean, any, any)
-					local bucket = mapHist[key]
-					if bucket == nil or #bucket == 0 then return false, nil, nil end
-					local snap = if world.mode == "random"
-						then world.scheduler:pick(bucket, "ms.stale")
-						else bucket[#bucket]
+					local snap = pickStaleSnapshot(world, mapHist[key], "ms.stale")
+					if snap == nil then return false, nil, nil end
 					return true, deepCopy(snap.value), snap.sortKey
 				end,
 			}, raw.GetAsync, raw, key)

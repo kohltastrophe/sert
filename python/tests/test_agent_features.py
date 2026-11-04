@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import helpers  # noqa: F401
 from sert import check, cli, coverage, mutate, run
 
 
@@ -88,6 +89,29 @@ class AgentFeaturesTest(unittest.TestCase):
                 code = coverage.cmd_coverage(args, root=self.root)
             self.assertEqual(code, 0)
             self.assertEqual(stdout_buf.getvalue().strip(), "100.0")
+
+        self.assertEqual(coverage.filter_diff_files(files, {}), {})
+        self.assertEqual(coverage.filter_diff_files(files, {"README.md": {1, 2}}), {})
+        with mock.patch("sert.coverage.git_diff_lines", return_value={"README.md": {1, 2}}):
+            args_non_luau = cli.build(["coverage"]).parse_args(["coverage", "--root", str(self.root), "--diff", "HEAD~1", "--min", "100"])
+            stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf), mock.patch("sys.stderr", stderr_buf):
+                code = coverage.cmd_coverage(args_non_luau, root=self.root)
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout_buf.getvalue().strip(), "coverage: no covered lines modified in diff")
+
+        (self.root / "test").mkdir(parents=True, exist_ok=True)
+        (self.root / "test/spec.luau").write_text("return {}\n", encoding="utf-8")
+        (self.root / "sert.toml").write_text('[test]\nentries = ["test/spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n', encoding="utf-8")
+        with mock.patch("sert.coverage.git_diff_lines", return_value={"README.md": {1, 2}}), mock.patch(
+            "sert.mutate.run_mod.luau_command", return_value="luau"
+        ):
+            args_mut = cli.build(["mutate"]).parse_args(["mutate", "--root", str(self.root), "--no-coverage-run", "--diff", "HEAD~1"])
+            stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf), mock.patch("sys.stderr", stderr_buf):
+                code_mut = mutate.cmd_mutate(args_mut)
+            self.assertEqual(code_mut, 0)
+            self.assertEqual(stdout_buf.getvalue().strip(), "mutate: no covered lines modified in diff; skipping")
 
     def test_coverage_badge_generation_and_branch_publishing(self) -> None:
         self.assertEqual(coverage.badge_color(30.0), coverage.badge_color(50.0))

@@ -249,4 +249,4 @@ describe("Headless UI Layout Engine & Layout Invariants", function()
 	end)
 end)
 
-return nil
+return {}

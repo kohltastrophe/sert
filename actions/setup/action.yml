@@ -71,8 +71,13 @@ runs:
       with:
         path: |
           ${{ runner.os == 'Windows' && '~\AppData\Local\sert' || runner.os == 'macOS' && '~/Library/Caches/sert' || '~/.cache/sert' }}
-          .sert
+          .sert/bin
+          .sert/sert
+          .sert/pkg
+          .sert/types
         key: sert-${{ runner.os }}-${{ steps.pins.outputs.hash }}${{ inputs.sert-ref != '' && format('-ref-{0}', inputs.sert-ref) || '' }}${{ inputs.cache-key-extra != '' && format('-{0}', inputs.cache-key-extra) || '' }}
+        restore-keys: |
+          sert-${{ runner.os }}-
 
     - name: Check out the sert CLI at ${{ inputs.sert-ref }}
       if: inputs.sert-ref != ''

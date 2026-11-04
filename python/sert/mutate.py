@@ -1129,12 +1129,14 @@ def main(args) -> int:
     diff_rev = getattr(args, "diff", None)
     if diff_rev:
         diff_lines = coverage_mod.git_diff_lines(cfg.root, str(diff_rev))
-        if diff_lines:
-            cov_files = coverage_mod.filter_diff_files(cov_files, diff_lines)
+        cov_files = coverage_mod.filter_diff_files(cov_files, diff_lines)
 
     chosen = coverage_mod.chosen_files(cov_files, include, exclude)
     target_files = [rel for rel in sorted(chosen) if (cfg.root / rel).is_file() and any(chosen[rel].values())]
     if not target_files:
+        if diff_rev:
+            print("mutate: no covered lines modified in diff; skipping")
+            return 0
         raise SertError(f"mutate: no covered files under {', '.join(include)}")
 
     wrap_staged = bool(stage_spec)

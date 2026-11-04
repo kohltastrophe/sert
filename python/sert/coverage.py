@@ -80,14 +80,14 @@ def parse_diff_lines(diff_text: str, root: Path | None = None) -> dict[str, set[
 
 def filter_diff_files(files: dict[str, dict[int, bool]], diff_lines: dict[str, set[int]]) -> dict[str, dict[int, bool]]:
     if not diff_lines:
-        return files
+        return {}
     filtered: dict[str, dict[int, bool]] = {}
     for name, lines in files.items():
         if name in diff_lines:
             sub = {ln: hit for ln, hit in lines.items() if ln in diff_lines[name]}
             if sub:
                 filtered[name] = sub
-    return filtered if filtered else files
+    return filtered
 
 
 def norm(name: str, root: Path | None = None) -> str:
@@ -289,9 +289,11 @@ def cmd_coverage(args, root: Path | None = None, cfg: config_mod.Config | dict |
         raise SertError(f"coverage: cannot read {path}: {err}")
     diff_rev = getattr(args, "diff", None)
     if diff_rev:
-        diff_lines = git_diff_lines(root, str(diff_rev))
-        if diff_lines:
-            files = filter_diff_files(files, diff_lines)
+        files = filter_diff_files(files, git_diff_lines(root, str(diff_rev)))
+        chosen = chosen_files(files, include, exclude)
+        if sum(len(lines) for lines in chosen.values()) == 0:
+            print("coverage: no covered lines modified in diff")
+            return 0
     uncovered = bool(getattr(args, "uncovered", False))
     pct = summarize(files, include, exclude=exclude, uncovered=uncovered, root=root)
     step_summary(markdown(files, include, exclude, float(minimum) if minimum is not None else None))

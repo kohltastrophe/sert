@@ -91,15 +91,7 @@ export type Spec = typeof(setmetatable(
 	Spec
 ))
 
-local function sortedKeys(tbl: { [string]: any }?): { string }
-	local keys: { string } = {}
-	if tbl == nil then return keys end
-	for k in tbl do
-		table.insert(keys, k)
-	end
-	table.sort(keys)
-	return keys
-end
+local sortedKeys = util.sortedKeys
 
 local function canonicalize(value: any, seen: { [any]: number }, nextId: { number }): string
 	local kind = type(value)
