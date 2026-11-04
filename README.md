@@ -30,7 +30,7 @@ return {}
 The `sert` CLI only requires Python 3.11 or newer. The `lint` command also uses `luau-lsp`, StyLua, and `rojo`, which you can install from `rokit.toml` with [rokit](https://github.com/rojo-rbx/rokit).
 
 ```sh
-curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.0/tools/sert.py
+curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.1/tools/sert.py
 python3 tools/sert.py init
 python3 tools/sert.py run
 ```
@@ -38,7 +38,7 @@ python3 tools/sert.py run
 On Windows, download the stub with PowerShell and run `python` instead of `python3`.
 
 ```powershell
-mkdir -Force tools; iwr https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.0/tools/sert.py -OutFile tools/sert.py
+mkdir -Force tools; iwr https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.1/tools/sert.py -OutFile tools/sert.py
 ```
 
 `tools/sert.py` is a small bootstrap script that you commit to your repository. It runs the `sert` version pinned in `sert.toml`.
@@ -152,7 +152,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.1.1
       - run: python3 tools/sert.py run --coverage
       - run: python3 tools/sert.py coverage --min 90
       - run: python3 tools/sert.py lint

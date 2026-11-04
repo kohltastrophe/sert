@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.1.1
       - run: python3 tools/sert.py lint
       - run: python3 tools/sert.py run --coverage
       - run: python3 tools/sert.py coverage --min 90
@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.1.1
         with:
           rokit: false
       - run: python3 tools/sert.py run --exhaustive
@@ -45,7 +45,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.1.1
       - name: sert cloud
         env:
           ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}

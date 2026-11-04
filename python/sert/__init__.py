@@ -4,7 +4,7 @@ VERSION is the single source of sert's own release version: `sert pack` names th
 release workflow creates must be `v<VERSION>`.
 """
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 __version__ = VERSION
 
 # The luau and luau-lsp versions sert is developed and tested against: `sert init` pins them in a new sert.toml, and

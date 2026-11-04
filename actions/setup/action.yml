@@ -3,7 +3,7 @@
 # actions/checkout. Works on Linux, macOS and Windows runners (every step runs under bash; Python is `python3`, or
 # `python` on Windows).
 #
-#   - uses: kohltastrophe/sert/actions/setup@v0.1.0
+#   - uses: kohltastrophe/sert/actions/setup@v0.1.1
 #
 # With `sert-ref`, both the CLI and the Luau `sert` package are mirrored from that git ref of kohltastrophe/sert
 # instead of the release sert.toml pins (for trying an unreleased sert); pinned `[deps]` and `[tools]` still come from
@@ -91,7 +91,7 @@ runs:
     - name: Fetch sert and the pinned deps
       shell: bash
       env:
-        SERT_ACTION_VERSION: "0.1.0"
+        SERT_ACTION_VERSION: "0.1.1"
         SERT_REF: ${{ inputs.sert-ref }}
         GITHUB_TOKEN: ${{ inputs.token }}
         PY: ${{ runner.os == 'Windows' && 'python' || 'python3' }}

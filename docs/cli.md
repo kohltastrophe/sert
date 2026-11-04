@@ -13,7 +13,7 @@ The CLI requires Python 3.11 or newer and uses only the Python standard library.
 
 ```toml
 [sert]
-version = "0.1.0"
+version = "0.1.1"
 ```
 
 Set `SERT_OFFLINE=1` to use cached downloads only.
