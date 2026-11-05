@@ -713,8 +713,24 @@ def wrap_staged_source(instrumented_source: str) -> str:
     return run_mod.wrap_luau_source(instrumented_source, _ENV_G_BRIDGE)
 
 
+_ACTIVE_PROCS: set[subprocess.Popen] = set()
+_ACTIVE_PROCS_LOCK = threading.Lock()
+
+
+def _kill_active_procs() -> None:
+    with _ACTIVE_PROCS_LOCK:
+        procs = list(_ACTIVE_PROCS)
+    for proc in procs:
+        run_mod._kill(proc)
+
+
 def _run_process(
-    cmd: list[str], *, cwd: Path | None = None, timeout: float, capture_output: bool = False
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float,
+    capture_output: bool = False,
+    step_timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     proc = subprocess.Popen(
         cmd,
@@ -726,16 +742,69 @@ def _run_process(
         errors="replace",
         start_new_session=(os.name == "posix"),
     )
+    with _ACTIVE_PROCS_LOCK:
+        _ACTIVE_PROCS.add(proc)
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        run_mod._kill(proc)
-        out, err = proc.communicate()
-        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
-    except BaseException:
-        run_mod._kill(proc)
-        raise
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        if capture_output and step_timeout is not None and proc.stdout is not None and proc.stderr is not None:
+            out_lines: list[str] = []
+            err_chunks: list[str] = []
+            now = time.monotonic()
+            deadline = now + timeout
+            last_step = [now]
+            stdout_pipe, stderr_pipe = proc.stdout, proc.stderr
+
+            def _read_out() -> None:
+                for line in iter(stdout_pipe.readline, ""):
+                    out_lines.append(line)
+                    if _BATCH_LINE_RE.match(line.strip()):
+                        last_step[0] = time.monotonic()
+
+            def _read_err() -> None:
+                err_chunks.append(stderr_pipe.read())
+
+            out_thread = threading.Thread(target=_read_out, daemon=True)
+            err_thread = threading.Thread(target=_read_err, daemon=True)
+            out_thread.start()
+            err_thread.start()
+            try:
+                while True:
+                    wait_sec = min(deadline, last_step[0] + step_timeout) - time.monotonic()
+                    if wait_sec <= 0 and proc.poll() is None:
+                        run_mod._kill(proc)
+                        out_thread.join(timeout=2)
+                        err_thread.join(timeout=2)
+                        proc.wait()
+                        raise subprocess.TimeoutExpired(cmd, step_timeout, output="".join(out_lines), stderr="".join(err_chunks))
+                    try:
+                        proc.wait(timeout=max(0.0, min(wait_sec, 0.1)))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                out_thread.join(timeout=2)
+                err_thread.join(timeout=2)
+                return subprocess.CompletedProcess(cmd, proc.returncode, "".join(out_lines), "".join(err_chunks))
+            except subprocess.TimeoutExpired:
+                raise
+            except BaseException:
+                run_mod._kill(proc)
+                raise
+            finally:
+                stdout_pipe.close()
+                stderr_pipe.close()
+
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            run_mod._kill(proc)
+            out, err = proc.communicate()
+            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+        except BaseException:
+            run_mod._kill(proc)
+            raise
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    finally:
+        with _ACTIVE_PROCS_LOCK:
+            _ACTIVE_PROCS.discard(proc)
 
 
 def _check_staged_compiles(luau_bin: str, staged_path: Path, runner: str = "luau") -> bool:
@@ -824,18 +893,41 @@ def _evaluate_one_mutant(
 _BATCH_LINE_RE = re.compile(r"^\[sert-mutant\]\s*(\d+)=(KILLED|SURVIVED)\s*$")
 
 
+def _evaluate_single_mutant(
+    mutant: Mutant, root: Path, runner: str, luau_bin: str, entries: list[str], timeout_sec: float, codegen: bool = False, program_args: list[str] | tuple[str, ...] = ()
+) -> tuple[Mutant | None, list[Mutant]]:
+    mutant.status = _evaluate_one_mutant(mutant, root, runner, luau_bin, entries, timeout_sec, codegen, program_args)
+    return None, []
+
+
 def _evaluate_mutant_batch(
-    batch: list[Mutant], root: Path, runner: str, luau_bin: str, entries: list[str], timeout_sec: float, codegen: bool = False, program_args: list[str] | tuple[str, ...] = ()
-) -> None:
+    batch: list[Mutant],
+    root: Path,
+    runner: str,
+    luau_bin: str,
+    entries: list[str],
+    timeout_sec: float,
+    codegen: bool = False,
+    program_args: list[str] | tuple[str, ...] = (),
+    defer_remaining: bool = False,
+) -> tuple[Mutant | None, list[Mutant]] | None:
     if len(entries) != 1 or len(batch) <= 1:
         for m in batch:
             m.status = _evaluate_one_mutant(m, root, runner, luau_bin, entries, timeout_sec, codegen, program_args)
-        return
+        return None, []
     cmd = _mutant_batch_command(runner, luau_bin, entries[0], [m.id for m in batch], batch[0].spec_filter, codegen=codegen, program_args=program_args)
+    timed_out = False
     try:
-        res = _run_process(cmd, cwd=root, timeout=timeout_sec * min(len(batch), BATCH_TIMEOUT_FACTOR), capture_output=True)
+        res = _run_process(
+            cmd,
+            cwd=root,
+            timeout=timeout_sec * min(len(batch), BATCH_TIMEOUT_FACTOR),
+            capture_output=True,
+            step_timeout=timeout_sec,
+        )
         out_str = res.stdout or ""
     except subprocess.TimeoutExpired as exc:
+        timed_out = True
         out_str = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
     status_by_id = {int(m.group(1)): m.group(2) for line in out_str.splitlines() if (m := _BATCH_LINE_RE.match(line.strip()))}
     remaining: list[Mutant] = []
@@ -844,10 +936,21 @@ def _evaluate_mutant_batch(
             m.status = status_by_id[m.id]
         else:
             remaining.append(m)
-    if remaining:
-        remaining[0].status = _evaluate_one_mutant(remaining[0], root, runner, luau_bin, entries, timeout_sec, codegen, program_args)
-        if len(remaining) > 1:
-            _evaluate_mutant_batch(remaining[1:], root, runner, luau_bin, entries, timeout_sec, codegen, program_args)
+    if not remaining:
+        return None, []
+    if timed_out and len(remaining) == len(batch):
+        remaining[0].status = "TIMEOUT"
+        head: Mutant | None = None
+    else:
+        head = remaining[0]
+    tail = remaining[1:]
+    if defer_remaining:
+        return head, tail
+    if head is not None:
+        head.status = _evaluate_one_mutant(head, root, runner, luau_bin, entries, timeout_sec, codegen, program_args)
+    if tail:
+        _evaluate_mutant_batch(tail, root, runner, luau_bin, entries, timeout_sec, codegen, program_args)
+    return None, []
 
 
 def summarize(mutants: list[Mutant], out=None, max_survived: int = 50, root: Path | None = None) -> float:
@@ -929,6 +1032,7 @@ def summary_markdown(mutants: list[Mutant], score: float, max_survived: int = 20
 
 
 DEFAULT_TIMEOUT = 5.0
+MIN_MUTANT_TIMEOUT = 1.0
 BATCH_SIZE = 32
 BASELINE_TIMEOUT_FACTOR = 4.0
 BASELINE_TIMEOUT_FLOOR = 30.0
@@ -1078,6 +1182,7 @@ def main(args) -> int:
     include_raw = args.paths or as_list(table.get("include")) or as_list(cov_table.get("include")) or ["src"]
     include = [coverage_mod.norm(str(p)).rstrip("/") for p in include_raw]
     exclude = [coverage_mod.norm(str(p)).rstrip("/") for p in as_list(table.get("exclude"))]
+    explicit_timeout = args.timeout is not None or "timeout" in table
     timeout_sec = float(args.timeout if args.timeout is not None else table.get("timeout", DEFAULT_TIMEOUT))
     minimum = args.min if args.min is not None else table.get("min")
     max_mutants_raw = args.max_mutants if args.max_mutants is not None else table.get("max_mutants")
@@ -1208,8 +1313,9 @@ def main(args) -> int:
                 elapsed = fut.result()
                 baseline_by_filter[filt] = max(baseline_by_filter.get(filt, 0.0), elapsed)
 
+            mutant_floor = timeout_sec if explicit_timeout else min(timeout_sec, MIN_MUTANT_TIMEOUT)
             timeout_by_filter = {
-                filt: max(timeout_sec, BASELINE_FACTOR * elapsed)
+                filt: max(mutant_floor, BASELINE_FACTOR * elapsed)
                 for filt, elapsed in baseline_by_filter.items()
             }
             worker_count = max(1, jobs)
@@ -1219,13 +1325,25 @@ def main(args) -> int:
                 for filt, filt_mutants in sorted(by_filter.items(), key=lambda kv: -baseline_by_filter.get(kv[0], 0.0))
                 for i in range(0, len(filt_mutants), dynamic_batch_size)
             ]
-            futures = [
-                pool.submit(_evaluate_mutant_batch, batch, work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args)
+            pending = {
+                pool.submit(_evaluate_mutant_batch, batch, work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args, True): filt_timeout
                 for batch, filt_timeout in batches
-            ]
-            for future in as_completed(futures):
-                future.result()
+            }
+            while pending:
+                done_fut = next(as_completed(pending))
+                filt_timeout = pending.pop(done_fut)
+                res = done_fut.result()
+                if res is None:
+                    continue
+                head, tail = res
+                if head is not None:
+                    pending[pool.submit(_evaluate_single_mutant, head, work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args)] = filt_timeout
+                if len(tail) == 1:
+                    pending[pool.submit(_evaluate_single_mutant, tail[0], work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args)] = filt_timeout
+                elif len(tail) > 1:
+                    pending[pool.submit(_evaluate_mutant_batch, tail, work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args, True)] = filt_timeout
         except BaseException:
+            _kill_active_procs()
             pool.shutdown(wait=True, cancel_futures=True)
             raise
         else:

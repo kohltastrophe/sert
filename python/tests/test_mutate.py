@@ -146,8 +146,18 @@ class MutateSchemaTest(Case):
         ]) as run_mock:
             mutate._evaluate_mutant_batch([m1, m2, m3, m4_tail], self.tmp, "luau", "luau", ["test/spec.luau"], 1.0)
             self.assertEqual(run_mock.call_args_list[0].kwargs["timeout"], 4.0)
+            self.assertEqual(run_mock.call_args_list[0].kwargs["step_timeout"], 1.0)
             self.assertEqual(len(run_mock.call_args_list), 3)
         self.assertEqual((m1.status, m2.status, m3.status, m4_tail.status), ("KILLED", "TIMEOUT", "SURVIVED", "KILLED"))
+
+        mh1, mh2 = [mutate.Mutant(id=i, file="src/A.luau", line=i + 2, op="stmt_del", original="x=1", mutated="--") for i in (1, 2)]
+        with mock.patch("sert.mutate._run_process", side_effect=[
+            subprocess.TimeoutExpired(cmd=["luau"], timeout=1.0, output=""),
+            subprocess.CompletedProcess(["luau"], 0, "", ""),
+        ]) as head_mock:
+            mutate._evaluate_mutant_batch([mh1, mh2], self.tmp, "luau", "luau", ["test/spec.luau"], 1.0)
+            self.assertEqual(len(head_mock.call_args_list), 2)
+        self.assertEqual((mh1.status, mh2.status), ("TIMEOUT", "SURVIVED"))
 
         big_batch = [mutate.Mutant(id=i, file="src/A.luau", line=i, op="stmt_del", original="x=1", mutated="--") for i in range(1, 20)]
         with mock.patch("sert.mutate._run_process", return_value=subprocess.CompletedProcess(["luau"], 0, stdout="\n".join(f"[sert-mutant] {i}=KILLED" for i in range(1, 20)))) as big_mock:
