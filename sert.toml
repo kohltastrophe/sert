@@ -1,0 +1,41 @@
+# sert's own configuration: the toolkit tests itself with its own CLI (PYTHONPATH=python python3 -m sert ...).
+
+[test]
+specs = ["test/*.spec.luau"]
+codegen = true
+
+[coverage]
+include = ["src"]
+min = 90
+
+[mutate]
+include = ["src"]
+
+# Compile-time probes of the public types (run by `sert lint` or `sert lint --only types`): pass files analyze clean,
+# fail files error on exactly their `-- expect-error` lines, under both solvers.
+[types]
+pass = ["test/types"]
+fail = ["test/types/fail"]
+
+[studio]
+project = "test/roblox/default.project.json"
+specs = ["test/roblox/specs/**/*.spec.luau"]
+
+[lint]
+paths = ["src", "test"]
+project = "test/roblox/default.project.json"
+solvers = ["new", "old"]
+selene = true
+stub = false
+
+[release]
+prefix = "v"
+versions = [
+	{ file = "python/sert/__init__.py", pattern = '^VERSION = "([^"]+)"$' },
+	{ file = "actions/setup/action.yml", pattern = '^\s*SERT_ACTION_VERSION: "([^"]+)"' },
+	{ file = "actions/setup/action.yml", pattern = '^#.*uses: kohltastrophe/sert/actions/setup@v([^\s`")]+)' },
+	{ file = "README.md", pattern = 'sert/v([^\s`")]+)/tools/sert\.py' },
+	{ file = "README.md", pattern = 'actions/setup@v([^\s`")]+)' },
+	{ file = "docs/ci.md", pattern = 'actions/setup@v([^\s`")]+)' },
+	{ file = "docs/cli.md", pattern = '`version = "([^"]+)"`' },
+]
