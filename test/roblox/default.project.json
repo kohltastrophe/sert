@@ -1,0 +1,14 @@
+{
+	"name": "sert-studio",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"$className": "ReplicatedStorage",
+			"sert": { "$path": "../../src" },
+			"Tests": {
+				"$className": "Folder",
+				"specs": { "$path": "specs" }
+			}
+		}
+	}
+}
