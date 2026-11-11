@@ -1,0 +1,108 @@
+# Set up a sert consumer: install Python (`python-version`), the rokit toolchain (cached on rokit.toml), restore the
+# sert download cache, run `tools/sert.py fetch` and put .sert/bin on PATH. Run it after actions/checkout. Works on
+# Linux, macOS and Windows runners (every step runs under bash; Python is `python3`, or `python` on Windows).
+#
+#   - uses: kohltastrophe/sert/actions/setup@v0.1.0
+#
+# With `sert-ref`, both the CLI and the Luau `sert` package are mirrored from that git ref of kohltastrophe/sert
+# instead of the release sert.toml / sert.lock pins (for trying an unreleased sert). Never use it for a release.
+name: Set up sert
+description: Install the rokit toolchain and fetch the verified sert release and types pinned in sert.toml and sert.lock
+
+inputs:
+  python-version:
+    description: Python for the sert CLI, 3.11 or newer (empty = the runner's own Python)
+    required: false
+    default: "3.13"
+  sert-ref:
+    description: Run the sert CLI from this git ref of kohltastrophe/sert instead of the pinned release (empty = pinned)
+    required: false
+    default: ""
+  cache-key-extra:
+    description: Extra text for the sert cache key, to split caches between jobs or force a fresh download
+    required: false
+    default: ""
+  rokit:
+    description: Install the rokit toolchain from rokit.toml (false when the job already provides luau/tools)
+    required: false
+    default: "true"
+  token:
+    description: Sent as GITHUB_TOKEN to github.com downloads (rate limits, private releases)
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      if: inputs.python-version != ''
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    # Caches ~/.rokit/bin and ~/.rokit/tool-storage under `<os>-rokit-<hashFiles(rokit.toml)>`.
+    - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+      if: inputs.rokit == 'true'
+      with:
+        version: v1.2.0
+        cache: true
+
+    # The cache key covers [sert] in sert.toml, sert.lock, and [tools] in rokit.toml so editing other settings keeps
+    # the cache.
+    - name: Hash the pins
+      id: pins
+      shell: bash
+      env:
+        PY: ${{ runner.os == 'Windows' && 'python' || 'python3' }}
+      run: |
+        "$PY" - >> "$GITHUB_OUTPUT" <<'PY'
+        import hashlib, json, pathlib, tomllib
+        pins = {}
+        for name, tables in (("sert.toml", ("sert",)), ("rokit.toml", ("tools",))):
+            path = pathlib.Path(name)
+            data = tomllib.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else {}
+            pins[name] = {table: data.get(table) for table in tables}
+        lock_path = pathlib.Path("sert.lock")
+        pins["sert.lock"] = tomllib.loads(lock_path.read_text(encoding="utf-8-sig")) if lock_path.is_file() else {}
+        print("hash=" + hashlib.sha256(json.dumps(pins, sort_keys=True).encode()).hexdigest()[:32])
+        PY
+
+    # The sert download cache holds downloaded release assets and .sert the extracted tree; both follow from the pins alone.
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ runner.os == 'Windows' && '~\AppData\Local\sert' || runner.os == 'macOS' && '~/Library/Caches/sert' || '~/.cache/sert' }}
+          .sert/bin
+          .sert/sert
+          .sert/types
+        key: sert-${{ runner.os }}-${{ steps.pins.outputs.hash }}${{ inputs.sert-ref != '' && format('-ref-{0}', inputs.sert-ref) || '' }}${{ inputs.cache-key-extra != '' && format('-{0}', inputs.cache-key-extra) || '' }}
+        restore-keys: |
+          sert-${{ runner.os }}-
+
+    - name: Check out the sert CLI at ${{ inputs.sert-ref }}
+      if: inputs.sert-ref != ''
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: kohltastrophe/sert
+        ref: ${{ inputs.sert-ref }}
+        path: .sert/sert-ref
+        persist-credentials: false
+
+    - name: Fetch sert and the pinned deps
+      shell: bash
+      env:
+        SERT_ACTION_VERSION: "0.1.0"
+        SERT_REF: ${{ inputs.sert-ref }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        PY: ${{ runner.os == 'Windows' && 'python' || 'python3' }}
+        WORKSPACE: ${{ github.workspace }}
+      run: |
+        echo "sert setup action v$SERT_ACTION_VERSION"
+        if [ -n "$SERT_REF" ]; then
+          # Later steps reach the checked-out CLI through SERT_SOURCE (tools/sert.py runs it instead of the pyz).
+          echo "::warning::sert CLI from ref '$SERT_REF', not the pinned release"
+          echo "SERT_SOURCE=$WORKSPACE/.sert/sert-ref" >> "$GITHUB_ENV"
+          SERT_SOURCE="$WORKSPACE/.sert/sert-ref" PYTHONPATH="$WORKSPACE/.sert/sert-ref/python" "$PY" -P -m sert fetch
+        else
+          "$PY" tools/sert.py fetch
+        fi
+        echo "$WORKSPACE/.sert/bin" >> "$GITHUB_PATH"
