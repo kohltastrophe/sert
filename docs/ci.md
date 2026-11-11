@@ -1,6 +1,6 @@
 # GitHub Actions (`ci.md`)
 
-`kohltastrophe/sert/actions/setup@v0.1.0` sets up Python, installs your Rokit toolchain from `rokit.toml`, restores cached downloads, runs `python3 tools/sert.py fetch` with SHA-256 verification against `sert.lock`, and adds `.sert/bin` to `PATH`. It runs on Linux, macOS, and Windows runners.
+`kohltastrophe/sert/actions/setup@v0.2.0` sets up Python, installs your Rokit toolchain from `rokit.toml`, restores cached downloads, runs `python3 tools/sert.py fetch` with SHA-256 verification against `sert.lock`, and adds `.sert/bin` to `PATH`. It runs on Linux, macOS, and Windows runners.
 
 ## Workflow example (`.github/workflows/ci.yml`)
 
@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.2.0
       - name: Lint, test, and verify coverage
         run: python3 tools/sert.py check
       - name: JUnit report
@@ -44,7 +44,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.2.0
       - run: python3 tools/sert.py run --exhaustive --budget 600
 
   cloud:
@@ -56,7 +56,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.2.0
       - name: Run Open Cloud specs
         env:
           ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}

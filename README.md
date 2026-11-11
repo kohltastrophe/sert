@@ -30,7 +30,7 @@ end)
 `sert` requires Python 3.11 or newer and [Rokit](https://github.com/rojo-rbx/rokit) to manage `luau`, `rojo`, `selene`, `StyLua`, and `luau-lsp`.
 
 ```sh
-curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.0/tools/sert.py
+curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.2.0/tools/sert.py
 python3 tools/sert.py init --fetch
 rokit install
 python3 tools/sert.py run
@@ -39,7 +39,7 @@ python3 tools/sert.py run
 On Windows, download `tools/sert.py` with PowerShell and run `python` instead of `python3`:
 
 ```powershell
-mkdir -Force tools; iwr https://raw.githubusercontent.com/kohltastrophe/sert/v0.1.0/tools/sert.py -OutFile tools/sert.py
+mkdir -Force tools; iwr https://raw.githubusercontent.com/kohltastrophe/sert/v0.2.0/tools/sert.py -OutFile tools/sert.py
 python tools/sert.py init --fetch
 rokit install
 python tools/sert.py run
@@ -175,7 +175,7 @@ python3 tools/sert.py studio --clients 2
 | [docs/sim.md](docs/sim.md) | Multi-peer `sert.sim`, unified `Spec<State, Sut>`, VOPR fault injection, `{ replay = "v1:..." }` reproduction, remote faults, and Teleport/BindToClose/ProcessReceipt hazards. |
 | [docs/roblox.md](docs/roblox.md) | Zero-boilerplate `sert studio` and `sert cloud`, target tags, `--device`, `--clients`, `--warm`, `Layout`, `Flicker`, `fuzzRemote`, and `sweep`. |
 | [docs/cli.md](docs/cli.md) | All CLI commands (`init`, `fetch`, `lint`, `run`, `coverage`, `mutate`, `check`, `studio`, `cloud`), `sert.toml`, and `sert.lock`. |
-| [docs/ci.md](docs/ci.md) | GitHub Actions setup (`kohltastrophe/sert/actions/setup@v0.1.0`), lockfile caching, coverage and mutation gates, and Open Cloud secrets. |
+| [docs/ci.md](docs/ci.md) | GitHub Actions setup (`kohltastrophe/sert/actions/setup@v0.2.0`), lockfile caching, coverage and mutation gates, and Open Cloud secrets. |
 
 ## CI
 
@@ -185,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.1.0
+      - uses: kohltastrophe/sert/actions/setup@v0.2.0
       - run: python3 tools/sert.py check
       - run: python3 tools/sert.py mutate --diff origin/main
 ```

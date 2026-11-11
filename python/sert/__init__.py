@@ -4,7 +4,7 @@ VERSION is the single source of sert's release version: `scripts/pack.py` names 
 release tags are `v<VERSION>`.
 """
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 __version__ = VERSION
 
 LUAU = "0.724"
