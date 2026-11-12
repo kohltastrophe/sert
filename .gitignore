@@ -1,0 +1,23 @@
+/*.rbxl
+/*.rbxlx
+/*.rbxlx.lock
+/*.rbxl.lock
+/*.rbxm
+/*.rbxmx
+
+/sourcemap.json
+
+/.sert/
+/sert.local.toml
+/coverage.out
+/coverage.info
+/coverage.json
+/sert-junit.xml
+/release-notes.md
+/build/
+/dist/
+__pycache__/
+
+# plexer's local graph cache — regenerable, not committed (run `plexer build`).
+/plexer/
+/.claude/

@@ -1,0 +1,7 @@
+[tools]
+luau = "luau-lang/luau@0.724"
+lute = "luau-lang/lute@1.0.0"
+rojo = "rojo-rbx/rojo@7.7.0"
+selene = "Kampfkarren/selene@0.31.0"
+StyLua = "JohnnyMorganz/StyLua@2.5.2"
+luau-lsp = "JohnnyMorganz/luau-lsp@1.70.0"

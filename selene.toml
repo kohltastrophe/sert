@@ -1,0 +1,8 @@
+std = "roblox"
+
+# A generator callback names its Gen `g` like the enclosing one (`g:list(function(g) ... end)`), as the docs do.
+[config]
+shadowing = { ignore_pattern = "^_|^g$" }
+
+[rules]
+multiple_statements = "allow"
