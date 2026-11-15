@@ -118,3 +118,19 @@ local _badMeta: sert.MetamorphicSpec<number, number> = { gen = intGen, sut = 123
 local _badMetaRel: sert.MetamorphicSpec<number, number> = { gen = intGen, sut = idFn, relations = "bad" } -- expect-error
 local _badComp: sert.ComplexitySpec<number> = { bound = "O(2^n)", gen = lenFn } -- expect-error
 local _badCompSizes: sert.ComplexitySpec<number> = { bound = "O(n)", sizes = { "big" }, gen = lenFn } -- expect-error
+
+-- Wave 1 & Wave 2: Sim linearizable, recorder & explore
+local seqModelMisuse: sert.SimSequentialModel<number, number, number> = {
+	init = function() return 0 end,
+	step = function(s: number, _op: string, a: number, r: number) return r == s + a, s + a end,
+}
+local recMisuse = sert.sim.recorder()
+sert.sim.linearizable(123, {}) -- expect-error
+sert.sim.linearizable(seqModelMisuse, { { proc = 1 } }) -- expect-error
+sert.sim.recorder("not-fn") -- expect-error
+recMisuse:call(true, "op", 1) -- expect-error
+recMisuse:call("p1", 123, 1) -- expect-error
+recMisuse:finish("bad-handle", 1) -- expect-error
+sert.sim.explore(123) -- expect-error
+sert.sim.explore({ maxRuns = "ten" }, function() end) -- expect-error
+sert.sim.explore("named", function() end, { stateHash = "bad" }) -- expect-error

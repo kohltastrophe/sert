@@ -257,6 +257,8 @@ export type World = typeof(World) & {
 	http: any,
 	pendingCloud: number,
 	pendingRemotes: number,
+	_inflightRemotes: { [number]: any },
+	_nextRemotePacketId: number,
 }
 
 export type Server = typeof(Server) & {
@@ -437,6 +439,8 @@ function World.new(options: Options?): World
 		nextReceiptSeq = 1,
 		pendingCloud = 0,
 		pendingRemotes = 0,
+		_inflightRemotes = {},
+		_nextRemotePacketId = 0,
 		kicks = {},
 		remoteErrors = {},
 		receipts = {},
@@ -497,6 +501,8 @@ local LATENCY_ALIASES: { [string]: string } = {
 	messagingservice = "MessagingService",
 	http = "HttpService",
 	httpservice = "HttpService",
+	remote = "Remote",
+	remotes = "Remote",
 }
 
 local function normalizeLatencyKind(kind: string): string

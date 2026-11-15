@@ -97,11 +97,22 @@ export type SimServer = sim.Server
 export type SimClient = sim.Client
 export type SimFaultConfig = sim.FaultConfig
 export type SimFaults = sim.Faults
+export type SimRemoteError = sim.RemoteError
 export type SimCommand<State, Sut = any, Arg = any, Res = any> = sim.Command<State, Sut, Arg, Res>
 export type SimSpec<State, Sut = any> = sim.Spec<State, Sut>
+export type SimTraceStep = sim.TraceStep
+export type SimBfsOptions = sim.BfsOptions
+export type SimBfsResult = sim.BfsResult
 export type SimVoprOptions = sim.VoprOptions
 export type SimCheckOptions = sim.CheckOptions
 export type SimCheckResult = sim.CheckResult
+export type SimOperation<Arg = any, Res = any> = sim.Operation<Arg, Res>
+export type SimSequentialModel<State, Arg = any, Res = any> = sim.SequentialModel<State, Arg, Res>
+export type LinearizeResult = sim.LinearizeResult
+export type SimRecorder = sim.Recorder
+export type SimOperationHandle = sim.OperationHandle
+export type SimExploreOptions = sim.ExploreOptions
+export type SimExploreOutcome = sim.ExploreOutcome
 
 export type RobloxConfig = roblox.Config
 export type RobloxContext = roblox.Context
@@ -115,6 +126,12 @@ export type SweepOptions = roblox.SweepOptions
 
 export type JsonOptions = format.JsonOptions
 
+type SimExploreFn = (
+	optsOrName: string | sim.ExploreOptions | ((world: sim.World) -> ()),
+	maybeFn: ((world: sim.World) -> ())?,
+	maybeOpts: sim.ExploreOptions?
+) -> sim.ExploreOutcome?
+
 local api = registry.api
 local output = registry.output
 
@@ -123,6 +140,23 @@ local publicBytes = table.freeze({
 	fromHex = bytes.fromHex,
 })
 
+local publicSim: {
+	Scheduler: typeof(sim.Scheduler),
+	Fabric: typeof(sim.Fabric),
+	spec: typeof(sim.spec),
+	verifyTrace: typeof(sim.verifyTrace),
+	toItfJson: typeof(sim.toItfJson),
+	canonicalize: typeof(sim.canonicalize),
+	linearizable: typeof(sim.linearizable),
+	checkLinearizable: typeof(sim.checkLinearizable),
+	recorder: typeof(sim.recorder),
+	vopr: typeof(sim.vopr),
+	new: typeof(sim.new),
+	check: typeof(sim.check),
+	explore: SimExploreFn,
+} =
+	sim :: any
+
 local sert = {
 	-- Runtime & Subsystems
 	isRoblox = IS_ROBLOX,
@@ -130,7 +164,7 @@ local sert = {
 	laws = laws,
 	model = model,
 	env = env :: env.EnvNamespace,
-	sim = sim,
+	sim = publicSim,
 	roblox = roblox,
 	bytes = publicBytes,
 

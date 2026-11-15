@@ -1,6 +1,7 @@
 --!strict
 -- Headless Roblox datatypes and engine services exposed through `sert.env.new()`.
 
+local Signal = require("../src/engine/signal")
 local sert = require("../src")
 
 local describe = sert.describe
@@ -918,4 +919,64 @@ describe("Engine extended datatypes, persistence versions, and boundary serializ
 			sert.ok(ms:evict() ~= nil)
 		end
 	)
+end)
+
+describe("Scheduler helpers and Signal.fromWorld", function()
+	test("Scheduler.record, replay, runFor, runUntil, and stateDigest behave deterministically", function()
+		local Scheduler = sert.sim.Scheduler
+		local rec = Scheduler.record(Scheduler.replay({ 2, { value = 3 }, 99 }))
+		local s1 = Scheduler.new({ seed = 1, frame = 0.05, chooser = rec })
+		sert.eq(s1:choose(3, "first"), 2)
+		sert.eq(s1:choose(4, "second"), 3)
+		sert.eq(s1:choose(2, "clamped"), 1)
+		sert.eq(#rec.choices, 3)
+		sert.eq(rec.choices[2], { n = 4, label = "second", value = 3 })
+
+		local replayed = Scheduler.new({ seed = 1, frame = 0.05, chooser = Scheduler.replay(rec.choices) })
+		sert.eq(replayed:choose(3, "first"), 2)
+		sert.eq(replayed:choose(4, "second"), 3)
+		sert.eq(replayed:choose(2, "clamped"), 1)
+
+		local ran = 0
+		s1:defer("worker", function()
+			ran += 1
+		end)
+		s1:after(0.15, "timerOwner", function()
+			ran += 10
+		end)
+		local digestA = s1:stateDigest()
+		sert.contains(digestA, "q:[string:worker@")
+		sert.contains(digestA, "tm:[string:timerOwner+150000000#")
+
+		s1:runFor(0.1)
+		sert.eq(ran, 1)
+		sert.eq(s1:runUntil(function() return ran >= 11 end, 1), true)
+		sert.eq(ran, 11)
+		sert.eq(s1:runUntil(function() return false end, 0.1), false)
+	end)
+
+	test("Signal.fromWorld supports Immediate vs Deferred dispatch and Wait from world tasks", function()
+		local w = sert.sim.new({ seed = 1 })
+		local srv = w:server({ name = "srv", skew = 0 })
+
+		local emptyHits = 0
+		local imm = Signal.fromWorld(w, srv, function()
+			emptyHits += 1
+		end, true)
+		local log: { string } = {}
+		local conn = imm:Connect(function(v: string) table.insert(log, v) end)
+		imm:Fire("now")
+		sert.eq(log, { "now" })
+		conn:Disconnect()
+		sert.eq(emptyHits, 1)
+
+		local def = Signal.fromWorld(w, srv)
+		local got: any = nil
+		srv:spawn(function() got = def:Wait() end)
+		w:converge()
+		def:Fire(42)
+		sert.eq(got, nil)
+		w:converge()
+		sert.eq(got, 42)
+	end)
 end)

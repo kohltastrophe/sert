@@ -56,10 +56,16 @@ export type HostHooks = {
 	resume: (thread: thread, ...any) -> (),
 }
 
-export type ExploreLimits = { maxChoices: number?, maxRuns: number?, maxBranch: number? }
+export type ExploreLimits = {
+	maxChoices: number?,
+	maxRuns: number?,
+	maxBranch: number?,
+	stateHash: (() -> (string | number)?)?,
+}
 export type ExploreFailure = { choices: { number }, error: any }
 export type ExploreOutcome = {
 	runs: number,
+	pruned: number,
 	truncated: boolean,
 	limit: ("maxRuns" | "maxChoices")?,
 	failure: ExploreFailure?,
@@ -100,6 +106,7 @@ export type Scheduler = {
 	host: (self: Scheduler, owner: any) -> HostHooks,
 	trace: (self: Scheduler, text: string) -> (),
 	digest: (self: Scheduler) -> number,
+	stateDigest: (self: Scheduler) -> string,
 }
 
 type Timer = {
@@ -730,31 +737,145 @@ function Scheduler.trace(s: State, text: string)
 	fold(s, text)
 end
 
+local function ownerDigestLabel(ownerKey: any): string
+	local owner = ownerOf(ownerKey)
+	if owner == nil then return "main" end
+	local ot = type(owner)
+	if ot == "string" or ot == "number" or ot == "boolean" then return `{ot}:{tostring(owner)}` end
+	if ot == "table" then
+		local rawTbl: any = owner
+		local rawName = rawget(rawTbl, "name")
+		if type(rawName) == "string" or type(rawName) == "number" then return `peer:{tostring(rawName)}` end
+		local instName = rawget(rawTbl, "Name")
+		if type(instName) == "string" or type(instName) == "number" then return `name:{tostring(instName)}` end
+		return "table"
+	end
+	return ot
+end
+
 function Scheduler.digest(s: State): number return s.hash end
 
---- Exhaustively explores all decision prefixes of `body(chooser)` up to `limits`.
+--- Returns a deterministic structural digest of queued work, active timers, dead owners, errors, and virtual time.
+function Scheduler.stateDigest(s: State): string
+	local nowUnits = math.round(s.now * 1e9)
+	if nowUnits == 0 then nowUnits = 0 end
+
+	local seqs: { number } = {}
+	for idx = s.head, s.tail do
+		local entry = s.queue[idx]
+		if entry ~= nil and not entry.cancelled then table.insert(seqs, entry.seq) end
+	end
+	for _, timer in s.timers do
+		if not timer.cancelled then table.insert(seqs, timer.seq) end
+	end
+	table.sort(seqs)
+
+	local seqOrd: { [number]: number } = {}
+	local ordinal = 0
+	for _, seqVal in seqs do
+		if seqOrd[seqVal] == nil then
+			ordinal += 1
+			seqOrd[seqVal] = ordinal
+		end
+	end
+
+	local qParts: { string } = {}
+	for idx = s.head, s.tail do
+		local entry = s.queue[idx]
+		if entry ~= nil and not entry.cancelled then
+			table.insert(qParts, `{ownerDigestLabel(entry.owner)}@{entry.depth}#{seqOrd[entry.seq]}`)
+		end
+	end
+
+	type TimerDigest = { delta: number, ord: number, owner: string }
+	local timerList: { TimerDigest } = {}
+	for _, timer in s.timers do
+		if not timer.cancelled then
+			local delta = math.round(math.max(0, timer.wake - s.now) * 1e9)
+			if delta == 0 then delta = 0 end
+			table.insert(timerList, {
+				delta = delta,
+				ord = seqOrd[timer.seq] or 0,
+				owner = ownerDigestLabel(timer.owner),
+			})
+		end
+	end
+	table.sort(timerList, function(a: TimerDigest, b: TimerDigest): boolean
+		if a.delta ~= b.delta then return a.delta < b.delta end
+		if a.ord ~= b.ord then return a.ord < b.ord end
+		return a.owner < b.owner
+	end)
+	local timerParts: { string } = table.create(#timerList, "")
+	for i, item in timerList do
+		timerParts[i] = `{item.owner}+{item.delta}#{item.ord}`
+	end
+
+	local deadOwners: { string } = {}
+	for ownerKey, isDead in s.dead do
+		if isDead then table.insert(deadOwners, ownerDigestLabel(ownerKey)) end
+	end
+	table.sort(deadOwners)
+
+	return `t:{nowUnits};e:{#s.errors};q:[{table.concat(qParts, ",")}];tm:[{table.concat(timerParts, ",")}];d:[{table.concat(
+		deadOwners,
+		","
+	)}]`
+end
+
+--- Exhaustively explores all decision prefixes of `body(chooser)` up to `limits` with optional state-hashed pruning.
 function Scheduler.explore(body: (chooser: Chooser) -> (), limits: ExploreLimits?): ExploreOutcome
 	local given: ExploreLimits = limits or {}
 	local maxChoices = given.maxChoices or 64
 	local maxRuns = given.maxRuns or 10000
 	local maxBranch = given.maxBranch or math.huge
+	local stateHash = given.stateHash
 	local prefix: { number } = {}
-	local runs, branched = 0, false
+	local cleanStates: { [string]: boolean } = {}
+	local taintedPrefix: { [number]: boolean } = {}
+	local runs, pruned, branched = 0, 0, false
 	local limit: ("maxRuns" | "maxChoices")? = nil
 	while true do
-		if runs >= maxRuns then return { runs = runs, truncated = true, limit = "maxRuns", failure = nil } end
+		if runs >= maxRuns then
+			return { runs = runs, pruned = pruned, truncated = true, limit = "maxRuns", failure = nil }
+		end
 		runs += 1
 		local values, sizes: { number } = {}, {}
+		local runStateKeys: { string? } = {}
+		local prunedThisRun = false
 		local chooser: Chooser = {
 			choose = function(_self: any, n: number, _label: string): number
+				if prunedThisRun then return 1 end
 				local index = #values + 1
 				if index > maxChoices then
 					limit = "maxChoices"
+					for d = 1, #values do
+						taintedPrefix[d] = true
+					end
 					return 1
+				end
+				if stateHash ~= nil then
+					local rawHash = stateHash()
+					if rawHash ~= nil then
+						local tag = if type(rawHash) == "number"
+							then `n:{string.format("%.17g", rawHash :: number)}`
+							else `s:{tostring(rawHash)}`
+						local key = `{index}:{tag}`
+						if cleanStates[key] then
+							pruned += 1
+							prunedThisRun = true
+							return 1
+						end
+						runStateKeys[index] = key
+					end
 				end
 				local value = math.min(prefix[index] or 1, n)
 				values[index], sizes[index] = value, n
-				if n > maxBranch then branched = true end
+				if n > maxBranch then
+					branched = true
+					for d = 1, index do
+						taintedPrefix[d] = true
+					end
+				end
 				return value
 			end,
 		}
@@ -762,6 +883,7 @@ function Scheduler.explore(body: (chooser: Chooser) -> (), limits: ExploreLimits
 		if not ok then
 			return {
 				runs = runs,
+				pruned = pruned,
 				truncated = branched or limit ~= nil,
 				limit = limit,
 				failure = { choices = values, error = err },
@@ -769,10 +891,16 @@ function Scheduler.explore(body: (chooser: Chooser) -> (), limits: ExploreLimits
 		end
 		local depth = #values
 		while depth > 0 and values[depth] >= math.min(sizes[depth], maxBranch) do
+			local key = runStateKeys[depth]
+			if key ~= nil and not taintedPrefix[depth] then cleanStates[key] = true end
+			taintedPrefix[depth] = nil
 			depth -= 1
 		end
 		if depth == 0 then
-			return { runs = runs, truncated = branched or limit ~= nil, limit = limit, failure = nil }
+			return { runs = runs, pruned = pruned, truncated = branched or limit ~= nil, limit = limit, failure = nil }
+		end
+		for j, _ in taintedPrefix do
+			if j > depth then taintedPrefix[j] = nil end
 		end
 		prefix = table.move(values, 1, depth - 1, 1, {})
 		prefix[depth] = values[depth] + 1

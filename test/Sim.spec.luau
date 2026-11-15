@@ -2,6 +2,7 @@
 -- Deterministic multi-peer simulation (`sert.sim`), unified `Spec<State, Sut>` model checking & VOPR,
 -- trace shrinking + `v1:` replay tokens, and distributed Roblox cloud/network hazard regressions.
 
+local SimMod = require("../src/sim")
 local registry = require("../src/core/registry")
 local sert = require("../src")
 
@@ -280,8 +281,10 @@ describe("Unified Spec<State, Sut>, sert.sim.vopr, shrinking & replay tokens", f
 				return log
 			end
 
-			sert.eq(recordRun(777), recordRun(777))
-			sert.ne(recordRun(777), recordRun(888))
+			local runA = recordRun(777)
+			local runB = recordRun(777)
+			sert.eq(runA, runB)
+			sert.ne(runA, recordRun(888))
 
 			-- Invariant assertion failures MUST NEVER be swallowed: they shrink, emit ONE `[world ...]` summary,
 			-- and produce a copy-paste `{ replay = "v1:..." }` token that reproduces the exact minimal failure in 1 trial!
@@ -1766,4 +1769,256 @@ describe("World & Fabric partitions, remote FIFO/RPC disconnect, and cloud fault
 			sert.eq(restarted1.state, "crashed")
 		end
 	)
+end)
+
+describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
+	test("Scheduler.explore prunes redundant (depth, stateDigest) subtrees and preserves failure detection", function()
+		-- Diamond branches [1, 2] and [2, 1] converge to stateVal == 3 before three trailing binary choices.
+		local stateVal = 0
+		local fullCount = 0
+		local prunedOutcome = Sim.Scheduler.explore(function(chooser)
+			fullCount += 1
+			stateVal = 0
+			local c1 = chooser:choose(2, "c1")
+			stateVal += if c1 == 1 then 1 else 2
+			local c2 = chooser:choose(2, "c2")
+			stateVal += if c2 == 1 then 1 else 2
+			local t1 = chooser:choose(2, "t1")
+			local t2 = chooser:choose(2, "t2")
+			local _t3 = chooser:choose(2, "t3")
+			sert.ok(stateVal ~= 99 and t1 >= 1 and t2 >= 1)
+		end, {
+			stateHash = function(): number return stateVal end,
+		})
+		-- 13 executed runs vs 32 brute force (7 redundant subtrees pruned at matching `(depth, stateDigest)`).
+		sert.eq(prunedOutcome.failure, nil)
+		sert.eq(prunedOutcome.pruned, 7)
+		sert.eq(prunedOutcome.runs, 13)
+		sert.eq(fullCount, 13)
+
+		-- Pruning a clean equivalent subtree [2,1] must still explore distinct state [2,2] and catch its bug.
+		local bugVal = 0
+		local bugOutcome = Sim.Scheduler.explore(function(chooser)
+			bugVal = 0
+			local c1 = chooser:choose(2, "c1")
+			bugVal += if c1 == 1 then 1 else 2
+			local c2 = chooser:choose(2, "c2")
+			bugVal += if c2 == 1 then 1 else 2
+			local t1 = chooser:choose(2, "t1")
+			if bugVal == 4 and t1 == 2 then error("reached bad state 4 at t1=2", 0) end
+		end, {
+			stateHash = function(): number return bugVal end,
+		})
+		sert.ok(bugOutcome.failure ~= nil)
+		sert.eq(bugOutcome.pruned, 1)
+		sert.eq(bugOutcome.failure and bugOutcome.failure.choices, { 2, 2, 2 })
+
+		-- Truncated subtrees (`maxChoices` or `maxBranch`) must NEVER be cached as verified in `cleanStates`.
+		local maxChoiceOutcome = Sim.Scheduler.explore(function(chooser)
+			local c1 = chooser:choose(2, "c1")
+			local c2 = chooser:choose(2, "c2")
+			if c1 == 1 and c2 == 1 then
+				-- Hits `maxChoices = 3` at depth 4 inside child (1, 1); ancestor at depth 2 must remain uncached.
+				local _c3 = chooser:choose(1, "c3")
+				local _over = chooser:choose(2, "overLimit")
+			elseif c1 == 2 and c2 == 2 then
+				error("caught unpruned maxChoices sibling", 0)
+			end
+		end, {
+			maxChoices = 3,
+			stateHash = function(): number return 42 end,
+		})
+		sert.eq(maxChoiceOutcome.limit, "maxChoices")
+		sert.eq(maxChoiceOutcome.truncated, true)
+		sert.eq(maxChoiceOutcome.pruned, 0)
+		sert.ok(maxChoiceOutcome.failure ~= nil)
+		sert.contains(
+			tostring(maxChoiceOutcome.failure and maxChoiceOutcome.failure.error),
+			"caught unpruned maxChoices sibling"
+		)
+
+		local maxBranchOutcome = Sim.Scheduler.explore(function(chooser)
+			local c1 = chooser:choose(2, "c1")
+			local c2 = chooser:choose(2, "c2")
+			if c1 == 1 and c2 == 1 then
+				-- `n = 3 > maxBranch = 2` truncates child siblings under `(1, 1)`, so ancestor depth 2 stays uncached.
+				local _truncated = chooser:choose(3, "wide")
+			elseif c1 == 2 and c2 == 2 then
+				error("caught unpruned maxBranch sibling", 0)
+			end
+		end, {
+			maxBranch = 2,
+			stateHash = function(): number return 7 end,
+		})
+		sert.eq(maxBranchOutcome.truncated, true)
+		sert.eq(maxBranchOutcome.pruned, 0)
+		sert.ok(maxBranchOutcome.failure ~= nil)
+		sert.contains(
+			tostring(maxBranchOutcome.failure and maxBranchOutcome.failure.error),
+			"caught unpruned maxBranch sibling"
+		)
+	end)
+
+	test('Sim.explore defaults to exact exploration and supports stateHash = "backing" and custom hashes', function()
+		-- Default `stateHash = nil` and `stateHash = false` perform zero pruning so pure Luau divergence is always found.
+		for _, mode in { nil, false } :: { any } do
+			local exactRuns = 0
+			local exactOutcome = Sim.explore({
+				maxRuns = 32,
+				seed = 7,
+				stateHash = mode,
+			}, function(w: sert.SimWorld)
+				exactRuns += 1
+				local _a = w.scheduler:choose(2, "a")
+				local _b = w.scheduler:choose(2, "b")
+				local _c = w.scheduler:choose(2, "c")
+			end)
+			sert.ok(exactOutcome ~= nil)
+			sert.eq((exactOutcome :: SimMod.ExploreOutcome).pruned, 0)
+			sert.eq((exactOutcome :: SimMod.ExploreOutcome).runs, 8)
+			sert.eq(exactRuns, 8)
+
+			local okLocal, errLocal = pcall(function()
+				Sim.explore({
+					maxRuns = 32,
+					seed = 7,
+					stateHash = mode,
+				}, function(w: sert.SimWorld)
+					local secret = if w.scheduler:choose(2, "c1") == 1 then "left" else "right"
+					local _mid = w.scheduler:choose(2, "mid")
+					local tail = w.scheduler:choose(2, "tail")
+					if secret == "right" and tail == 2 then error("caught local divergence", 0) end
+				end)
+			end)
+			sert.eq(okLocal, false)
+			sert.contains(tostring(errLocal), "caught local divergence")
+		end
+
+		local observedRuns = 0
+		local outcome = Sim.explore({
+			maxRuns = 64,
+			seed = 19,
+			stateHash = "backing" :: "backing",
+		}, function(w: sert.SimWorld)
+			observedRuns += 1
+			w:setLatency("DataStoreService", 0)
+			w:setLatency("MemoryStoreService", 0)
+			local srv = w:server({ name = "app", skew = 0 })
+			local ds = srv.DataStoreService:GetDataStore("items")
+			local ods = srv.DataStoreService:GetOrderedDataStore("board")
+			local ms = srv.MemoryStoreService
+			local hmap = ms:GetHashMap("cache")
+			local q = ms:GetQueue("jobs")
+
+			local order = w.scheduler:choose(2, "writeOrder")
+			srv:spawn(function()
+				if order == 1 then
+					ds:SetAsync("k1", { n = 1 })
+					ds:SetAsync("k2", { n = 2 })
+				else
+					ds:SetAsync("k2", { n = 2 })
+					ds:SetAsync("k1", { n = 1 })
+				end
+				ods:SetAsync("score", 10)
+				hmap:SetAsync("session", "ok", 60)
+				q:AddAsync("jobA", 60, 1)
+			end)
+			w:converge()
+
+			-- Enqueue identical deferred/timed work before trailing decisions so scheduler queues & timers match.
+			w.scheduler:defer("worker", function() end)
+			w.scheduler:after(0.25, srv, function() end)
+
+			local t1 = w.scheduler:choose(2, "tail1")
+			local t2 = w.scheduler:choose(2, "tail2")
+			local t3 = w.scheduler:choose(2, "tail3")
+			local v1, v2 = 0, 0
+			srv:spawn(function()
+				v1 = (ds:GetAsync("k1") :: any).n
+				v2 = (ds:GetAsync("k2") :: any).n
+			end)
+			w:converge()
+			sert.eq(v1, 1)
+			sert.eq(v2, 2)
+			sert.ok(t1 >= 1 and t2 >= 1 and t3 >= 1)
+		end)
+
+		sert.ok(outcome ~= nil)
+		sert.eq((outcome :: SimMod.ExploreOutcome).failure, nil)
+		sert.eq((outcome :: SimMod.ExploreOutcome).pruned, 3)
+		sert.eq((outcome :: SimMod.ExploreOutcome).runs, 5)
+		sert.eq(observedRuns, 5)
+
+		-- `stateHash = "backing"` distinguishes in-flight remote payloads and queued MessagingService publishes.
+		local okRemote, errRemote = pcall(function()
+			Sim.explore({
+				maxRuns = 16,
+				seed = 23,
+				frame = 0.05,
+				faults = "none",
+				stateHash = "backing" :: "backing",
+			}, function(w: sert.SimWorld)
+				w:setLatency("remote", 0.5)
+				local srv = w:server({ name = "srv", skew = 0 })
+				local cli = srv:client(101)
+				local got = ""
+				srv.remotes:channel("cmd").OnServerEvent:Connect(function(_p: any, val: string) got = val end)
+				local kind = w.scheduler:choose(2, "payload")
+				cli.remotes:channel("cmd"):FireServer(if kind == 1 then "good" else "evil")
+				local tail = w.scheduler:choose(2, "tail")
+				w:converge()
+				if got == "evil" and tail == 2 then error("detected evil remote payload", 0) end
+			end)
+		end)
+		sert.eq(okRemote, false)
+		sert.contains(tostring(errRemote), "detected evil remote payload")
+
+		local okMsg, errMsg = pcall(function()
+			Sim.explore({
+				maxRuns = 16,
+				seed = 29,
+				frame = 0.05,
+				faults = "none",
+				stateHash = "backing" :: "backing",
+			}, function(w: sert.SimWorld)
+				w:setLatency("MessagingService", 0)
+				w:setLatency("delivery", 0.5)
+				local srv = w:server({ name = "pub", skew = 0 })
+				local delivered = ""
+				srv:spawn(function()
+					srv.MessagingService:SubscribeAsync("alerts", function(msg: any) delivered = tostring(msg.Data) end)
+				end)
+				w:converge()
+				local pick = w.scheduler:choose(2, "msg")
+				srv:spawn(function() srv.MessagingService:PublishAsync("alerts", if pick == 1 then "ok" else "bad") end)
+				w.scheduler:runFor(0.1)
+				local tail = w.scheduler:choose(2, "tail")
+				w:converge()
+				if delivered == "bad" and tail == 2 then error("detected bad queued message", 0) end
+			end)
+		end)
+		sert.eq(okMsg, false)
+		sert.contains(tostring(errMsg), "detected bad queued message")
+
+		-- Custom `stateHash(world)` receives each constructed World and supports pruning/validation cleanly.
+		local seenWorlds = 0
+		local customOutcome = Sim.explore({
+			stateHash = function(world: sert.SimWorld): string
+				seenWorlds += 1
+				return `{#world.servers}:{math.round(world:now() * 1000)}`
+			end,
+		}, function(w: sert.SimWorld)
+			w:server({ name = "alpha", skew = 0 })
+			local _a = w.scheduler:choose(2, "pickA")
+			local _b = w.scheduler:choose(2, "pickB")
+			local _c = w.scheduler:choose(2, "pickC")
+		end)
+		sert.ok(seenWorlds > 0)
+		sert.ok((customOutcome :: SimMod.ExploreOutcome).pruned >= 1)
+		sert.lt((customOutcome :: SimMod.ExploreOutcome).runs, 8)
+
+		sert.throws(function()
+			Sim.explore({ stateHash = "not-a-function" :: any }, function() end)
+		end, "stateHash must be false")
+	end)
 end)

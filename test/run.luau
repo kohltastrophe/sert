@@ -21,6 +21,7 @@ local SPECS: { string } = {
 	"Engine.spec",
 	"Env.spec",
 	"Sim.spec",
+	"Linearize.spec",
 	"Roblox.spec",
 	"layout_headless.spec",
 }

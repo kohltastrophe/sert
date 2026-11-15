@@ -29,6 +29,7 @@ type PendingCaller = {
 	id: number,
 	active: boolean,
 	thread: thread,
+	clearPacket: (() -> ())?,
 }
 
 type Subscription = {
@@ -1059,8 +1060,11 @@ end
 local function computeRemoteTransit(w: any): (number, boolean)
 	local s = w.scheduler
 	local range = w.faults.remoteLatencyRange
+	local fixedRemote = if w.fixed ~= nil then (w.fixed.Remote or w.fixed.remote or w.fixed.remotes) else nil
 	local delay = 0
-	if type(range) == "table" and #range >= 2 then
+	if type(fixedRemote) == "number" then
+		delay = fixedRemote
+	elseif type(range) == "table" and #range >= 2 then
 		local lo = tonumber(range[1]) or 0
 		local hi = tonumber(range[2]) or lo
 		if hi < lo then hi = lo end
@@ -1135,6 +1139,8 @@ function Fabric.attachRemotes(w: any, server: any): any
 	local function schedulePacket(
 		remoteName: string,
 		unreliable: boolean,
+		dir: string,
+		route: string,
 		packedFactory: () -> { [number]: any, n: number },
 		deliverFn: (packed: { [number]: any, n: number }) -> ()
 	)
@@ -1171,8 +1177,20 @@ function Fabric.attachRemotes(w: any, server: any): any
 			local payload = if copyIdx == 1 then firstPacked else packedFactory()
 			local fireAt = targetAt + (copyIdx - 1) * 0.005
 			w.pendingRemotes = (w.pendingRemotes or 0) + 1
+			local pktId = (w._nextRemotePacketId or 0) + 1
+			w._nextRemotePacketId = pktId
+			if w._inflightRemotes == nil then w._inflightRemotes = {} end
+			w._inflightRemotes[pktId] = {
+				kind = "event",
+				dir = dir,
+				remote = remoteName,
+				route = route,
+				unreliable = unreliable,
+				payload = payload,
+			}
 			w.scheduler:after(math.max(0, fireAt - now), nil, function()
 				w.pendingRemotes = math.max(0, (w.pendingRemotes or 0) - 1)
+				if w._inflightRemotes ~= nil then w._inflightRemotes[pktId] = nil end
 				deliverFn(payload)
 			end)
 		end
@@ -1205,7 +1223,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 			-- Validate eagerly on sender side (matching Roblox RemoteEvent argument checks).
 			local validated = serializeTuple(translateServerToClient(server, target), unpackValues(rawArgs))
 			local firstUsed = false
-			schedulePacket(name, ev.unreliable, function()
+			schedulePacket(name, ev.unreliable, "s->c", `{server.name}->{target.name}`, function()
 				if not firstUsed then
 					firstUsed = true
 					return validated
@@ -1262,10 +1280,22 @@ function Fabric.attachRemotes(w: any, server: any): any
 		end
 
 		local callerThread = coroutine.running()
+		local pktId = (w._nextRemotePacketId or 0) + 1
+		w._nextRemotePacketId = pktId
+		if w._inflightRemotes == nil then w._inflightRemotes = {} end
+		w._inflightRemotes[pktId] = {
+			kind = "rpc_req",
+			remote = name,
+			payload = reqPacked,
+		}
+		local function clearPacket()
+			if w._inflightRemotes ~= nil then w._inflightRemotes[pktId] = nil end
+		end
 		local callerRecord: PendingCaller = {
 			id = nextCallerId,
 			active = true,
 			thread = callerThread,
+			clearPacket = clearPacket,
 		}
 		nextCallerId += 1
 		table.insert(pendingCallers, callerRecord)
@@ -1273,6 +1303,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 		local function removeCaller()
 			if not callerRecord.active then return end
 			callerRecord.active = false
+			clearPacket()
 			for i = #pendingCallers, 1, -1 do
 				if pendingCallers[i] == callerRecord then
 					table.remove(pendingCallers, i)
@@ -1290,6 +1321,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 		w.scheduler:after(math.max(0, reqDelay), nil, function()
 			if not callerRecord.active or not senderAlive() or not receiverAlive() then
 				w.pendingRemotes = math.max(0, (w.pendingRemotes or 0) - 1)
+				clearPacket()
 				if callerRecord.active then
 					done = true
 					replyOk = false
@@ -1298,6 +1330,14 @@ function Fabric.attachRemotes(w: any, server: any): any
 					if coroutine.status(callerThread) == "suspended" then w.scheduler:resume(callerThread) end
 				end
 				return
+			end
+
+			if w._inflightRemotes ~= nil then
+				w._inflightRemotes[pktId] = {
+					kind = "rpc_exec",
+					remote = name,
+					payload = reqPacked,
+				}
 			end
 
 			receiverSpawn(function()
@@ -1312,9 +1352,19 @@ function Fabric.attachRemotes(w: any, server: any): any
 					end)
 				end
 
+				if w._inflightRemotes ~= nil and callerRecord.active then
+					w._inflightRemotes[pktId] = {
+						kind = "rpc_res",
+						remote = name,
+						ok = okCall,
+						payload = if okCall then resOrErr else format.errorText(resOrErr),
+					}
+				end
+
 				local resDelay = (computeRemoteTransit(w))
 				w.scheduler:after(math.max(0, resDelay), nil, function()
 					w.pendingRemotes = math.max(0, (w.pendingRemotes or 0) - 1)
+					clearPacket()
 					if not callerRecord.active then return end
 					done = true
 					if not senderAlive() or not receiverAlive() or shouldDropPacket(w, false) then
@@ -1358,6 +1408,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 		for _, rec in snapshot do
 			if rec.active then
 				rec.active = false
+				if rec.clearPacket ~= nil then rec.clearPacket() end
 				if coroutine.status(rec.thread) == "suspended" then w.scheduler:resume(rec.thread) end
 			end
 		end
@@ -1374,7 +1425,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 				local rawArgs = packValues(...)
 				local validated = serializeTuple(translateClientToServer(client, server), unpackValues(rawArgs))
 				local firstUsed = false
-				schedulePacket(name, ev.unreliable, function()
+				schedulePacket(name, ev.unreliable, "c->s", `{client.name}->{server.name}`, function()
 					if not firstUsed then
 						firstUsed = true
 						return validated

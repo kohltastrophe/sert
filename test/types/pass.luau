@@ -378,3 +378,63 @@ local _compSpec: sert.ComplexitySpec<{ number }> = {
 }
 sert.laws.complexity("scan complexity law", _compSpec, { runs = 3 })
 sert.laws.complexity(_compSpec)
+
+-- Wave 1 & Wave 2: Linearizability, Recorder, and State-Hashed / DPOR Exploration
+local _simOp: sert.SimOperation<number, number> = {
+	proc = "p1",
+	op = "inc",
+	arg = 1,
+	res = 1,
+	callAt = 0,
+	retAt = 1,
+}
+local _seqModel: sert.SimSequentialModel<number, number, number> = {
+	init = function(): number return 0 end,
+	step = function(state: number, _op: string, arg: number, res: number): (boolean, number)
+		local nextState = state + arg
+		return res == nextState, nextState
+	end,
+	hash = function(state: number): number return state end,
+	partition = function(op: sert.SimOperation<number, number>): string | number return op.proc end,
+}
+local _linRes: sert.LinearizeResult = sert.sim.linearizable(_seqModel, { _simOp }, "linearizable counter")
+local _linCheck: sert.LinearizeResult = sert.sim.checkLinearizable(_seqModel, { _simOp })
+local _linOk: boolean = _linRes.ok and _linCheck.ok
+
+local _rec: sert.SimRecorder = sert.sim.recorder(function(): number return os.clock() end)
+local _opHandle: sert.SimOperationHandle = _rec:call("p1", "inc", 1)
+local _finishedOp: sert.SimOperation<any, any> = _rec:finish(_opHandle, 1)
+local _wrappedVal: number = _rec:wrap("p1", "inc", 1, function(): number return 2 end)
+local _recOps: { sert.SimOperation<any, any> } = _rec:operations()
+
+local _exploreOpts: sert.SimExploreOptions = {
+	maxChoices = 16,
+	maxRuns = 8,
+	maxBranch = 4,
+	seed = 42,
+	stateHash = function(w: sert.SimWorld): (string | number)? return `{w:now()}` end,
+}
+local _exploreOptsBacking: sert.SimExploreOptions = {
+	stateHash = "backing" :: "backing",
+}
+local _exploreOptsExact: sert.SimExploreOptions = {
+	stateHash = false :: false,
+}
+local _exploreOut1: sert.SimExploreOutcome? = sert.sim.explore(
+	function(w: sert.SimWorld) local _pick: number = w.scheduler:choose(2, "branch") end
+)
+local _exploreOut2: sert.SimExploreOutcome? = sert.sim.explore(
+	_exploreOpts,
+	function(w: sert.SimWorld) local _pick: number = w.scheduler:choose(2, "branch") end
+)
+local _exploreOut3: sert.SimExploreOutcome? = sert.sim.explore(
+	"named explore",
+	function(w: sert.SimWorld) local _pick: number = w.scheduler:choose(2, "branch") end,
+	_exploreOpts
+)
+local _exploreOut4: sert.SimExploreOutcome? = sert.sim.explore(function(w) local _now: number = w:now() end)
+local _pruned: number = if _exploreOut1 ~= nil then _exploreOut1.pruned else 0
+local _simBfsOpts: sert.SimBfsOptions = { maxStates = 10 }
+local _simBfsRes: sert.SimBfsResult? = nil
+local _simTraceStep: sert.SimTraceStep? = nil
+local _simRemoteErr: sert.SimRemoteError? = nil
