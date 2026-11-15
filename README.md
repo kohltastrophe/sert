@@ -4,7 +4,7 @@
 
 Testing, property shrinking, deterministic simulation, and Studio verification for Luau and Roblox. Write unit tests, shrinking properties, headless DataModel specs, and multi-server fault simulations that run across standalone Luau, Roblox Studio, and Open Cloud.
 
-`sert` combines procedural `sert.*` assertions, nested asymmetric matchers (`any`, `subset`, `within`, `matching`), and auto-restoring spies with byte-tape property shrinking (`sert.prop`, `sert.gen`), algebraic laws (`sert.laws`), and stateful model checking (`sert.model`). When code touches Roblox APIs, run `Instance` trees, deferred signals, UI layouts, input, DataStores, and MemoryStores on a virtual clock with `sert.env.new()`, or schedule multiple servers and clients with `sert.sim` to inject packet drops, cloud storage faults, rolling shutdowns, and teleport races. Point `sert studio` or `sert cloud` at your Rojo project to run server, client, multi-client, and device-preset suites without bootstrap scripts, and gate changes with dual-solver type probes, LCOV coverage floors, and token-stream mutation testing.
+`sert` combines procedural assertions, canonical inline and `.snap` snapshots, allocation checks (`sert.noAllocs`, `sert.bench`), and auto-restoring spies with byte-tape property shrinking (`sert.prop`, `sert.gen`), algebraic/metamorphic/complexity laws (`sert.laws`), and stateful model checking (`sert.model`). Headless `sert.env.new()` simulates `Instance` trees, 3D spatial casts, `InputAction`s, `SharedTable`/`Actor` guards, Audio routing, UI layouts, deferred signals, DataStores, and MemoryStores on a virtual clock. `sert.sim` schedules multiple servers and clients with VOPR fault injection, exact bounded `explore` (with opt-in `stateHash` pruning), and concurrent linearizability verification (`sert.sim.linearizable`). For real Roblox engines and automated workflows, `sert studio` (with `--warm` bridge attachment), `sert cloud`, `sert.roblox.conformance`, greybox `sert fuzz` (persisting `test/.sert-regressions.toml`), zero-config `sert mutate`, `sert audit`, and `sert check --changed --agent` form one closed-loop verification harness.
 
 ```luau
 --!strict
@@ -164,18 +164,21 @@ end)
 ```sh
 python3 tools/sert.py studio --device Phone
 python3 tools/sert.py studio --clients 2
+python3 tools/sert.py studio --warm --affected
+python3 tools/sert.py check --changed --agent
 ```
 
 ## Guides
 
 | Guide | Contents |
 | --- | --- |
-| [docs/api.md](docs/api.md) | Registration, targets, hooks, assertions, asymmetric matchers, spies, `sert.prop`, `sert.gen`, `sert.laws`, `sert.model`, `sert.bytes`, output capture, and `sert.run`. |
-| [docs/env.md](docs/env.md) | `sert.env.new()`, strict and deferred defaults, typed lexical staging (`[test].stage` and `@game`), modeled services, UI layout, and `env:input()`. |
-| [docs/sim.md](docs/sim.md) | Multi-peer `sert.sim`, unified `Spec<State, Sut>`, VOPR fault injection, `{ replay = "v1:..." }` reproduction, remote faults, and Teleport/BindToClose/ProcessReceipt hazards. |
-| [docs/roblox.md](docs/roblox.md) | Zero-boilerplate `sert studio` and `sert cloud`, target tags, `--device`, `--clients`, `--warm`, `Layout`, `Flicker`, `fuzzRemote`, and `sweep`. |
-| [docs/cli.md](docs/cli.md) | All CLI commands (`init`, `fetch`, `lint`, `run`, `coverage`, `mutate`, `check`, `studio`, `cloud`), `sert.toml`, and `sert.lock`. |
-| [docs/ci.md](docs/ci.md) | GitHub Actions setup (`kohltastrophe/sert/actions/setup@v0.1.0`), lockfile caching, coverage and mutation gates, and Open Cloud secrets. |
+| [docs/agents.md](docs/agents.md) | AI-agent workflow (`sert check --changed`, `sert audit`, `sert init --skill`, `--agent` / `--format json`, `--affected`, `sert fuzz`, zero-config `sert mutate`, snapshots, and anti-reward-hacking rules). |
+| [docs/api.md](docs/api.md) | Registration, targets, assertions, inline and `.snap` snapshots, allocation budgets and `sert.bench`, spies, `sert.prop`, `sert.gen`, `sert.laws`, `sert.model`, `sert.bytes`, output capture, and `sert.run`. |
+| [docs/env.md](docs/env.md) | `sert.env.new()`, strict and deferred defaults, `[test].stage` and `@game`, 3D spatial casts, `InputAction`, `SharedTable`, Audio nodes, UI layout, and `env:input()`. |
+| [docs/sim.md](docs/sim.md) | Multi-peer `sert.sim`, unified `Spec<State, Sut>`, VOPR fault injection, `{ replay = "v1:..." }` reproduction, bounded `explore` (`stateHash`), and linearizability checks (`sert.sim.linearizable`). |
+| [docs/roblox.md](docs/roblox.md) | Zero-boilerplate `sert studio` and `sert cloud`, target tags, `--device`, `--clients`, `--warm`, `sert.roblox.conformance`, `Layout`, `Flicker`, `fuzzRemote`, and `sweep`. |
+| [docs/cli.md](docs/cli.md) | All CLI commands (`check`, `run`, `fuzz`, `audit`, `bench`, `coverage`, `mutate`, `studio`, `cloud`, `lint`, `init`, `fetch`), `sert.toml`, and `sert.lock`. |
+| [docs/ci.md](docs/ci.md) | GitHub Actions setup (`kohltastrophe/sert/actions/setup@v0.1.0`), lockfile caching, coverage, audit, benchmark and mutation gates, and Open Cloud secrets. |
 
 ## CI
 

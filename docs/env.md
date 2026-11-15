@@ -127,14 +127,23 @@ You can also load staged instances directly via `env:require(env.game.Replicated
 | `Players` | `PlayerAdded`, `PlayerRemoving`, `GetPlayers`, `GetPlayerByUserId`, `LocalPlayer`, and character helpers. |
 | `MarketplaceService` | `ProcessReceipt`, `PromptProductPurchase`, `PromptGamePassPurchase`, `UserOwnsGamePassAsync`, `GetProductInfo` (configured with `env:setGamePass` and `env:setProductInfo`). |
 | `TeleportService` | `TeleportAsync`, `ReserveServer`, `TeleportToPrivateServer`, and `GetLocalPlayerTeleportData`. |
+| `PhysicsService` | `RegisterCollisionGroup`, `UnregisterCollisionGroup`, `RenameCollisionGroup`, `IsCollisionGroupRegistered`, `CollisionGroupSetCollidable`, `CollisionGroupsAreCollidable`, and `GetRegisteredCollisionGroups`. |
+| `SharedTableRegistry` | `GetSharedTable` and `SetSharedTable` backed per environment. |
+| `Workspace` (spatial) | 3D `Raycast`, `Blockcast`, `Spherecast`, `Shapecast`, `GetPartBoundsInBox`, `GetPartBoundsInRadius`, and `GetPartsInPart` across rotated boxes, spheres, and X-aligned cylinders (`CollisionGroup` and `BruteForceAllSlow` filtering). |
+
+### Parallel Luau, Audio graphs, and InputActions
+
+- **Parallel Luau:** `env.SharedTable` (`new`, `clear`, `clone`, `cloneAndFreeze`, `isFrozen`, `size`, `increment`, `update`), `SharedTableRegistry`, and `Actor` (`BindToMessage`, `BindToMessageParallel`, `SendMessage`) execute deterministically. When `strict = true`, mutating instances or non-parallel services between `task.desynchronize()` and `task.synchronize()` throws a parallel-safety error.
+- **Audio graphs:** `Wire` auto-links pins (`WiringChanged`, `GetConnectedWires`), `AudioPlayer` advances `TimePosition` and fires `Ended` / `Looped` on the virtual clock, `AudioEmitter` and `AudioListener` compute distance/group audibility (`GetAudibilityFor`), `AudioFader` scales gain, and `AudioAnalyzer` exposes `PeakLevel`, `RmsLevel`, and `GetSpectrum()` into `AudioDeviceOutput`.
+- **InputActions:** `env:input()` evaluates `InputContext` instances in descending `Priority` order (honoring `Enabled` and `Sink`), updating `InputAction:GetState()` / `Pressed` / `Released` / `Changed` from `InputBinding` triggers.
 
 ---
 
 ## UI layout solver and `env:input()`
 
-`sert.env` computes `AbsolutePosition`, `AbsoluteSize`, `AbsoluteCanvasSize`, and `ContentText` in headless Luau across:
+`sert.env` computes `AbsolutePosition`, `AbsoluteSize`, `AbsoluteCanvasSize`, `ContentText`, and `TextBounds` (stripping `RichText` tags when `RichText = true`) in headless Luau across:
 
-- `UIListLayout` and `UIGridLayout` (including `StartCorner`, `FillDirection`, `HorizontalAlignment`, `VerticalAlignment`, and `AbsoluteCellCount`)
+- `UIListLayout`, `UIGridLayout`, and `UIPageLayout` (`JumpTo`, `JumpToIndex`, `Next`, `Previous`, `PageEnter`, `PageLeave`, `Stopped`, `CurrentPage`, `StartCorner`, `FillDirection`, `HorizontalAlignment`, `VerticalAlignment`, and `AbsoluteCellCount`)
 - `UIPadding`, `UIScale`, `UISizeConstraint`, `UIAspectRatioConstraint` (`FitWithinMaxSize` and `ScaleWithParentSize`), and `UIFlexItem` grow/shrink distribution
 - `AutomaticSize` (`X`, `Y`, `XY`), `ClipsDescendants`, and `ScrollingFrame.CanvasPosition`
 

@@ -61,7 +61,7 @@ end)
 
 - **Device emulation (`--device <Preset>`):** Calls `StudioDeviceSimulatorService:SetDeviceAsync` before specs run. Built-in presets are `Phone` (`390x844@3`), `SmallPhone` (`320x568@2`), `Tablet` (`820x1180@2`), `Desktop` (`1920x1080@1`), `Console` (`1920x1080@1`), and `Ultrawide` (`2560x1080@1`), or pass custom geometry as `WxH` / `WxH@dpr` (`--device 412x915@2.6`).
 - **Multi-client sessions (`--clients N`):** Launches a `PlayServer` plus `N` concurrent player clients, isolates each side's test registry, and aggregates the server report alongside all `N` client reports by `runId`.
-- **Warm Studio bridge (`--warm`):** Connects to an already-open Roblox Studio via `studio_link.py` (`--studio ID` targets a named Studio instance; `--capture` records screenshots). On each warm run, `sert.roblox.Runner` clones spec `ModuleScript`s before calling `require`, bypassing Luau's module cache so edited specs re-execute without restarting Studio.
+- **Warm Studio bridge (`--warm`):** Connects to an already-open Roblox Studio via `studio_link.py` (`--studio ID` targets a named Studio instance; `--capture` records viewport PNGs into `<out>/<mode>.png`). On each warm run, `sert.roblox.Runner` clones spec `ModuleScript`s before calling `require`, bypassing Luau's module cache so edited specs re-execute without restarting Studio. `sert studio` also accepts `--affected [REV]`, `-u` / `--update-snapshots`, `--prune-snapshots`, `--strict-assertions`, `--save-regressions`, `--bench`, `--agent`, and `--format human|agent|json`.
 
 ### Optional custom `sert.roblox.Runner`
 
@@ -69,23 +69,47 @@ Most projects need only `[studio].project` and `[studio].specs`. If your game ne
 
 ---
 
+## Dual-target conformance (`sert.roblox.conformance`)
+
+`sert.roblox.conformance(name, fn, opts?)` registers two specs from one callback: `<name> [portable]` runs in headless `sert.env`, and `<name> [roblox]` (or `<name> [client]` when `opts.target = "client"`) runs in live Roblox Studio. Each run receives a fresh container (`Workspace` folder or `PlayerGui` `ScreenGui` selected by `opts.container`) and a unified `ConformanceContext` exposing `isRoblox`, `target`, `game`, `workspace`, `Instance`, `task`, `Enum`, datatypes, `SharedTable`, `getService(name)`, and `step(seconds?)`:
+
+```luau
+--!strict
+local sert = require("@sert")
+
+sert.roblox.conformance("raycast hits rotated box", function(root, ctx)
+	local part = ctx.Instance.new("Part")
+	part.Size = ctx.Vector3.new(4, 2, 4)
+	part.CFrame = ctx.CFrame.new(0, 5, 0) * ctx.CFrame.Angles(0, math.rad(45), 0)
+	part.Parent = root
+
+	local hit = ctx.workspace:Raycast(ctx.Vector3.new(0, 10, 0), ctx.Vector3.new(0, -10, 0))
+	sert.ok(hit ~= nil)
+	sert.eq(hit.Instance, part)
+end, { container = "workspace", target = "roblox" })
+```
+
+`sert.roblox.conformance` also provides `.skip` and `.focus` modifiers plus `{ tags, timeout, env }` options.
+
+---
+
 ## UI geometry assertions (`sert.roblox.Layout`)
 
-`sert.roblox.Layout` verifies rendered `GuiObject` bounds, text fitting, overlap, and touch targets in both Roblox Studio and headless `sert.env`:
+`sert.roblox.Layout` verifies rendered `GuiObject` bounds, text fitting, overlap, and touch targets in both Roblox Studio and headless `sert.env`, recording each check with `sert`'s assertion tracker so tests satisfy `--strict-assertions` and `sert audit`:
 
 | Function | Verifies |
 | --- | --- |
-| `Layout.settle(frames?, opts?)` | Steps `frames` render frames (default `2`) so `UIListLayout`, `AutomaticSize`, and `TextBounds` settle. |
-| `Layout.visible(gui, label?)` | `AbsoluteSize` has positive width and height, `Visible` is `true` on all `GuiObject` ancestors, enclosing `LayerCollector.Enabled` is `true`, `CanvasGroup.GroupTransparency < 1`, and no ancestor `UIScale` is `0`. |
-| `Layout.fitsParent(child, eps?, label?)` | `child` stays within its parent's bounds (checking `AbsoluteCanvasSize` when parented to a `ScrollingFrame`). |
-| `Layout.within(inner, outer, eps?, label?)` | `inner`'s axis-aligned bounding box stays inside `outer`. |
-| `Layout.fitsViewport(gui, viewport?, eps?)` | `gui` and its visible descendants fit inside the screen—accounting for `GuiService:GetGuiInset()` when `ScreenGui.IgnoreGuiInset == false`, rotated `Rotation` bounding boxes, and `ClipsDescendants` containers. |
-| `Layout.noOverlap(items, eps?, label?)` | Sibling `GuiObject`s in `items` have pairwise non-overlapping rectangles. |
-| `Layout.noTextOverflow(gui, eps?, label?)` | `TextBounds` (checked against `ContentText` and inner `UIPadding` space) fits inside `AbsoluteSize` and `TextFits` is `true`. |
-| `Layout.minTouchTarget(gui, minPx?, label?)` | Interactive control measures at least `minPx x minPx` (default `44` px). |
-| `Layout.aligned(items, edge, eps?, label?)` | Aligns `items` along `"left"`, `"right"`, `"top"`, `"bottom"`, `"centerX"`, or `"centerY"`. |
-| `Layout.audit(root, opts?)` | Runs `settle` plus `viewport`, `overlap`, `textOverflow`, and `touchTargets` checks across an entire UI subtree (`opts = { settle?, overlap?, viewport?, textOverflow?, touchTargets?, ignore? }`). |
-| `Layout.matrix(name?, mountFn, opts?)` | Runs `mountFn(presetName, viewportSize)` across `Layout.PRESETS` (`Phone`, `SmallPhone`, `Tablet`, `Desktop`, `Console`, `Ultrawide`). |
+| `Layout.settle(root, opts?) -> number` | Steps render frames (`maxFrames`, `stableFrames`, `tolerance`) until `UIListLayout`, `AutomaticSize`, and `TextBounds` stabilize. |
+| `Layout.visible(gui)` | `AbsoluteSize` has positive width and height, `Visible` is `true` on all `GuiObject` ancestors, enclosing `LayerCollector.Enabled` is `true`, `CanvasGroup.GroupTransparency < 1`, and no ancestor `UIScale` is `0`. |
+| `Layout.fitsParent(child, margin?, tolerance?)` | `child` stays within its parent's bounds (checking `AbsoluteCanvasSize` when parented to a `ScrollingFrame`). |
+| `Layout.within(descendant, ancestor, margin?, tolerance?)` | `descendant`'s axis-aligned bounding box stays inside `ancestor`. |
+| `Layout.fitsViewport(root, opts?)` | `root` and its visible descendants fit inside the viewport (`opts = { viewport?, tolerance?, ignore? }`), accounting for `GuiService:GetGuiInset()`, rotated bounding boxes, and `ClipsDescendants`. |
+| `Layout.noOverlap(container, opts?)` | Child `GuiObject`s inside `container` have pairwise non-overlapping rectangles (`opts = { tolerance?, ignore?, recursive? }`). |
+| `Layout.noTextOverflow(root, opts?)` | `TextBounds` (checked against `ContentText` and inner `UIPadding` space) fits inside `AbsoluteSize` and `TextFits` is `true`. |
+| `Layout.minTouchTarget(root, opts?)` | Interactive controls measure at least `minSize` (`number | Vector2`, default `44` px). |
+| `Layout.aligned(elements, edge, tolerance?)` | Aligns `elements` along `"left"`, `"right"`, `"top"`, `"bottom"`, `"centerX"`, or `"centerY"`. |
+| `Layout.audit(root, opts?)` | Runs `settle` plus `viewport`, `overlap`, `textOverflow`, and `touchTargets` checks across a UI subtree (`opts = { settle?, overlap?, viewport?, textOverflow?, touchTargets?, ignore? }`). |
+| `Layout.matrix(name?, mountFn, opts?)` | Runs `mountFn(container, preset, env?)` across `Layout.PRESETS` (`Phone`, `SmallPhone`, `Tablet`, `Desktop`, `Console`, `Ultrawide`). |
 
 ```luau
 --!strict
@@ -93,11 +117,11 @@ local sert = require("@sert")
 local Layout = sert.roblox.Layout
 
 sert.test.client("shop modal passes layout audit across every form factor", function()
-	Layout.matrix(function(_preset, size)
-		local modal = mountShopModal(size)
+	Layout.matrix(function(container, _preset)
+		local modal = mountShopModal(container)
 		Layout.audit(modal, {
 			touchTargets = 44,
-			ignore = { Divider = true },
+			ignore = { "Divider" },
 		})
 		modal:Destroy()
 	end)
@@ -108,7 +132,7 @@ end)
 
 ## Layout stability (`sert.roblox.Flicker`)
 
-`Flicker.steady(target, opts?)` steps frame by frame while watching `AbsolutePosition` and `AbsoluteSize` on `target` and its descendants—catching one-frame zero-size flashes, `AutomaticSize` oscillation, or post-settle layout jumps:
+`Flicker.steady(target, opts?)` steps frame by frame while watching `AbsolutePosition` and `AbsoluteSize` on `target` and its descendants. It catches single-frame zero-size flashes, `AutomaticSize` oscillation, and post-settle layout jumps while recording an assertion on `Flicker.expect`:
 
 ```luau
 --!strict

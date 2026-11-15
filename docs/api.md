@@ -22,7 +22,7 @@ sert.prop(name: string, fn: (g: sert.GenContext) -> (), opts?: sert.PropOptions)
 sert.model(name: string, spec: sert.ModelSpec<State, Sut>, opts?: sert.ModelOptions)
 ```
 
-Every test receives a `TestContext` (`{ name: string, file: string, target: sert.Target, defer: (self, () -> ()) -> () }`).
+Every test receives a `TestContext` (`{ name: string, file: string, target: sert.Target, defer: (self, () -> ()) -> () }`). `TestOptions` accepts `timeout`, `skip`, `focus`, `file`, `target`, `smoke: boolean?` (exempts intentional zero-assertion smoke tests from `--strict-assertions` and `sert audit`), and `tags: { string }?`.
 
 ### Target namespaces
 
@@ -91,7 +91,7 @@ All assertions report the caller's stack frame and (unless noted) return their f
 | Assertion | Description |
 | --- | --- |
 | `sert.ok(val, msg?)` / `sert(val, msg?)` | Asserts `val` is truthy (`val ~= nil and val ~= false`) and returns `val`. |
-| `sert.eq(actual, expected, msg?)` | Deep structural equality with cycle handling, `NaN == NaN`, hex diffs on `buffer`, and nested `Matcher` support. |
+| `sert.eq(actual, expected, msg?)` | Deep structural equality with cycle handling, `NaN == NaN`, hex diffs on `buffer`, nested `Matcher` support, and up to `8` leaf path diffs per mismatch. (`sert audit` flags `rawequal` table calls unless `msg` includes `"same"`, `"identity"`, `"intentional"`, or `"reference"`.) |
 | `sert.ne(actual, unexpected, msg?)` | Asserts `not sert.equals(actual, unexpected)`. |
 | `sert.equals(a, b) -> boolean` | Boolean predicate using the same deep comparison and matcher rules as `sert.eq`. |
 | `sert.lt(a, b, msg?)` / `sert.le(a, b, msg?)` | Asserts `a < b` or `a <= b`. |
@@ -103,6 +103,21 @@ All assertions report the caller's stack frame and (unless noted) return their f
 | `sert.doesNotThrow(fn, msg?) -> ...` | Asserts `fn()` completes without throwing and returns all values returned by `fn()`. |
 | `sert.fail(msg?) -> never` | Unconditionally fails the current test. |
 | `sert.waitFor(pred, timeout?, interval?, msg?)` | Polls `pred()` until it returns a non-`nil`, non-`false` value (default `timeout = 1` second), advancing the active `sert.env` in headless Luau or `task.wait` in Roblox. |
+
+---
+
+## Snapshots, allocation budgets, and benchmarks
+
+| API | Description |
+| --- | --- |
+| `sert.inlineSnapshot(actual, expected?, msg?) -> actual` | Matches canonical serialized output against an inline string in the spec; `-u` / `--update-snapshots` patches missing or changed expectations in place. |
+| `sert.snapshot(actual, name?, msg?) -> actual` | Matches serialized output against `test/__snapshots__/<spec_stem>.snap` under `"{testName} :: {name or ordinal}"`; `-u` writes updates and `--prune-snapshots` removes unused keys. |
+| `sert.allocs(fn, warmup?, samples?) -> number` | Measures average heap growth per call to `fn` in KB (`warmup` defaults to `4`, `samples` to `32`). |
+| `sert.maxAllocs(maxKb, fn, msg?) -> number` | Asserts that `sert.allocs(fn)` stays at or below `maxKb` KB/call and returns the measurement. |
+| `sert.noAllocs(fn, msg?)` | Asserts zero heap allocations within a `0.01` KB/call measurement tolerance. |
+| `sert.bench(name, fn: (b: sert.BenchContext) -> (), opts?: sert.BenchOptions)` | Registers a benchmark executed by `sert bench` or `sert run --bench`. `b` exposes `iter(fn)`, `stopTimer()`, `startTimer()`, and `bytes(n)`. |
+
+Both `inlineSnapshot` and `snapshot` sort table keys deterministically and render `Instance` trees with sorted attributes and `GuiBase2d` layout bounds. Under `--ci` or `CI=true`, passing `-u` or `--prune-snapshots` fails instead of writing snapshot files.
 
 ---
 
@@ -221,8 +236,11 @@ end, {
 | `g:list(gen, min?, max?)` / `g:dict(kGen, vGen, min?, max?)` | Draws shrinkable arrays and dictionaries. |
 | `g:optional(gen)` / `g:tuple(...)` / `g:record(shape)` | Draws `T?`, fixed tuples, or shaped record tables. |
 | `g:string(charset?, min?, max?)` / `g:bytes(min?, max?)` | Draws strings (`"ascii"`, `"alnum"`, `"alpha"`, `"digit"`, `"hex"`, `"printable"`, `"utf8"`, or custom characters) and `buffer`s. |
+| `g:target(score, label?)` | Records a numeric guidance score per `label` so `sert fuzz` steers evolutionary byte-tape mutations toward higher scores. |
+| `g:classify(cond, label)` | Tallies label hit percentages across non-vacuous trials and prints distributions on failure (or when verbose). |
+| `g:cover(minPct, cond, label)` | Requires `label` to occur in at least `minPct` (`0–100`) percent of trials, failing when the 99% Wilson upper confidence bound falls below `minPct`. |
 
-`PropOptions` accepts `runs`, `size`, `seed`, `regressions: { number }`, `exhaustive: { size: number }`, `shrinkBudget: { tries?: number, seconds?: number }`, and `timeout`. Use `sert.prop.run(fn, opts?)` to execute a property inline and get back a `PropResult`.
+`PropOptions` accepts `runs`, `size`, `seed`, `regressions: { number | string }` (integer seeds or `"v1:<seed>:<size>:<hex>"` shrunk tapes), `exhaustive: { size: number }`, `shrinkBudget: { tries?: number, seconds?: number }`, and `timeout`. Use `sert.prop.skip`, `.focus`, `.each`, and `.eachTuple` across `sert.prop` and target namespaces. `sert run` and `sert studio` load saved tokens from `test/.sert-regressions.toml` into `RunOptions.regressions` automatically. Call `sert.prop.run(fn, opts?)` to execute a property inline and get back a `PropResult`.
 
 ### Built-in generators (`sert.gen`)
 
@@ -249,6 +267,8 @@ Register standard algebraic and round-trip properties in a single call (each reg
 | `sert.laws.order(name, { gen, lt, eq? }, opts?)` | Irreflexivity, asymmetry, transitivity, and trichotomy of `lt(a, b)`. |
 | `sert.laws.algebra(name, { gen, op, identity?, hasIdentity?, associative?, commutative?, idempotent?, inverse?, eq? }, opts?)` | Requested algebraic laws (`hasIdentity = true` allows `identity = nil`). |
 | `sert.laws.differential(name, { gen, sut, oracle, eq? }, opts?)` | `sut(x)` matches a reference `oracle(x)` (including matching throws vs returns). |
+| `sert.laws.metamorphic(name, { gen, sut, relations }, opts?)` | Registers one property per relation `{ transform = function(x, g) ... end, relate = function(x0, y0, x1, y1) ... end }`. |
+| `sert.laws.complexity(name, { bound, gen, sut?, measure?, sizes? }, opts?)` | Verifies empirical runtime or `measure(input)` ratios across increasing `sizes` against `"O(1)"`, `"O(log n)"`, `"O(n)"`, or `"O(n log n)"`. |
 
 ---
 
@@ -308,5 +328,5 @@ sert.model("bounded counter", {
 | `sert.print(...)` / `sert.warn(...)` | Writes through `sert`'s active output sink. |
 | `sert.quiet(fn, ...)` | Runs `fn(...)` while discarding `sert.print` / `sert.warn` output. |
 | `sert.capture(fn, ...) -> { string }` | Captures `sert.print` / `sert.warn` lines emitted during `fn(...)` and returns them (`(lines, ...ret)`). |
-| `sert.run(opts?: sert.RunOptions) -> sert.Results` | Executes registered specs and returns `{ passed, failed, skipped, duration, failures }`. |
-| `sert.parseCliArgs(...: string) -> sert.RunOptions` | Parses standalone Luau `-a` runner flags into `RunOptions`. |
+| `sert.run(opts?: sert.RunOptions) -> sert.Results` | Executes registered specs and returns `{ passed, failed, skipped, skippedByReason, zeroAssertionTests, tautologies, todo, total, clock, failures, seeds, mutants? }`. |
+| `sert.parseCliArgs(...: string) -> sert.RunOptions` | Parses standalone Luau runner flags (`--filter`, `--grep`, `--replay`, `-u`, `--strict-assertions`, `--bench`, and related switches) into `RunOptions`. |

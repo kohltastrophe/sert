@@ -11,10 +11,13 @@
 | `sert.sim.new(opts?: sert.SimWorldOptions) -> sert.SimWorld` | Creates a deterministic multi-peer simulation `World` for direct imperative tests. |
 | `sert.sim.vopr(name, spec: sert.SimSpec<State, Sut>, opts?: sert.SimVoprOptions)` | Registers a shrinking VOPR command-sequence test (supports `.roblox`, `.server`, `.client`, `.skip`, `.focus`). |
 | `sert.sim.check(spec, opts?: sert.SimCheckOptions) -> sert.SimCheckResult` | Runs bounded breadth-first state-space exploration (`bfs`) on finite models and/or VOPR execution immediately. |
-| `sert.sim.explore(name?, opts?, fn: (world: sert.SimWorld) -> ())` | Exhaustively explores bounded scheduler interleaving choices (`maxChoices`, `maxRuns`, `maxBranch`). |
+| `sert.sim.explore(name?, opts?, fn: (world: sert.SimWorld) -> ())` | Exhaustively explores bounded scheduler interleaving choices (`maxChoices`, `maxRuns`, `maxBranch`, `stateHash`). |
 | `sert.sim.spec(def)` | Validates and types a `SimSpec<State, Sut>` table. |
 | `sert.sim.verifyTrace(spec, trace, initialState?)` | Replays a recorded `{ TraceStep }` against pure `pre` / `next` / `invariants` transitions without aliasing caller tables. |
 | `sert.sim.toItfJson(spec, trace, initialState?)` | Serializes a trace to Apalache Informal Trace Format (ITF) JSON for TLA+ tooling. |
+| `sert.sim.recorder(clockFn?) -> Recorder` | Captures non-overlapping/overlapping operation intervals (`callAt`, `retAt`) with monotonic timestamps. |
+| `sert.sim.linearizable(model, history, msg?) -> LinearizeResult` | Asserts that `history` is linearizable under `model` (records an assertion and throws with a minimal conflict timeline on failure). |
+| `sert.sim.checkLinearizable(model, history) -> LinearizeResult` | Non-throwing Wing & Gong / Porcupine solver returning `{ ok, message?, timeline?, conflicts? }`. |
 
 ---
 
@@ -147,4 +150,40 @@ Use `world:partition(server, seconds)`, `world:isolate(server)`, and `world:heal
 
 1. **Teleport session-lock races (`teleportRaceRate` and `world:handoffClient`):** When a player teleports via `TeleportService:TeleportAsync(placeId, { player })` or `world:handoffClient(client, destServer)`, the destination server's `Players.PlayerAdded` can fire *before* the source server finishes `Players.PlayerRemoving` and releases its DataStore session lock.
 2. **Rolling 30-second `BindToClose` shutdowns (`rollingShutdownRate` and `server:shutdown`):** Servers shut down mid-traffic, running `game:BindToClose` handlers against a strict 30-second virtual deadline (`CLOSE_SECONDS = 30`) while detaching in-flight cloud writes that already left the process. `server:crash()` models an abrupt kill where `BindToClose` never runs at all.
-3. **Duplicate `ProcessReceipt` delivery (`receiptDuplicateRate` and `world:purchaseProduct`):** If `MarketplaceService.ProcessReceipt` yields, throws, crashes, or returns `Enum.ProductPurchaseDecision.NotProcessedYet` (or if `receiptDuplicateRate` triggers after a lost acknowledgment), `sert.sim` redelivers the exact same `PurchaseId` on rejoin or on another server—verifying that receipt handlers grant currency at most once.
+3. **Duplicate `ProcessReceipt` delivery (`receiptDuplicateRate` and `world:purchaseProduct`):** If `MarketplaceService.ProcessReceipt` yields, throws, crashes, or returns `Enum.ProductPurchaseDecision.NotProcessedYet` (or if `receiptDuplicateRate` triggers after a lost acknowledgment), `sert.sim` redelivers the exact same `PurchaseId` on rejoin or on another server, verifying that receipt handlers grant currency at most once.
+
+---
+
+## Bounded scheduler exploration (`sert.sim.explore`)
+
+`sert.sim.explore` branches across nondeterministic task interleavings in a `SimWorld` under `maxChoices`, `maxRuns`, and `maxBranch` bounds. By default (`stateHash` omitted or `false`), it performs exact bounded prefix exploration without skipping interleavings. Pass `stateHash = "backing"` to prune revisited states using the built-in hash of backing `DataStore`, `OrderedDataStore`, `MemoryStore`, `MessagingService`, in-flight remote packets, peer states, and `scheduler:stateDigest()`, or pass a custom `stateHash = function(world) ... end` (automatically salted with `world.scheduler:stateDigest()`). Truncated subtrees are never cached as explored. The returned `ExploreOutcome` reports `{ runs, pruned, truncated, limit?, failure? }`.
+
+---
+
+## Concurrent linearizability verification (`sert.sim.linearizable`)
+
+Record overlapping client/server operations with `sert.sim.recorder(clockFn?)` (defaults to the active `Env.now` or `os.clock()`, guaranteeing strictly monotonic timestamps per sequence) using `rec:call(proc, op, arg)` and `rec:finish(handle, res)` or `rec:wrap(proc, op, arg, fn)`. Pass `rec:operations()` alongside a `SequentialModel<State, Arg, Res>` to `sert.sim.linearizable(model, history, msg?)` or `sert.sim.checkLinearizable(model, history)`:
+
+```luau
+--!strict
+local sert = require("@sert")
+
+local rec = sert.sim.recorder()
+rec:wrap("p1", "inc", 1, function() return 1 end)
+rec:wrap("p2", "inc", 2, function() return 3 end)
+
+sert.sim.linearizable({
+	init = function() return 0 end,
+	step = function(state: number, op: string, arg: number, res: number)
+		if op == "inc" then
+			local nxt = state + arg
+			return res == nxt, nxt
+		end
+		return false, state
+	end,
+	partition = function(entry) return entry.proc end, -- optional key to solve independent shards separately
+	hash = function(state: number) return state end, -- optional state deduplication key
+}, rec:operations())
+```
+
+When a concurrent history is not linearizable, the Wing & Gong / Porcupine solver minimizes the conflict set (`conflicts`) and renders an ASCII interval timeline showing the exact overlapping calls (`callAt` to `retAt`).

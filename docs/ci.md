@@ -31,6 +31,9 @@ jobs:
       - uses: kohltastrophe/sert/actions/setup@v0.1.0
       - name: Lint, test, and verify coverage
         run: python3 tools/sert.py check
+      - name: Audit pull request changes
+        if: github.event_name == 'pull_request'
+        run: python3 tools/sert.py audit --diff "origin/${{ github.base_ref }}" --strict
       - name: JUnit report
         if: always()
         run: python3 tools/sert.py run --junit sert-junit.xml
@@ -104,9 +107,11 @@ If you host an internal fork via `[sert].repo = "your-org/sert"`, pass a Persona
 
 ## Quality gates, annotations, and summaries
 
-When `CI=1` or `CI=true` (set automatically by GitHub Actions), any `.focus` test, describe block, or property fails the run unless `--allow-focused` is passed. Active `[override]` paths in `sert.toml` also fail right away under `CI=true` so branches can't pass against local paths by mistake.
+When `CI=1` or `CI=true` (set automatically by GitHub Actions), any `.focus` test, describe block, benchmark, or property fails the run unless `--allow-focused` is passed. Snapshot writes (`-u`, `--update-snapshots`, `--prune-snapshots`) and active `[override]` paths in `sert.toml` also fail under `CI=true` so branches never ratify unreviewed snapshots or pass against local paths by mistake.
 
-`sert check` runs `sert lint` and `sert run --coverage` concurrently, then evaluates `[coverage].min`; pass `sert check --diff origin/main` on pull requests to enforce your coverage floor on newly added and modified lines. `sert mutate` enforces `[mutate].min` (or `--min N`), supporting `--diff origin/main` on pull requests and full-repo runs on pushes or nightly schedules.
+`sert check` runs `sert lint` and `sert run --coverage` concurrently and enforces `[coverage].min`. Pass `sert check --diff origin/main --audit --strict` (or `sert check --changed origin/main --strict`) on pull requests to apply the coverage floor to added and modified lines while catching zero-assertion tests, tautologies, vacuous properties, unfuzzed `.OnServerEvent` / `.OnServerInvoke` handlers, and uncovered public exports.
+
+`sert run` and `sert studio` load `test/.sert-regressions.toml` automatically in CI so shrunk `v1:...` counterexamples from `sert fuzz` stay locked in the suite. `sert mutate` enforces `[mutate].min` (or `--min N`) with zero-config line-to-spec routing and `--diff origin/main` on pull requests, while `sert bench --compare main` enforces median timing and allocation budgets (`--fail-regression PCT`, default `20`).
 
 When `GITHUB_ACTIONS=true`, `sert lint`, `sert run`, and `sert cloud` emit `::error` and `::warning` annotations directly on PR diffs, while `sert coverage` and `sert mutate` append Markdown tables to `$GITHUB_STEP_SUMMARY`. Pass `--junit sert-junit.xml` to `sert run` for test reporters and `--badge coverage.json` to `sert coverage` to write a Shields.io endpoint JSON payload.
 
