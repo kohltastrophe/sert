@@ -364,6 +364,335 @@ class MutateSchemaTest(Case):
         self.assertEqual(mutate._mutant_batch_command("luau", "luau", "test/spec.luau", [1, 2], None, program_args=["Mine"])[-2:], ["Mine", "--mutants=1,2"])
         self.assertEqual(mutate._mutant_command("luau", "luau", "e.luau", 1, None)[-2:], ["-a", "--mutant=1"])
 
+    def test_new_operators_off_by_one_nil_guard_remote_guard(self):
+        for op in ("off_by_one", "nil_guard", "remote_guard"):
+            self.assertIn(op, mutate.ALL_OPERATORS)
+
+        source = "\n".join(
+            [
+                "--!strict",
+                "local M = {}",
+                "function M.work(items: { number }, opts: { limit: number? }, flag: boolean, remote: any)",
+                "\tlocal count = #items",
+                "\tlocal limit = opts.limit or 10",
+                "\tlocal total = 0",
+                "\tfor i = 1, #items do",
+                "\t\ttotal += items[i]",
+                "\tend",
+                "\tif flag or total > 0 then",
+                "\t\ttotal += 1",
+                "\tend",
+                "\tif typeof(remote) ~= \"nil\" then",
+                "\t\tremote.OnServerEvent:Connect(function(_player, payload)",
+                "\t\t\tif typeof(payload) ~= \"string\" then",
+                "\t\t\t\treturn",
+                "\t\t\tend",
+                "\t\t\tif type(payload) == \"string\" then",
+                "\t\t\t\ttotal += #payload",
+                "\t\t\tend",
+                "\t\tend)",
+                "\t\tremote.OnServerInvoke = function(_player, req)",
+                "\t\t\tlocal bad = \"number\" ~= type(req)",
+                "\t\t\treturn req or 0",
+                "\t\tend",
+                "\tend",
+                "\treturn limit or total",
+                "end",
+                "return M",
+            ]
+        )
+        inst, mutants = mutate.instrument_source(
+            source,
+            {i: True for i in range(1, 35)},
+            file_path="src/Handlers.luau",
+            operators=("off_by_one", "nil_guard", "remote_guard"),
+        )
+        self.assertEqual(len(inst.splitlines()), len(source.splitlines()))
+        by_op: dict[str, list[tuple[int, str]]] = {"off_by_one": [], "nil_guard": [], "remote_guard": []}
+        for m in mutants:
+            by_op.setdefault(m.op, []).append((m.line, m.mutated))
+
+        # off_by_one: `#items` -> `(#items - 1)` and `for i = 1, #items do` -> `for i = 1, #items - 1 do`
+        self.assertIn((4, "local count = (#items - 1)"), by_op["off_by_one"])
+        self.assertIn((7, "for i = 1, #items - 1 do"), by_op["off_by_one"])
+        self.assertIn((19, "total += (#payload - 1)"), by_op["off_by_one"])
+
+        # nil_guard: assignment RHS and return only, skipping boolean `if flag or total > 0 then`
+        self.assertIn((5, "local limit = opts.limit"), by_op["nil_guard"])
+        self.assertIn((24, "return req"), by_op["nil_guard"])
+        self.assertIn((27, "return limit"), by_op["nil_guard"])
+        self.assertFalse(any(line == 10 for line, _ in by_op["nil_guard"]))
+
+        # remote_guard: inside OnServerEvent:Connect and OnServerInvoke only, NOT line 13 outside!
+        self.assertFalse(any(line == 13 for line, _ in by_op["remote_guard"]))
+        self.assertIn((15, "if false then"), by_op["remote_guard"])
+        self.assertIn((18, "if true then"), by_op["remote_guard"])
+        self.assertIn((23, "local bad = false"), by_op["remote_guard"])
+
+        if have("luau"):
+            staged = self.tmp / "Handlers.staged.luau"
+            compiled = mutate.compile_and_stage_file("luau", source, inst, mutants, staged, wrap=False)
+            self.assertEqual(len(compiled), len(mutants))
+
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_zero_config_routing_fast_first_and_short_circuit(self):
+        root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n',
+            name="routing",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src").mkdir()
+        (root / "src/Calc.luau").write_text(
+            "\n".join(
+                [
+                    "local Calc = {}",
+                    "function Calc.add(a: number, b: number): number",
+                    "\treturn a + b",
+                    "end",
+                    "function Calc.onlySlow(x: number): number",
+                    "\treturn x * 2",
+                    "end",
+                    "return Calc",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test").mkdir()
+        (root / "test/fast.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local Calc = require("@lib/Calc")',
+                    'sert.test("add fast", function()',
+                    "\tsert.eq(Calc.add(2, 3), 5)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test/slow.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local Calc = require("@lib/Calc")',
+                    'sert.test("calc slow", function()',
+                    "\tsert.eq(Calc.add(4, 5), 9)",
+                    "\tsert.eq(Calc.onlySlow(3), 6)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        # Seed coverage-map.json where fast (5ms) + slow (500ms) both cover line 3, and only slow covers line 6
+        (root / ".sert/coverage-map.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "specs": {
+                        "test/fast.spec.luau": {"ms": 5, "files": {"src/Calc.luau": [3]}},
+                        "test/slow.spec.luau": {"ms": 500, "files": {"src/Calc.luau": [3, 6]}},
+                    },
+                }
+            )
+        )
+        (root / "coverage.out").write_text("SF:src/Calc.luau\nDA:3,1\nDA:6,1\nend_of_record\n")
+
+        observed_calls: list[list[str]] = []
+        orig_eval_batch = mutate._evaluate_mutant_batch
+        orig_eval_one = mutate._evaluate_one_mutant
+
+        def spy_batch(batch, *args, **kwargs):
+            for m in batch:
+                observed_calls.append([str(m.id), str(m.line), m.spec_filter or "", ",".join(m.covering_specs)])
+            return orig_eval_batch(batch, *args, **kwargs)
+
+        def spy_one(mutant, *args, **kwargs):
+            observed_calls.append([str(mutant.id), str(mutant.line), mutant.spec_filter or "", ",".join(mutant.covering_specs)])
+            return orig_eval_one(mutant, *args, **kwargs)
+
+        with (
+            mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_batch),
+            mock.patch.object(mutate, "_evaluate_one_mutant", side_effect=spy_one),
+        ):
+            code, out, err = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1")
+        self.assertEqual((code, out.strip()), (0, "100.0"), err)
+
+        # Mutant on line 3 (`Calc.add`) has covering_specs = ("test/fast.spec.luau", "test/slow.spec.luau"):
+        # `fast` (5ms) runs first, kills it, and short-circuits (`slow` NEVER runs for line 3!).
+        # Mutant on line 6 (`Calc.onlySlow`) is ordered fastest-first too, survives `fast`, and falls through to `slow` (500ms).
+        line3_filters = [filt for _id, ln, filt, _cov in observed_calls if ln == "3"]
+        self.assertTrue(any(f == "@file=test/fast.spec.luau" for f in line3_filters), observed_calls)
+        self.assertFalse(any(f == "@file=test/slow.spec.luau" for f in line3_filters), observed_calls)
+        line6_filters = [filt for _id, ln, filt, _cov in observed_calls if ln == "6"]
+        self.assertIn("@file=test/fast.spec.luau", line6_filters, observed_calls)
+        self.assertIn("@file=test/slow.spec.luau", line6_filters, observed_calls)
+        self.assertLess(
+            line6_filters.index("@file=test/fast.spec.luau"),
+            line6_filters.index("@file=test/slow.spec.luau"),
+            observed_calls,
+        )
+
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_incremental_cache_hit_invalidation_no_cache_and_formats(self):
+        root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n',
+            name="cacheproj",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src").mkdir()
+        target = root / "src/Math.luau"
+        target.write_text(
+            "\n".join(
+                [
+                    "local M = {}",
+                    "function M.op(a: number, b: number): number",
+                    "\treturn a + b",
+                    "end",
+                    "function M.untested(a: number): number",
+                    "\treturn a + 1",
+                    "end",
+                    "return M",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test").mkdir()
+        (root / "test/math.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local M = require("@lib/Math")',
+                    'sert.test("op", function()',
+                    "\tsert.eq(M.op(2, 3), 5)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "coverage.out").write_text("SF:src/Math.luau\nDA:3,1\nDA:6,1\nend_of_record\n")
+
+        # 1. Cold run populates `.sert/mutate/cache.json` (1 killed, 1 survived => 50.0%)
+        code1, out1, err1 = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1")
+        self.assertEqual((code1, out1.strip()), (0, "50.0"), err1)
+        cache_file = root / ".sert/mutate/cache.json"
+        self.assertTrue(cache_file.is_file())
+        cache_data = json.loads(cache_file.read_text())
+        self.assertEqual(len(cache_data["entries"]), 2)
+
+        # 2. Warm run + comment-only change reuses cache with ZERO process evaluations
+        target.write_text(target.read_text() + "-- trailing comment preserves token digest\n")
+        with (
+            mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=AssertionError("should hit cache")),
+            mock.patch.object(mutate, "_evaluate_one_mutant", side_effect=AssertionError("should hit cache")),
+        ):
+            code_agent, out_agent, err_agent = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--agent"
+            )
+            self.assertEqual(code_agent, 0, err_agent)
+            self.assertIn("FAIL mutation_score=50.0% killed=1 survived=1", out_agent)
+            self.assertIn("SURVIVED", out_agent)
+
+            code_json, out_json, err_json = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--format", "json"
+            )
+            self.assertEqual(code_json, 0, err_json)
+            env = json.loads(out_json)
+            self.assertEqual((env["command"], env["status"], env["summary"]["score"], env["summary"]["cached"]), ("mutate", "ok", 50.0, 2))
+            self.assertEqual(len(env["data"]["survived"]), 1)
+
+        # 3. `--no-cache` forces fresh evaluation
+        eval_calls = 0
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def count_batch(*args, **kwargs):
+            nonlocal eval_calls
+            eval_calls += 1
+            return orig_eval_batch(*args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=count_batch):
+            code_nc, out_nc, err_nc = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--no-cache", "-j", "1"
+            )
+        self.assertEqual((code_nc, out_nc.strip()), (0, "50.0"), err_nc)
+        self.assertGreater(eval_calls, 0)
+
+        # 4. Editing target code invalidates cache and re-evaluates cleanly
+        target.write_text(target.read_text().replace("return a + 1", "return a * 2"))
+        eval_calls2 = 0
+
+        def count_batch2(*args, **kwargs):
+            nonlocal eval_calls2
+            eval_calls2 += 1
+            return orig_eval_batch(*args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=count_batch2):
+            code_inv, out_inv, err_inv = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code_inv, out_inv.strip()), (0, "50.0"), err_inv)
+        self.assertGreater(eval_calls2, 0)
+
+        # 5. Editing a transitive helper required by a spec invalidates the cache
+        (root / "src/Math.luau").write_text(
+            "local M = {}\nfunction M.op(a: number, b: number): number\n\treturn a + b\nend\nreturn M\n"
+        )
+        (root / "test/helpers").mkdir(parents=True, exist_ok=True)
+        leaf_helper = root / "test/helpers/val_leaf.luau"
+        leaf_helper.write_text("return function(v: number): boolean\n\treturn v == 5\nend\n")
+        (root / "test/helpers/expect_val.luau").write_text(
+            'local checkLeaf = require("./val_leaf")\nreturn function(v: number): boolean\n\treturn checkLeaf(v)\nend\n'
+        )
+        (root / "test/math.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local M = require("@lib/Math")',
+                    'local expectVal = require("./helpers/expect_val")',
+                    'sert.test("op", function()',
+                    "\tsert.ok(expectVal(M.op(2, 3)))",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "coverage.out").write_text("SF:src/Math.luau\nDA:3,1\nend_of_record\n")
+
+        code_cold, out_cold, err_cold = self.sert(
+            "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+        )
+        self.assertEqual((code_cold, out_cold.strip()), (0, "100.0"), err_cold)
+
+        with (
+            mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=AssertionError("should hit cache")),
+            mock.patch.object(mutate, "_evaluate_one_mutant", side_effect=AssertionError("should hit cache")),
+        ):
+            code_warm, out_warm, err_warm = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code_warm, out_warm.strip()), (0, "100.0"), err_warm)
+
+        # Modify ONLY the 2-hop transitive helper so baseline stays green (5) while mutant (-1) now survives.
+        leaf_helper.write_text("return function(v: number): boolean\n\treturn v == 5 or v == -1\nend\n")
+        trans_eval_calls = 0
+
+        def count_trans(*args, **kwargs):
+            nonlocal trans_eval_calls
+            trans_eval_calls += 1
+            return orig_eval_batch(*args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=count_trans):
+            code_trans, out_trans, err_trans = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code_trans, out_trans.strip()), (0, "0.0"), err_trans)
+        self.assertGreater(trans_eval_calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

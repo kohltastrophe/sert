@@ -16,9 +16,18 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from xml.etree import ElementTree
 
-from sert import config as config_mod, luau_lex, markers as markers_mod
+from sert import (
+    agent,
+    config as config_mod,
+    coverage as coverage_mod,
+    graph as graph_mod,
+    luau_lex,
+    markers as markers_mod,
+    snapshots as snapshots_mod,
+)
 from sert.util import (
     FAILED,
     INFRA,
@@ -49,8 +58,121 @@ from sert.util import (
 RUNNERS = ("luau", "lute", "lune")
 DEFAULT_SPEC_GLOBS = ("test/**/*.spec.luau", "tests/**/*.spec.luau")
 LAST_FAILED_REL = ".sert/last-failed.json"
+LAST_TELEMETRY_REL = ".sert/last-telemetry.json"
+REGRESSIONS_REL = "test/.sert-regressions.toml"
 STAGE_HEADER = "-- sert-stage-v4\n"
 LEXICAL_MARKER = "return function(_ENV: any, ...: any): ...any"
+
+_REPLAY_TOKEN_RE = re.compile(r'Replay:\s*\{\s*replay\s*=\s*"(v\d+:[^"]+)"\s*\}')
+
+
+def _toml_str(value: str) -> str:
+    escaped: list[str] = ['"']
+    for ch in value:
+        code = ord(ch)
+        if ch == "\\":
+            escaped.append("\\\\")
+        elif ch == '"':
+            escaped.append('\\"')
+        elif ch == "\b":
+            escaped.append("\\b")
+        elif ch == "\f":
+            escaped.append("\\f")
+        elif ch == "\n":
+            escaped.append("\\n")
+        elif ch == "\r":
+            escaped.append("\\r")
+        elif ch == "\t":
+            escaped.append("\\t")
+        elif code < 0x20 or code == 0x7F:
+            escaped.append(f"\\u{code:04x}")
+        else:
+            escaped.append(ch)
+    escaped.append('"')
+    return "".join(escaped)
+
+
+def load_regression_entries(root: Path) -> list[dict[str, str]]:
+    """Load `[[regression]]` entries (`test`, `file`, `token`) from `test/.sert-regressions.toml`."""
+    path = Path(root) / REGRESSIONS_REL
+    if not path.is_file():
+        return []
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as err:
+        raise SertError(f"{REGRESSIONS_REL}: {err}") from err
+    raw = data.get("regression") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        test_name = str(item.get("test") or "").strip()
+        file_name = str(item.get("file") or "").strip()
+        token = str(item.get("token") or "").strip()
+        if not test_name or not token or (test_name, token) in seen:
+            continue
+        seen.add((test_name, token))
+        entries.append({"test": test_name, "file": file_name, "token": token})
+    return entries
+
+
+def load_regressions_by_test(root: Path) -> dict[str, list[str]]:
+    """Return `{test_name: [token, ...]}` loaded from `test/.sert-regressions.toml`."""
+    grouped: dict[str, list[str]] = {}
+    for entry in load_regression_entries(root):
+        bucket = grouped.setdefault(entry["test"], [])
+        if entry["token"] not in bucket:
+            bucket.append(entry["token"])
+    return grouped
+
+
+def save_regression_tokens(root: Path, events: list[dict]) -> list[dict[str, str]]:
+    """Persist `[sert-x:regression]` events into `test/.sert-regressions.toml` (`[[regression]]`)."""
+    root_path = Path(root)
+    existing = load_regression_entries(root_path)
+    by_key: dict[tuple[str, str], dict[str, str]] = {(e["test"], e["token"]): dict(e) for e in existing}
+    added: list[dict[str, str]] = []
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        test_name = str(ev.get("test") or ev.get("name") or "").strip()
+        token = str(ev.get("token") or ev.get("replay") or "").strip()
+        raw_file = str(ev.get("file") or "").strip()
+        norm_file = coverage_mod.norm(raw_file, root_path) if raw_file else ""
+        if not test_name or not token:
+            continue
+        key = (test_name, token)
+        if key in by_key:
+            if norm_file and not by_key[key]["file"]:
+                by_key[key]["file"] = norm_file
+            continue
+        rec = {"test": test_name, "file": norm_file, "token": token}
+        by_key[key] = rec
+        added.append(rec)
+
+    if not added and not any(by_key[k] != e for k, e in zip(by_key, existing)):
+        return []
+
+    ordered = sorted(by_key.values(), key=lambda e: (e["file"], e["test"], e["token"]))
+    blocks: list[str] = []
+    for entry in ordered:
+        blocks.append(
+            "\n".join(
+                [
+                    "[[regression]]",
+                    f"test = {_toml_str(entry['test'])}",
+                    f"file = {_toml_str(entry['file'])}",
+                    f"token = {_toml_str(entry['token'])}",
+                ]
+            )
+        )
+    content = ("\n\n".join(blocks) + "\n") if blocks else ""
+    write_atomic(root_path / REGRESSIONS_REL, content.encode("utf-8"))
+    return added
 
 ENV_GLOBAL_NAMES = (
     "Axes",
@@ -829,6 +951,15 @@ def write_spec_runner(
         "\t\tlocal _names = {}",
         '\t\tfor _item in string.gmatch(_v, "[^\\n]+") do table.insert(_names, _item) end',
         "\t\t_extraOpts.names = _names",
+        '\telseif _k == "failed-replays" then',
+        '\t\tlocal _seeds = if type(_extraOpts.seeds) == "table" then _extraOpts.seeds else {}',
+        '\t\tfor _item in string.gmatch(_v, "[^\\n]+") do',
+        '\t\t\tlocal _tok, _nm = string.match(_item, "^([^\\t]+)\\t(.+)$")',
+        "\t\t\tif _tok ~= nil and _nm ~= nil then",
+        "\t\t\t\t_seeds[_nm] = tonumber(_tok) or _tok",
+        "\t\t\tend",
+        "\t\tend",
+        "\t\t_extraOpts.seeds = _seeds",
         "\telse table.insert(_coreArgs, _a) end",
         "end",
         "local options: any = sert.parseCliArgs(_coreArgs)",
@@ -836,6 +967,12 @@ def write_spec_runner(
         "if #_greps == 1 then options.grep = _greps[1] elseif #_greps > 1 then options.grep = table.concat(_greps, \"|\") end",
         "if #_excludes == 1 then options.exclude = _excludes[1]; options.excludes = _excludes elseif #_excludes > 1 then options.exclude = table.concat(_excludes, \"|\"); options.excludes = _excludes end",
         "if #_files > 0 then options.file = _files[1]; options.files = _files end",
+    ]
+    if regressions := load_regressions_by_test(root):
+        lines.append(f"if options.regressions == nil then options.regressions = {_luau_literal(regressions)} end")
+    if file_snaps := snapshots_mod.load_file_snapshots(root):
+        lines.append(f"if options.snapshots == nil then options.snapshots = {_luau_literal(file_snaps)} end")
+    lines += [
         "local function _normSpec(p: string): string",
         '\tlocal c = string.gsub(string.gsub(p, "^[@=]", ""), "%.luau?$", "")',
         '\tc = string.gsub(string.gsub(c, "\\\\", "/"), "^%./", "")',
@@ -1138,7 +1275,11 @@ def _run_sharded_entry(
 
     wall_seconds = time.monotonic() - started
     run = EntryRun(entry, 0, wall_seconds)
-    totals = {"passed": 0, "failed": 0, "skipped": 0, "skippedRtest": 0, "todo": 0, "total": 0}
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "skippedRtest": 0, "skippedRoblox": 0, "todo": 0, "total": 0}
+    skipped_by_reason = {reason: 0 for reason in markers_mod.SKIP_REASONS}
+    zero_assertion_tests: list[str] = []
+    seen_zero: set[str] = set()
+    tautologies: list[dict] = []
     any_done = False
     seed_line: str | None = None
     body_lines: list[str] = []
@@ -1160,6 +1301,15 @@ def _run_sharded_entry(
                 any_done = True
                 for k in totals:
                     totals[k] += int(d.get(k) or 0)
+        for reason, count in parsed.skipped_by_reason.items():
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + int(count or 0)
+        for name in parsed.zero_assertion_tests:
+            if name not in seen_zero:
+                seen_zero.add(name)
+                zero_assertion_tests.append(name)
+        for taut in parsed.tautologies:
+            if taut not in tautologies:
+                tautologies.append(taut)
         lines = w_out.splitlines(keepends=True)
         for idx, line in enumerate(lines):
             found = markers_mod.split(line)
@@ -1200,7 +1350,13 @@ def _run_sharded_entry(
     )
     todo_note = f" · {totals['todo']} todo" if totals["todo"] > 0 else ""
     footer = f"\n{totals['passed']} passed · {totals['failed']} failed · {totals['skipped'] - totals.get('unselected', 0)} skipped{rtest_note}{todo_note} · {round(wall_seconds * 1000)} ms\n"
-    done_payload = {**totals, "clock": round(wall_seconds, 6)}
+    done_payload = {
+        **totals,
+        "skippedByReason": skipped_by_reason,
+        "zeroAssertionTests": zero_assertion_tests,
+        "tautologies": tautologies,
+        "clock": round(wall_seconds, 6),
+    }
     done_line = f"[sert-done] {json.dumps(done_payload, separators=(',', ':'))}\n"
 
     human_text = header + "".join(body_lines) + footer
@@ -1567,6 +1723,34 @@ def json_report(result: RunResult) -> dict:
     }
 
 
+def _extract_tapes(result: RunResult) -> dict[str, str]:
+    tapes: dict[str, str] = {}
+    for entry_run in result.entries:
+        if not entry_run.output:
+            continue
+        parsed = markers_mod.parse(entry_run.output)
+        for reg in parsed.regressions:
+            if isinstance(reg, dict):
+                name = str(reg.get("test") or reg.get("name") or "").strip()
+                tok = str(reg.get("token") or reg.get("replay") or "").strip()
+                if name and tok:
+                    tapes[name] = tok
+    for test in result.tests:
+        if test.get("status") != "fail":
+            continue
+        name = str(test.get("name") or "").strip()
+        if not name:
+            continue
+        raw_tok = test.get("replay") or test.get("tape")
+        if isinstance(raw_tok, str) and raw_tok.strip():
+            tapes[name] = raw_tok.strip()
+        elif name not in tapes:
+            msg = str(test.get("message") or test.get("error") or "")
+            if match := _REPLAY_TOKEN_RE.search(msg):
+                tapes[name] = match.group(1)
+    return tapes
+
+
 def save_last_failed(root: Path, result: RunResult) -> None:
     failed_names: list[str] = []
     failed_files: list[str] = []
@@ -1583,11 +1767,13 @@ def save_last_failed(root: Path, result: RunResult) -> None:
         seed = test.get("seed")
         if name and isinstance(seed, int) and not isinstance(seed, bool):
             seeds[name] = seed
+    tapes = {k: v for k, v in _extract_tapes(result).items() if k in set(failed_names) or not failed_names}
     payload = {
         "status": result.status,
         "failed": failed_names,
         "files": failed_files,
         "seeds": seeds,
+        "tapes": tapes,
     }
     target = Path(root) / LAST_FAILED_REL
     write_atomic(target, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
@@ -1680,6 +1866,59 @@ def _skipped_only_count(result: RunResult) -> int:
     return total_skipped
 
 
+_RUN_ARG_DEFAULTS: dict[str, object] = {
+    "specs": [],
+    "filter": None,
+    "grep": [],
+    "exclude": [],
+    "file": [],
+    "tag": [],
+    "exclude_tag": [],
+    "runner": None,
+    "coverage": False,
+    "codegen": False,
+    "no_codegen": False,
+    "roblox_globals": False,
+    "jobs": None,
+    "timeout": None,
+    "entry": None,
+    "affected": None,
+    "watch": False,
+    "junit": None,
+    "json_out": None,
+    "agent": False,
+    "format": None,
+    "failed": False,
+    "fail_fast": False,
+    "compact": False,
+    "list": False,
+    "repeat": None,
+    "slowest": None,
+    "test_timeout": None,
+    "allow_focused": False,
+    "ci": False,
+    "seed": None,
+    "runs": None,
+    "replay": None,
+    "exhaustive": False,
+    "budget": None,
+    "update_snapshots": False,
+    "prune_snapshots": False,
+    "strict_assertions": False,
+    "save_regressions": False,
+    "bench": False,
+    "program_args": [],
+    "root": None,
+}
+
+
+def make_run_args(**overrides) -> argparse.Namespace:
+    """Build a complete `sert run` argument Namespace with safe defaults."""
+    data = {k: list(v) if isinstance(v, list) else v for k, v in _RUN_ARG_DEFAULTS.items()}
+    data.update(overrides)
+    return argparse.Namespace(**data)
+
+
 def selection_args(args) -> list[str]:
     tokens = [f"--filter={args.filter}"] if getattr(args, "filter", None) is not None else []
     for grep_pat in as_list(getattr(args, "grep", None)):
@@ -1691,7 +1930,17 @@ def selection_args(args) -> list[str]:
     for file_pat in as_list(getattr(args, "file", None)):
         if file_pat:
             tokens.append(f"--file={file_pat}")
-    for flag in ("fail_fast", "compact", "list", "exhaustive", "allow_focused", "ci"):
+    for flag in (
+        "fail_fast",
+        "compact",
+        "list",
+        "exhaustive",
+        "allow_focused",
+        "ci",
+        "update_snapshots",
+        "strict_assertions",
+        "bench",
+    ):
         if getattr(args, flag, False) or (flag == "compact" and os.environ.get("SERT_COMPACT") == "1"):
             tokens.append("--" + flag.replace("_", "-"))
     for flag, cli_name in (
@@ -1755,6 +2004,15 @@ def watch_loop(
                 return last_status
 
 
+def _replay_value(value: str):
+    if re.fullmatch(r"v\d+:[^\s]+", value):
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int or replay token: {value!r}") from None
+
+
 def add_parser(subparsers) -> None:
     parser = subparsers.add_parser("run")
     parser.add_argument("--runner", choices=RUNNERS, help="runtime to execute entries with (default: [test].runner or luau)")
@@ -1765,9 +2023,26 @@ def add_parser(subparsers) -> None:
     parser.add_argument("-j", "--jobs", type=int, metavar="N", help="worker processes for sharded suites")
     parser.add_argument("--timeout", type=float, metavar="S", help="seconds per entry before it counts as timed out (exit 3)")
     parser.add_argument("--entry", action="append", metavar="FILE", help="run only this entry (repeatable)")
+    parser.add_argument(
+        "--affected",
+        "--changed",
+        dest="affected",
+        nargs="?",
+        const="HEAD",
+        default=None,
+        metavar="REV",
+        help="run only specs impacted by git diff against REV (default: HEAD)",
+    )
     parser.add_argument("--watch", action="store_true", help="watch .luau files and re-run on edits")
     parser.add_argument("--junit", metavar="FILE", help="write a JUnit XML report (relative to the root)")
     parser.add_argument("--json-out", metavar="FILE", help="write the results as JSON (relative to the root)")
+    parser.add_argument("--agent", action="store_true", help="token-efficient output format for AI agents")
+    parser.add_argument(
+        "--format",
+        choices=("human", "agent", "json"),
+        default=None,
+        help="output format (default: human; or agent when SERT_AGENT=1)",
+    )
     parser.add_argument("specs", nargs="*", help="spec files, globs or directories to run instead of [test]")
 
     selection = parser.add_argument_group("selection & execution (sent to every entry)")
@@ -1786,9 +2061,14 @@ def add_parser(subparsers) -> None:
     selection.add_argument("--ci", action="store_true", help="enable strict CI checks (automatically set when $CI is truthy)")
     selection.add_argument("--seed", type=_seed, metavar="N|random", help="base seed of every property")
     selection.add_argument("--runs", type=int, metavar="N", help="cases per property")
-    selection.add_argument("--replay", type=int, metavar="N", help="replay one failing property seed")
+    selection.add_argument("--replay", type=_replay_value, metavar="N|TOKEN", help="replay one failing property seed or v1:... tape")
     selection.add_argument("--exhaustive", action="store_true", help="run only bounded-exhaustive properties")
     selection.add_argument("--budget", type=float, metavar="S", help="seconds an exhaustive property may take")
+    selection.add_argument("-u", "--update-snapshots", action="store_true", help="create/update inline and .snap snapshots")
+    selection.add_argument("--prune-snapshots", action="store_true", help="remove unused .snap keys/files")
+    selection.add_argument("--strict-assertions", action="store_true", help="fail tests with 0 assertions unless marked { smoke = true }")
+    selection.add_argument("--save-regressions", action="store_true", help="persist [sert-x:regression] tokens into test/.sert-regressions.toml")
+    selection.add_argument("--bench", action="store_true", help="execute registered sert.bench benchmarks")
     parser.add_argument("-a", dest="program_args", nargs=argparse.REMAINDER, default=[], help="extra flags forwarded to every entry")
     parser.set_defaults(func=main)
 
@@ -1808,17 +2088,275 @@ def _validate_extra_flags(args) -> None:
                 raise SertError(f"--grep: invalid pattern {grep_pat!r}: {exc}") from exc
 
 
-def cmd_run(
+def _check_run_selection(args) -> None:
+    replay_val = getattr(args, "replay", None)
+    if isinstance(replay_val, str):
+        clone = argparse.Namespace(**(vars(args) if hasattr(args, "__dict__") else {}))
+        clone.replay = 0
+        check_selection(clone)
+        return
+    check_selection(args)
+
+
+def _norm_spec_rel(root: Path, raw: str) -> str:
+    resolved = _resolve_root_file(root, raw)
+    if resolved is not None:
+        return posix(resolved, root)
+    return coverage_mod.norm(raw, root)
+
+
+def _spec_file_snapshot_info(path: Path) -> tuple[int, set[str]]:
+    """Return `(snapshot_call_count, literal_string_names)` for a spec file."""
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0, set()
+    tokens = luau_lex.tokenize(source, include_comments=False)
+    calls = 0
+    names: set[str] = set()
+    n = len(tokens)
+    for i, tok in enumerate(tokens):
+        if tok.kind == "IDENT" and tok.value == "snapshot":
+            # Exclude declarations (`function snapshot`, `function M.snapshot`, `function M:snapshot`).
+            head = i
+            while (
+                head >= 2
+                and tokens[head - 1].kind == "OP"
+                and tokens[head - 1].value in (".", ":")
+                and tokens[head - 2].kind == "IDENT"
+            ):
+                head -= 2
+            if head > 0 and tokens[head - 1].kind == "KEYWORD" and tokens[head - 1].value == "function":
+                continue
+            if i + 1 < n and tokens[i + 1].kind == "OP" and tokens[i + 1].value == "(":
+                calls += 1
+                j = i + 2
+                depth = 1
+                arg_idx = 0
+                while j < n and depth > 0:
+                    cur = tokens[j]
+                    if cur.kind == "OP" and cur.value in ("(", "[", "{"):
+                        depth += 1
+                    elif cur.kind == "OP" and cur.value in (")", "]", "}"):
+                        depth -= 1
+                    elif depth == 1 and cur.kind == "OP" and cur.value == ",":
+                        arg_idx += 1
+                        if arg_idx == 1 and j + 1 < n and tokens[j + 1].kind == "STRING":
+                            names.add(snapshots_mod._decode_luau_string_token(tokens[j + 1].value))
+                    j += 1
+    return calls, names
+
+
+def _collect_snapshot_prune_set(
+    root: Path,
+    cfg: config_mod.Config,
+    parsed_list: list[markers_mod.Parsed],
+    snapshot_events: list[dict],
+    full_suite_unfiltered: bool,
+) -> set[tuple[str, str]]:
+    existing = snapshots_mod.load_file_snapshots(root)
+    if not existing:
+        return set()
+    discovered = graph_mod.discover_specs(root, cfg)
+    stem_to_spec = {snapshots_mod.spec_stem(s, root): root / s for s in discovered}
+    prune: set[tuple[str, str]] = set()
+
+    for stem, bucket in existing.items():
+        if stem not in stem_to_spec:
+            for snap_key in bucket:
+                prune.add((stem, snap_key))
+
+    if not full_suite_unfiltered:
+        return prune
+
+    tests_by_stem: dict[str, set[str]] = {}
+    for parsed in parsed_list:
+        for test in parsed.tests:
+            raw_file = str(test.get("file") or "")
+            if raw_file and raw_file != "?":
+                rel = _norm_spec_rel(root, raw_file)
+                stem = snapshots_mod.spec_stem(rel, root)
+                if name := str(test.get("name") or ""):
+                    tests_by_stem.setdefault(stem, set()).add(name)
+
+    event_keys_by_stem: dict[str, set[str]] = {}
+    for ev in snapshot_events:
+        if isinstance(ev, dict) and ev.get("kind") == "file" and ev.get("file") and ev.get("key"):
+            ev_stem = snapshots_mod.spec_stem(str(ev["file"]), root)
+            event_keys_by_stem.setdefault(ev_stem, set()).add(str(ev["key"]))
+
+    for stem, bucket in existing.items():
+        if stem not in stem_to_spec or stem not in tests_by_stem:
+            continue
+        spec_path = stem_to_spec[stem]
+        snap_calls, literal_names = _spec_file_snapshot_info(spec_path)
+        active_tests = tests_by_stem[stem]
+        seen_events = event_keys_by_stem.get(stem, set())
+        for snap_key in bucket:
+            if snap_key in seen_events:
+                continue
+            if " :: " in snap_key:
+                test_prefix, suffix = snap_key.split(" :: ", 1)
+            else:
+                test_prefix, suffix = snap_key, ""
+            if test_prefix not in active_tests:
+                prune.add((stem, snap_key))
+            elif suffix and not suffix.isdigit() and suffix not in literal_names:
+                prune.add((stem, snap_key))
+            elif suffix.isdigit() and int(suffix) > snap_calls:
+                prune.add((stem, snap_key))
+    return prune
+
+
+def _record_run_coverage(
+    root: Path,
+    cfg: config_mod.Config,
+    entries: list[str],
+    result: RunResult,
+    parsed_list: list[markers_mod.Parsed],
+    explicit_specs: list[str] | None,
+) -> None:
+    cov_path = root / "coverage.out"
+    if not cov_path.is_file():
+        return
+    try:
+        cov_files = coverage_mod.parse(cov_path, root=root)
+    except OSError:
+        return
+    if not cov_files:
+        return
+
+    specs: list[str] = []
+    seen: set[str] = set()
+    ms_by_spec: dict[str, int] = {}
+
+    for test in result.tests:
+        raw_file = str(test.get("file") or "")
+        if not raw_file or raw_file == "?":
+            continue
+        rel = _norm_spec_rel(root, raw_file)
+        if rel.endswith((".spec.luau", ".spec.lua")):
+            ms_by_spec[rel] = ms_by_spec.get(rel, 0) + int(test.get("ms") or 0)
+            if rel not in seen:
+                seen.add(rel)
+                specs.append(rel)
+
+    for parsed in parsed_list:
+        for fitem in parsed.files:
+            raw_file = str(fitem.get("file") or "")
+            if not raw_file:
+                continue
+            rel = _norm_spec_rel(root, raw_file)
+            if rel.endswith((".spec.luau", ".spec.lua")):
+                if rel not in ms_by_spec:
+                    ms_by_spec[rel] = int(fitem.get("ms") or 0)
+                if rel not in seen:
+                    seen.add(rel)
+                    specs.append(rel)
+
+    candidates = list(explicit_specs or [])
+    if not candidates:
+        candidates = [e for e in entries if e.endswith((".spec.luau", ".spec.lua"))]
+    if not candidates and ".sert/run.luau" in entries:
+        candidates = graph_mod.discover_specs(root, cfg)
+
+    for cand in candidates:
+        if has_glob(cand):
+            for expanded in expand_globs(root, [cand], files=True):
+                rel = posix(expanded, root)
+                if rel not in seen:
+                    seen.add(rel)
+                    specs.append(rel)
+        else:
+            rel = _norm_spec_rel(root, cand)
+            if (root / rel).is_dir():
+                for expanded in expand_globs(root, [rel.rstrip("/") + "/**/*.spec.luau"], files=True):
+                    erel = posix(expanded, root)
+                    if erel not in seen:
+                        seen.add(erel)
+                        specs.append(erel)
+            elif rel not in seen and (root / rel).is_file():
+                seen.add(rel)
+                specs.append(rel)
+
+    if not specs:
+        return
+
+    default_ms = round(sum(r.seconds for r in result.entries) * 1000 / max(len(specs), 1))
+    if len(specs) == 1:
+        spec_rel = specs[0]
+        graph_mod.record_spec_coverage(root, spec_rel, cov_files, ms_by_spec.get(spec_rel, default_ms))
+        return
+
+    dep_graph = graph_mod.build_graph(root, cfg)
+    for spec_rel in specs:
+        norm_spec = graph_mod._norm_rel(spec_rel, root)
+        deps = dep_graph.dependencies(norm_spec, transitive=True) | {norm_spec}
+        sub_cov = {src: lines for src, lines in cov_files.items() if graph_mod._norm_rel(src, root) in deps}
+        if not sub_cov:
+            sub_cov = cov_files
+        graph_mod.record_spec_coverage(root, norm_spec, sub_cov, ms_by_spec.get(norm_spec, default_ms))
+
+
+def _collect_telemetry(result: RunResult, parsed_list: list[markers_mod.Parsed]) -> dict:
+    skipped_by_reason = {reason: 0 for reason in markers_mod.SKIP_REASONS}
+    zero_assertion_tests: list[str] = []
+    tautologies: list[dict] = []
+    vacuous_properties: list[dict] = []
+
+    for parsed in parsed_list:
+        for k, v in parsed.skipped_by_reason.items():
+            skipped_by_reason[k] = int(skipped_by_reason.get(k, 0)) + int(v or 0)
+        for name in parsed.zero_assertion_tests:
+            if name not in zero_assertion_tests:
+                zero_assertion_tests.append(name)
+        for taut in parsed.tautologies:
+            if taut not in tautologies:
+                tautologies.append(taut)
+
+    for test in result.tests:
+        msg = str(test.get("message") or test.get("error") or "")
+        low = msg.lower()
+        if test.get("vacuous") is True or "vacuous property" in low or (
+            "discarded" in low and "required runs" in low
+        ):
+            vacuous_properties.append(
+                {
+                    "name": str(test.get("name") or "?"),
+                    "file": str(test.get("file") or "?"),
+                    "line": test.get("line"),
+                    "message": msg or "vacuous property",
+                }
+            )
+
+    return {
+        "status": result.status,
+        "counts": result.counts,
+        "skippedByReason": skipped_by_reason,
+        "zeroAssertionTests": zero_assertion_tests,
+        "tautologies": tautologies,
+        "vacuousProperties": vacuous_properties,
+    }
+
+
+def _persist_telemetry(root: Path, result: RunResult, parsed_list: list[markers_mod.Parsed]) -> dict:
+    telemetry = _collect_telemetry(result, parsed_list)
+    with contextlib.suppress(OSError):
+        write_atomic(root / LAST_TELEMETRY_REL, (json.dumps(telemetry, indent=2) + "\n").encode("utf-8"))
+    return telemetry
+
+
+def execute_run(
     args,
     root: Path | None = None,
     cfg: config_mod.Config | dict | None = None,
     *,
     out=None,
     err=None,
-) -> int:
+) -> tuple[int, RunResult, list[markers_mod.Parsed]]:
     out_stream = sys.stdout if out is None else out
     err_stream = sys.stderr if err is None else err
-    check_selection(args)
+    _check_run_selection(args)
     _validate_extra_flags(args)
     program_args = list(getattr(args, "program_args", None) or [])
     if "--silent" in program_args:
@@ -1827,8 +2365,45 @@ def cmd_run(
         cfg = config_mod.load(root) if root is not None else config_mod.from_args(args)
     run_root = Path(root) if root is not None else cfg.root
 
+    fmt = agent.output_format(args)
+    ci_active = bool(getattr(args, "ci", False) or is_ci())
+    want_update_snaps = bool(getattr(args, "update_snapshots", False))
+    want_prune_snaps = bool(getattr(args, "prune_snapshots", False))
+    if (want_update_snaps or want_prune_snaps) and ci_active:
+        raise SertError("sert run: -u / --update-snapshots cannot be used in CI mode (--ci or CI=true)")
+
     if getattr(args, "watch", False):
-        return watch_loop(args, run_root, cfg, out=out_stream, err=err_stream)
+        code = watch_loop(args, run_root, cfg, out=out_stream, err=err_stream)
+        return code, RunResult(code), []
+
+    cli_specs = list(getattr(args, "specs", None) or [])
+    cli_entries = getattr(args, "entry", None)
+    affected_rev = getattr(args, "affected", None)
+    if affected_rev is not None and not cli_specs and not cli_entries:
+        impacted, modified = graph_mod.affected_specs(run_root, cfg, base_rev=str(affected_rev or "HEAD"))
+        if not impacted:
+            empty_res = RunResult(OK)
+            _persist_telemetry(run_root, empty_res, [])
+            if fmt == "agent":
+                out_stream.write("OK passed=0 failed=0 skipped=0 duration=0ms affected=0\n")
+                out_stream.flush()
+            elif fmt == "json":
+                out_stream.write(
+                    agent.json_dumps_compact(
+                        agent.json_envelope(
+                            "run",
+                            OK,
+                            summary={"passed": 0, "failed": 0, "skipped": 0, "total": 0, "affected_specs": 0},
+                            data={"affected_specs": [], "modified": sorted(modified)},
+                        )
+                    )
+                    + "\n"
+                )
+                out_stream.flush()
+            else:
+                note(f"sert run: 0 specs impacted by diff against {affected_rev or 'HEAD'}; skipping", err=err_stream)
+            return OK, empty_res, []
+        cli_specs = impacted
 
     from sert import fetch
 
@@ -1852,13 +2427,13 @@ def cmd_run(
     want_roblox_globals = bool(getattr(args, "roblox_globals", False)) or str(cfg.get("test.globals", "")).lower() == "roblox"
     entries = resolve_entries(
         cfg,
-        getattr(args, "entry", None),
-        getattr(args, "specs", None),
+        cli_entries,
+        cli_specs or None,
         roblox_globals=want_roblox_globals,
     )
 
     eff_args = argparse.Namespace(**vars(args)) if hasattr(args, "__dict__") else argparse.Namespace()
-    if is_ci() and not getattr(eff_args, "ci", False):
+    if ci_active and not getattr(eff_args, "ci", False):
         eff_args.ci = True
     if cfg.get("test.allow_focused") and not getattr(eff_args, "allow_focused", False):
         eff_args.allow_focused = True
@@ -1877,9 +2452,22 @@ def cmd_run(
             extra_failed_args.append("--failed-names=" + "\n".join(failed_names))
         elif len(failed_names) == 1 and getattr(eff_args, "filter", None) is None:
             eff_args.filter = failed_names[0]
+        tapes_map = last_failed.get("tapes") or {}
         seeds_map = last_failed.get("seeds") or {}
-        if len(failed_names) == 1 and failed_names[0] in seeds_map and getattr(eff_args, "replay", None) is None:
-            eff_args.replay = int(seeds_map[failed_names[0]])
+        if len(failed_names) == 1 and getattr(eff_args, "replay", None) is None:
+            if failed_names[0] in tapes_map:
+                eff_args.replay = str(tapes_map[failed_names[0]])
+            elif failed_names[0] in seeds_map:
+                eff_args.replay = int(seeds_map[failed_names[0]])
+        elif len(entries) == 1 and entries[0] == ".sert/run.luau":
+            replay_pairs: list[str] = []
+            for fname in failed_names:
+                if fname in tapes_map:
+                    replay_pairs.append(f"{tapes_map[fname]}\t{fname}")
+                elif fname in seeds_map:
+                    replay_pairs.append(f"{seeds_map[fname]}\t{fname}")
+            if replay_pairs:
+                extra_failed_args.append("--failed-replays=" + "\n".join(replay_pairs))
 
     forwarded = [*selection_args(eff_args), *extra_failed_args, *program_args]
     result = run_entries(
@@ -1890,39 +2478,128 @@ def cmd_run(
         coverage=coverage,
         codegen=codegen,
         timeout=getattr(args, "timeout", None),
+        echo=(fmt == "human"),
         jobs=jobs,
         out=out_stream,
         err=err_stream,
     )
-    if result.status == OK and ran_nothing(result):
+    parsed_list = [markers_mod.parse(run_item.output) for run_item in result.entries if run_item.output]
+
+    nothing_msg: str | None = None
+    has_benchmarks = bool(getattr(eff_args, "bench", False)) and any(p.benchmarks for p in parsed_list)
+    if result.status == OK and ran_nothing(result) and not has_benchmarks:
         has_sel = bool(
             getattr(eff_args, "filter", None)
             or getattr(eff_args, "grep", None)
             or getattr(eff_args, "file", None)
             or getattr(eff_args, "specs", None)
+            or affected_rev is not None
         )
         skipped_count = _skipped_only_count(result) if has_sel else 0
         if spec_entry := _unreported_spec_entry(result):
-            note(
+            nothing_msg = (
                 f"sert run: {spec_entry} exited without running any tests: "
-                f"--entry takes a runner script that calls sert.run(), while spec files should be passed as positional arguments (sert run {spec_entry})",
-                err=err_stream,
+                f"--entry takes a runner script that calls sert.run(), while spec files should be passed as positional arguments (sert run {spec_entry})"
             )
         elif skipped_count > 0:
-            note(
-                f"sert run: all {skipped_count} matching tests were skipped (use 'python3 tools/sert.py studio' to run rtest engine specs)",
-                err=err_stream,
-            )
+            nothing_msg = f"sert run: all {skipped_count} matching tests were skipped (use 'python3 tools/sert.py studio' to run rtest engine specs)"
         else:
-            note("sert run: no test ran: the selection matched none of the tests", err=err_stream)
+            nothing_msg = "sert run: no test ran: the selection matched none of the tests"
+        if fmt == "human":
+            note(nothing_msg, err=err_stream)
         result.status = FAILED
+
+    snapshot_events = [ev for parsed in parsed_list for ev in parsed.snapshots if isinstance(ev, dict)]
+    regression_events = [ev for parsed in parsed_list for ev in parsed.regressions if isinstance(ev, dict)]
+
+    snap_updates: list[dict] = []
+    if want_update_snaps or want_prune_snaps:
+        if want_update_snaps and snapshot_events:
+            snap_updates.extend(snapshots_mod.apply_inline_updates(run_root, snapshot_events))
+        is_unfiltered = not (
+            getattr(eff_args, "filter", None)
+            or getattr(eff_args, "grep", None)
+            or getattr(eff_args, "exclude", None)
+            or getattr(eff_args, "file", None)
+            or getattr(eff_args, "failed", False)
+            or cli_specs
+        )
+        prune_set = (
+            _collect_snapshot_prune_set(run_root, cfg, parsed_list, snapshot_events, is_unfiltered)
+            if want_prune_snaps
+            else None
+        )
+        file_events = snapshot_events if want_update_snaps else []
+        if file_events or prune_set:
+            snap_updates.extend(snapshots_mod.apply_file_updates(run_root, file_events, prune=prune_set or None))
+
+    saved_regressions: list[dict] = []
+    if getattr(args, "save_regressions", False) and regression_events:
+        saved_regressions = save_regression_tokens(run_root, regression_events)
+
+    if coverage:
+        _record_run_coverage(run_root, cfg, entries, result, parsed_list, cli_specs or None)
+
+    telemetry = _persist_telemetry(run_root, result, parsed_list)
 
     if not getattr(eff_args, "list", False):
         save_last_failed(run_root, result)
 
-    annotate_failures(run_root, result, out=out_stream)
+    if fmt == "agent":
+        body = agent.format_run_agent(result, root=run_root)
+        if nothing_msg:
+            body = f"{body}\nNOTE {nothing_msg}"
+        out_stream.write(body + "\n")
+        out_stream.flush()
+    elif fmt == "json":
+        errors = [
+            f"{t.get('file', '?')}: {t.get('name', '?')}: {t.get('message') or 'failed'}"
+            for t in result.tests
+            if t.get("status") == "fail"
+        ]
+        if nothing_msg:
+            errors.append(nothing_msg)
+        env_data = agent.json_envelope(
+            "run",
+            result.status,
+            summary={
+                **result.counts,
+                "wall_ms": round(sum(r.seconds for r in result.entries) * 1000),
+            },
+            errors=errors,
+            data={
+                "entries": [
+                    {"entry": r.entry, "code": r.code, "seconds": round(r.seconds, 3), "timedOut": r.timed_out}
+                    for r in result.entries
+                ],
+                "skipped_by_reason": telemetry["skippedByReason"],
+                "snapshots_updated": snap_updates,
+                "regressions_saved": saved_regressions,
+            },
+        )
+        out_stream.write(agent.json_dumps_compact(env_data) + "\n")
+        out_stream.flush()
+    else:
+        if snap_updates:
+            note(f"sert run: updated/pruned {len(snap_updates)} snapshot(s)", err=err_stream)
+        if saved_regressions:
+            note(f"sert run: saved {len(saved_regressions)} regression token(s) to {REGRESSIONS_REL}", err=err_stream)
+        annotate_failures(run_root, result, out=out_stream)
+
     write_reports(run_root, result, getattr(args, "junit", None), getattr(args, "json_out", None))
-    return result.status
+    return result.status, result, parsed_list
+
+
+def cmd_run(
+    args,
+    root: Path | None = None,
+    cfg: config_mod.Config | dict | None = None,
+    *,
+    out=None,
+    err=None,
+) -> int:
+    status, _result, _parsed = execute_run(args, root=root, cfg=cfg, out=out, err=err)
+    return status
 
 
 def main(args) -> int:

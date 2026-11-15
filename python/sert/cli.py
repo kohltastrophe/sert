@@ -14,10 +14,13 @@ from sert import VERSION
 from sert.util import INFRA, INTERRUPTED, OutputClosed, SertError, guarded, interrupt
 
 COMMANDS: dict[str, tuple[str, str | None]] = {
-    "init": ("sert.fetch", "scaffold sert.toml, rokit.toml, tools/sert.py, .luaurc, .gitignore, and a starter spec"),
+    "init": ("sert.fetch", "scaffold sert config, tools stub, starter spec, or output/install AI agent skill"),
     "fetch": ("sert.fetch", "download and SHA-256 verify sert and globalTypes into .sert/ and sert.lock"),
-    "check": ("sert.check", "run lint, headless tests with coverage, and coverage check in one pass"),
+    "check": ("sert.check", "run lint, tests with coverage, coverage check, and optional audit/mutate/Studio gates"),
     "run": ("sert.run", "run headless Luau specs with luau, lute, or lune"),
+    "fuzz": ("sert.fuzz", "continuous property, model, and VOPR fuzzing with shrinking and regression capture"),
+    "audit": ("sert.audit", "scan specs and source for reward-hacking, unfuzzed remotes, and uncovered exports"),
+    "bench": ("sert.bench", "run benchmarks under --codegen, compare saved baselines, and fail on regressions"),
     "studio": ("sert.studio", "run specs in Roblox Studio"),
     "cloud": ("sert.cloud", "run specs in parallel shards on Open Cloud Luau Execution"),
     "lint": ("sert.lint", "run luau-lsp, type probes, StyLua (--fix), selene, and stub checks"),
@@ -89,7 +92,14 @@ def build(argv: list[str]) -> argparse.ArgumentParser:
             module = importlib.import_module(module_name)
         except ModuleNotFoundError as err:
             if err.name and (module_name == err.name or module_name.startswith(err.name + ".")):
-                raise SertError(f"`sert {name}` is not available in this build: module {module_name} is missing")
+                placeholder = subparsers.add_parser(name, help=help_text)
+                _add_root(placeholder)
+
+                def _unavailable(_args, _name=name, _mod=module_name) -> int:
+                    raise SertError(f"`sert {_name}` is not available in this build: module {_mod} is missing")
+
+                placeholder.set_defaults(func=_unavailable)
+                continue
             raise
         specific_attr = f"add_{name}_parser"
         attr_name = specific_attr if hasattr(module, specific_attr) else "add_parser"

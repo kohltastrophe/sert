@@ -6,6 +6,7 @@ Duplicate SF: records merge by union: a line is covered if any record hit it.
 from __future__ import annotations
 
 import colorsys
+import io
 import json
 import os
 from pathlib import Path
@@ -48,7 +49,7 @@ def git_diff_lines(root: Path, rev: str = "HEAD") -> dict[str, set[int]]:
     modified: dict[str, set[int]] = {}
     try:
         proc = subprocess.run(
-            ["git", "diff", "-U0", rev],
+            ["git", "-c", "diff.mnemonicPrefix=false", "diff", "-U0", rev],
             cwd=root,
             capture_output=True,
             text=True,
@@ -312,10 +313,19 @@ def add_parser(subparsers) -> None:
         metavar="FILE",
         help="write local Shields.io endpoint JSON (default: coverage.json or [coverage].badge)",
     )
+    parser.add_argument("--agent", action="store_true", help="token-minimal coverage summary for AI agents")
+    parser.add_argument(
+        "--format",
+        choices=("human", "agent", "json"),
+        default=None,
+        help="output format (default: human; or agent when SERT_AGENT=1)",
+    )
     parser.set_defaults(func=main)
 
 
 def cmd_coverage(args, root: Path | None = None, cfg: config_mod.Config | dict | None = None) -> int:
+    from sert import agent
+
     if cfg is None or not isinstance(cfg, config_mod.Config):
         cfg = config_mod.from_args(args)
     root = Path(root) if root is not None else cfg.root
@@ -332,26 +342,77 @@ def cmd_coverage(args, root: Path | None = None, cfg: config_mod.Config | dict |
         files = parse(path, root=root)
     except OSError as err:
         raise SertError(f"coverage: cannot read {path}: {err}")
+    fmt = agent.output_format(args)
     diff_rev = getattr(args, "diff", None)
     if diff_rev:
         files = filter_diff_files(files, git_diff_lines(root, str(diff_rev)))
         chosen = chosen_files(files, include, exclude)
         if sum(len(lines) for lines in chosen.values()) == 0:
-            print("coverage: no covered lines modified in diff")
+            if fmt == "agent":
+                print("OK coverage=100.0% (0/0) no covered lines modified in diff")
+            elif fmt == "json":
+                print(
+                    agent.json_dumps_compact(
+                        agent.json_envelope(
+                            "coverage",
+                            0,
+                            summary={"pct": 100.0, "covered": 0, "total": 0, "diff": str(diff_rev)},
+                            data={"files": {}, "no_covered_lines_in_diff": True},
+                        )
+                    )
+                )
+            else:
+                print("coverage: no covered lines modified in diff")
             return 0
     uncovered = bool(getattr(args, "uncovered", False))
-    pct = summarize(files, include, exclude=exclude, uncovered=uncovered, root=root)
-    step_summary(markdown(files, include, exclude, float(minimum) if minimum is not None else None))
-    print(f"{pct:.1f}")
+    chosen = chosen_files(files, include, exclude)
+    min_float = float(minimum) if minimum is not None else None
+    pct = summarize(
+        files,
+        include,
+        out=(io.StringIO() if fmt != "human" else None),
+        exclude=exclude,
+        uncovered=uncovered,
+        root=root,
+    )
+    step_summary(markdown(files, include, exclude, min_float))
     badge_arg = getattr(args, "badge", None)
     cfg_badge = None if diff_rev else table.get("badge")
     badge_path = _resolve_badge_path(root, badge_arg, cfg_badge)
     if badge_path is not None:
         write_badge(badge_path, pct)
-    if minimum is not None and pct < float(minimum):
-        print(f"coverage: {pct:.1f}% is below the {float(minimum):g}% floor", file=sys.stderr)
-        return FAILED
-    return 0
+    exit_code = FAILED if (min_float is not None and pct < min_float) else 0
+    if fmt == "agent":
+        print(agent.format_coverage_agent(chosen, minimum=min_float))
+    elif fmt == "json":
+        tot = sum(len(lines) for lines in chosen.values())
+        cov = sum(1 for lines in chosen.values() for hit in lines.values() if hit)
+        gaps = {
+            rel: _uncovered_ranges(lines)
+            for rel, lines in sorted(chosen.items())
+            if any(not hit for hit in lines.values())
+        }
+        print(
+            agent.json_dumps_compact(
+                agent.json_envelope(
+                    "coverage",
+                    exit_code,
+                    summary={
+                        "pct": round(pct, 2),
+                        "covered": cov,
+                        "total": tot,
+                        **({"min": min_float} if min_float is not None else {}),
+                    },
+                    errors=([f"coverage {pct:.1f}% below floor {min_float:g}%"] if exit_code else []),
+                    data={"uncovered": gaps},
+                )
+            )
+        )
+    else:
+        print(f"{pct:.1f}")
+        if exit_code:
+            print(f"coverage: {pct:.1f}% is below the {min_float:g}% floor", file=sys.stderr)
+    return exit_code
 
 
 def main(args) -> int:

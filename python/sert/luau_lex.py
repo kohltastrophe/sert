@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import re
 
@@ -821,3 +822,155 @@ def referenced_identifiers(source_or_tokens: str | list[Token]) -> set[str]:
                     continue
         names.add(tok.value)
     return names
+
+
+_LONG_OPEN_RE = re.compile(r"^\[(=*)\[")
+_HEX_PAIR_RE = re.compile(r"[0-9a-fA-F]{2}")
+_UNICODE_ESC_RE = re.compile(r"^\{([0-9a-fA-F]+)\}")
+_PAIR_CLOSE = {"(": ")", "[": "]", "{": "}"}
+_IF_STMT_PREV_KEYWORDS = frozenset({"do", "repeat", "end", "break", "continue"})
+_IF_EXPR_PREV_KEYWORDS = frozenset(
+    {"local", "const", "return", "elseif", "while", "until", "for", "in", "and", "or", "not", "function"}
+)
+
+
+def unquote_string(raw: str) -> str | None:
+    """Decode a tokenized Luau short or long string literal, or return None if invalid/interpolated."""
+    if len(raw) < 2 or raw.startswith("`"):
+        return None
+    if raw[0] == "[":
+        m_long = _LONG_OPEN_RE.match(raw)
+        if not m_long:
+            return None
+        eq = m_long.group(1)
+        closer = f"]{eq}]"
+        open_len = 2 + len(eq)
+        if not raw.endswith(closer) or len(raw) < open_len + len(closer):
+            return None
+        inner = raw[open_len : len(raw) - len(closer)]
+        if inner.startswith("\r\n"):
+            return inner[2:]
+        if inner.startswith(("\n", "\r")):
+            return inner[1:]
+        return inner
+    quote = raw[0]
+    if quote not in ('"', "'") or raw[-1] != quote:
+        return None
+    inner = raw[1:-1]
+    if "\\" not in inner:
+        return inner
+    buf = bytearray()
+    i = 0
+    n = len(inner)
+    simple = {
+        "a": b"\a",
+        "b": b"\b",
+        "f": b"\f",
+        "n": b"\n",
+        "r": b"\r",
+        "t": b"\t",
+        "v": b"\v",
+        "\\": b"\\",
+        '"': b'"',
+        "'": b"'",
+        "\n": b"\n",
+    }
+    while i < n:
+        ch = inner[i]
+        if ch != "\\":
+            buf.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        esc = inner[i]
+        if esc == "\r":
+            i += 2 if (i + 1 < n and inner[i + 1] == "\n") else 1
+            buf.append(ord("\n"))
+        elif esc == "z":
+            i += 1
+            while i < n and inner[i] in " \t\r\n\v\f":
+                i += 1
+        elif esc == "x" and i + 2 < n and _HEX_PAIR_RE.fullmatch(inner[i + 1 : i + 3]):
+            buf.append(int(inner[i + 1 : i + 3], 16))
+            i += 3
+        elif esc == "u":
+            m_uni = _UNICODE_ESC_RE.match(inner[i + 1 :])
+            if m_uni:
+                code = int(m_uni.group(1), 16)
+                if 0 <= code <= 0x10FFFF and not (0xD800 <= code <= 0xDFFF):
+                    buf.extend(chr(code).encode("utf-8", errors="replace"))
+                else:
+                    buf.extend(b"\xef\xbf\xbd")
+                i += 1 + m_uni.end()
+            else:
+                buf.append(ord("u"))
+                i += 1
+        elif esc.isdigit():
+            digits = esc
+            j = i + 1
+            while j < n and len(digits) < 3 and inner[j].isdigit():
+                digits += inner[j]
+                j += 1
+            buf.append(int(digits) & 0xFF)
+            i = j
+        elif esc in simple:
+            buf.extend(simple[esc])
+            i += 1
+        else:
+            buf.extend(esc.encode("utf-8"))
+            i += 1
+    return buf.decode("utf-8", errors="replace")
+
+
+def matching_close(
+    tokens: list[Token],
+    open_idx: int,
+    open_op: str | None = None,
+    close_op: str | None = None,
+) -> int | None:
+    """Return the matching closing delimiter token index for `open_idx`, or `None` if balanced close is missing."""
+    if open_idx < 0 or open_idx >= len(tokens):
+        return None
+    if open_op is None or close_op is None:
+        open_op = tokens[open_idx].value
+        close_op = _PAIR_CLOSE.get(open_op)
+        if close_op is None:
+            return None
+    depth = 0
+    for j in range(open_idx, len(tokens)):
+        tok = tokens[j]
+        if tok.kind == "OP":
+            if tok.value == open_op:
+                depth += 1
+            elif tok.value == close_op:
+                depth -= 1
+                if depth == 0:
+                    return j
+    return None
+
+
+def is_if_statement(tokens: list[Token], idx: int, in_type: Sequence[bool] | None = None) -> bool:
+    """Distinguish `if ... then ... end` statements from `if ... then ... else ...` expressions."""
+    p = idx - 1
+    while p >= 0 and (tokens[p].kind == "COMMENT" or (in_type is not None and in_type[p])):
+        p -= 1
+    if p < 0:
+        return True
+    prev = tokens[p]
+    if prev.kind == "ATTR":
+        return True
+    if prev.kind == "OP":
+        if prev.value in (";", "}", ")"):
+            return True
+        if prev.value in _EXPR_OPS or prev.value in (".", ":", "::", "->", "&", "|"):
+            return False
+    if prev.kind == "KEYWORD":
+        if prev.value in _IF_STMT_PREV_KEYWORDS:
+            return True
+        if prev.value in ("then", "else"):
+            return prev.line < tokens[idx].line
+        if prev.value in _IF_EXPR_PREV_KEYWORDS:
+            return False
+    return True

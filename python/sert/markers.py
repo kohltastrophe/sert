@@ -15,6 +15,8 @@ FILE = re.compile(r"^([^|]*)\|(.*)\|(\d+)$")
 SEED_RUN = re.compile(r"^run (\d+)$")
 SEED_TEST = re.compile(r"^(.*)\|(\d+)$")
 VERDICT = "[sert-verdict]"
+SKIP_REASONS = ("explicit", "roblox", "server", "client")
+_MISSING = object()
 
 
 def split(line: str):
@@ -69,6 +71,12 @@ class Parsed:
         self.x: list[tuple[str, str]] = []
         self.outcomes: list = []
         self.run_ids: list[str] = []
+        self.skipped_by_reason: dict[str, int] = {reason: 0 for reason in SKIP_REASONS}
+        self.zero_assertion_tests: list[str] = []
+        self.tautologies: list[dict] = []
+        self.snapshots: list[dict] = []
+        self.regressions: list[dict] = []
+        self.benchmarks: list[dict] = []
 
     @property
     def catalogue(self) -> list[dict] | None:
@@ -205,6 +213,15 @@ def parse(output: str, on_marker=None) -> Parsed:
                 parsed.run_ids.append(payload.strip())
         elif kind == "x" and tag:
             parsed.x.append((tag, payload))
+            if tag in ("snapshot", "regression", "bench"):
+                value = _json(payload)
+                if isinstance(value, dict):
+                    if tag == "snapshot":
+                        parsed.snapshots.append(value)
+                    elif tag == "regression":
+                        parsed.regressions.append(value)
+                    else:
+                        parsed.benchmarks.append(value)
             if on_marker is not None:
                 on_marker(tag, payload)
 
@@ -220,10 +237,66 @@ def parse(output: str, on_marker=None) -> Parsed:
             for name, seed in done_item["seeds"].items():
                 if isinstance(seed, int) and not isinstance(seed, bool):
                     parsed.seeds.setdefault(name, seed)
+    _collect_quality_fields(parsed, verdict)
     for test in parsed.tests:
         if test["status"] == "fail" and test["name"] in parsed.seeds and "seed" not in test:
             test["seed"] = parsed.seeds[test["name"]]
     return parsed
+
+
+def _unwrap_dict(item) -> dict | None:
+    if is_wrapper(item):
+        inner = item.get("value")
+        return inner if isinstance(inner, dict) else None
+    return item if isinstance(item, dict) else None
+
+
+def _extract_outcome_field(obj: dict, key: str):
+    target = obj
+    if key not in target and isinstance(target.get("value"), dict) and "counts" in target["value"]:
+        target = target["value"]
+    if key in target:
+        val = target[key]
+        if isinstance(val, dict) and set(val) <= {"ok", "value", "error"} and "value" in val:
+            return val["value"]
+        return val
+    counts = target.get("counts")
+    if isinstance(counts, dict) and key in counts:
+        val = counts[key]
+        if isinstance(val, dict) and set(val) <= {"ok", "value", "error"} and "value" in val:
+            return val["value"]
+        return val
+    return _MISSING
+
+
+def _collect_quality_fields(parsed: Parsed, verdict: dict | None) -> None:
+    done_dicts = [d for item in parsed.done if (d := _unwrap_dict(item)) is not None]
+
+    def sources_for(key: str) -> list[dict]:
+        if verdict is not None and _extract_outcome_field(verdict, key) is not _MISSING:
+            return [verdict]
+        return done_dicts
+
+    for src in sources_for("skippedByReason"):
+        raw = _extract_outcome_field(src, "skippedByReason")
+        if isinstance(raw, dict):
+            for reason, count in raw.items():
+                if isinstance(reason, str) and isinstance(count, int) and not isinstance(count, bool):
+                    parsed.skipped_by_reason[reason] = parsed.skipped_by_reason.get(reason, 0) + count
+
+    for src in sources_for("zeroAssertionTests"):
+        raw = _extract_outcome_field(src, "zeroAssertionTests")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    parsed.zero_assertion_tests.append(item)
+
+    for src in sources_for("tautologies"):
+        raw = _extract_outcome_field(src, "tautologies")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    parsed.tautologies.append(dict(item))
 
 
 def _number(value) -> bool:

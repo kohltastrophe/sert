@@ -163,6 +163,40 @@ class LuauLexerTest(unittest.TestCase):
         self.assertIn("CFrame", refs)
         self.assertNotIn("Vector3", refs)
 
+    def test_unquote_string_short_long_and_edge_escapes(self) -> None:
+        self.assertEqual(luau_lex.unquote_string('""'), "")
+        self.assertEqual(luau_lex.unquote_string("''"), "")
+        self.assertEqual(luau_lex.unquote_string("[=[\nhello]]]=]"), "hello]]")
+        self.assertEqual(luau_lex.unquote_string("[==[\n\nkeep]==]"), "\nkeep")
+        self.assertEqual(luau_lex.unquote_string(r'"\u{41}\u{2603}\u{1F600}"'), "A\u2603\U0001f600")
+        self.assertEqual(luau_lex.unquote_string(r'"\u{D800}\u{DFFF}\u{110000}"'), "\ufffd\ufffd\ufffd")
+        self.assertEqual(luau_lex.unquote_string(r'"\u{}"'), "u{}")
+        self.assertEqual(luau_lex.unquote_string('"ab\\z\n \t\r cd"'), "abcd")
+        self.assertEqual(luau_lex.unquote_string(r'"\x41\x20\x7e"'), "A ~")
+        self.assertEqual(luau_lex.unquote_string(r'"\65\097\126"'), "Aa~")
+        self.assertEqual(luau_lex.unquote_string(r'"\255"'), "\ufffd")
+        self.assertEqual(luau_lex.unquote_string(r'"\xZZ"'), "xZZ")
+        self.assertIsNone(luau_lex.unquote_string("`hi`"))
+        self.assertIsNone(luau_lex.unquote_string('"unterminated'))
+
+    def test_matching_close_and_is_if_statement(self) -> None:
+        tokens = luau_lex.tokenize("local r = fn({ [1] = (a + b) })\nlocal m: Map<string, Array<number>> = nil\n")
+        by_op = [(idx, tok.value) for idx, tok in enumerate(tokens) if tok.kind == "OP"]
+        brace_idx = next(idx for idx, val in by_op if val == "{")
+        bracket_idx = next(idx for idx, val in by_op if val == "[")
+        paren_idx = next(idx for idx, val in by_op if val == "(" and idx > bracket_idx)
+        angle_idx = next(idx for idx, val in by_op if val == "<")
+        self.assertEqual(tokens[luau_lex.matching_close(tokens, paren_idx)].value, ")")
+        self.assertEqual(tokens[luau_lex.matching_close(tokens, bracket_idx)].value, "]")
+        self.assertEqual(tokens[luau_lex.matching_close(tokens, brace_idx)].value, "}")
+        self.assertEqual(tokens[luau_lex.matching_close(tokens, angle_idx, "<", ">")].value, ">")
+
+        if_tokens = luau_lex.tokenize(
+            "if a then\n\tf()\nend\nlocal x = if b then 1 else 2\nreturn if c then 1 elseif d then 2 else 3\n"
+        )
+        if_indices = [idx for idx, tok in enumerate(if_tokens) if tok.kind == "KEYWORD" and tok.value == "if"]
+        self.assertEqual([luau_lex.is_if_statement(if_tokens, idx) for idx in if_indices], [True, False, False])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-from sert import VERSION, config as config_mod, lock as lock_mod
+from sert import VERSION, config as config_mod, lock as lock_mod, skill as skill_mod
 from sert.util import (
     OK,
     SertError,
@@ -664,7 +664,7 @@ def _ensure_gitignore(root: Path) -> bool:
     return True
 
 
-def init(root: Path, *, force: bool = False, do_fetch: bool = False) -> list[str]:
+def init(root: Path, *, force: bool = False, do_fetch: bool = False, agents: bool = False) -> list[str]:
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
@@ -702,6 +702,12 @@ def init(root: Path, *, force: bool = False, do_fetch: bool = False) -> list[str
         write_atomic(starter, STARTER_SPEC.encode("utf-8"))
         written.append(posix(starter, root))
 
+    if agents:
+        skill_path = root / skill_mod.SKILL_REL
+        if not skill_path.exists() or force:
+            skill_mod.install_skill(skill_path, force=True)
+            written.append(posix(skill_path, root))
+
     if do_fetch:
         fetch(config_mod.load(root))
     return written
@@ -724,8 +730,44 @@ def cmd_fetch(args) -> int:
 
 
 def cmd_init(args) -> int:
+    skill_arg = getattr(args, "skill", None)
+    want_stdout = bool(getattr(args, "stdout", False))
+    want_json = bool(getattr(args, "json", False))
+    if want_json and want_stdout:
+        raise SertError("sert init: pass either --json or --stdout, not both")
+    if skill_arg is not None and (want_json or want_stdout):
+        raise SertError("sert init: pass either a target directory for --skill or --stdout/--json, not both")
+    if (skill_arg is not None or want_stdout or want_json) and (
+        bool(getattr(args, "fetch", False)) or bool(getattr(args, "agents", False))
+    ):
+        raise SertError("sert init: --skill/--stdout/--json cannot be combined with --fetch or --agents")
+
+    if want_json:
+        sys.stdout.write(json.dumps(skill_mod.skill_schema(), indent=2) + "\n")
+        sys.stdout.flush()
+        return OK
+    if want_stdout:
+        md = skill_mod.render_skill_markdown()
+        sys.stdout.write(md if md.endswith("\n") else md + "\n")
+        sys.stdout.flush()
+        return OK
+    if skill_arg is not None:
+        base = Path(args.root).resolve() if getattr(args, "root", None) is not None else config_mod.find_root(None)
+        if skill_arg == "":
+            dest = (base / skill_mod.SKILL_REL).parent
+        else:
+            raw_dest = Path(skill_arg)
+            dest = raw_dest if raw_dest.is_absolute() else (base / raw_dest)
+        written_skill = skill_mod.install_skill(dest, force=True)
+        try:
+            rel = posix(written_skill.resolve(), base.resolve())
+        except ValueError:
+            rel = str(written_skill)
+        print(f"wrote {rel}")
+        return OK
+
     root = config_mod.find_root(args.root)
-    written = init(root, force=args.force, do_fetch=args.fetch)
+    written = init(root, force=args.force, do_fetch=args.fetch, agents=bool(getattr(args, "agents", False)))
     for rel in written:
         print(f"wrote {rel}")
     if not written:
@@ -751,8 +793,19 @@ def add_init_parser(subparsers, parents) -> None:
     parser = subparsers.add_parser(
         "init",
         parents=parents,
-        help="Scaffold sert.toml, rokit.toml, tools/sert.py, .luaurc, .gitignore, and a starter spec",
+        help="Scaffold sert.toml, rokit.toml, tools/sert.py, .luaurc, .gitignore, starter spec, or AI skill",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing sert.toml, rokit.toml, and tools/sert.py")
     parser.add_argument("--fetch", action="store_true", help="Run `sert fetch` right after writing the files")
+    parser.add_argument("--agents", action="store_true", help="Write .agents/skills/sert/SKILL.md for AI coding agents")
+    parser.add_argument(
+        "--skill",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help="Write AI agent SKILL.md into DIR (default: .agents/skills/sert/) without full scaffold",
+    )
+    parser.add_argument("--stdout", action="store_true", help="Print AI agent SKILL.md to stdout")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable subcommand, flag, and API schema as JSON")
     parser.set_defaults(func=cmd_init)

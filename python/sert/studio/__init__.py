@@ -39,7 +39,7 @@ import tempfile
 import threading
 import time
 
-from sert import config as sert_config, luau_lex
+from sert import agent, config as sert_config, graph as graph_mod, luau_lex, run as run_mod, snapshots as snapshots_mod
 from sert.markers import (
     FILE,
     FRAME,
@@ -66,6 +66,7 @@ from sert.util import (
     build_place,
     check_selection,
     expand_globs,
+    is_ci,
     load_json,
     luau_string,
     worst,
@@ -1247,9 +1248,31 @@ def build_request(settings: Settings, opts, mode: str, selection: Selection, run
         request["failFast"] = True
     if getattr(opts, "compact", False) or os.environ.get("SERT_COMPACT") == "1":
         request["compact"] = True
-    ci_env = os.environ.get("CI")
-    if ci_env and ci_env.lower() not in ("0", "false", "no"):
+    ci_active = bool(getattr(opts, "ci", False) or is_ci())
+    if ci_active:
         request["ci"] = True
+    if (getattr(opts, "update_snapshots", False) or getattr(opts, "prune_snapshots", False)) and ci_active:
+        raise SertError("sert studio: -u / --update-snapshots cannot be used in CI mode (--ci or CI=true)")
+
+    extra_args = list(request.get("args") or [])
+    if getattr(opts, "update_snapshots", False):
+        request["updateSnapshots"] = True
+        if "--update-snapshots" not in extra_args and "-u" not in extra_args:
+            extra_args.append("--update-snapshots")
+    if getattr(opts, "strict_assertions", False):
+        request["strictAssertions"] = True
+        if "--strict-assertions" not in extra_args:
+            extra_args.append("--strict-assertions")
+    if getattr(opts, "bench", False):
+        request["bench"] = True
+        if "--bench" not in extra_args:
+            extra_args.append("--bench")
+    if extra_args:
+        request["args"] = extra_args
+    if regressions := run_mod.load_regressions_by_test(Path(settings.root)):
+        request["regressions"] = regressions
+    if file_snaps := snapshots_mod.load_file_snapshots(Path(settings.root)):
+        request["snapshots"] = file_snaps
     return request
 
 
@@ -1268,6 +1291,7 @@ def run_mode(
     catalogue: list[dict] | None,
     work: str,
 ) -> int:
+    fmt = agent.output_format(opts)
     proj_path, runner_path, config_path = prepare_studio_project(settings, work, label=f"overlay-{mode}")
     place = os.path.join(work, f"{mode}.rbxl")
     warm = bool(getattr(opts, "warm", False) or settings.warm)
@@ -1283,7 +1307,8 @@ def run_mode(
     sent = set(request)
     if isinstance(changed := hooks.call("request", opts, request), dict):
         request = changed
-    print(f"run {run_id}: {selection.describe()}", flush=True)
+    if fmt == "human":
+        print(f"run {run_id}: {selection.describe()}", flush=True)
 
     died = False
     max_attempts = 1 if warm else ATTEMPTS
@@ -1303,11 +1328,12 @@ def run_mode(
         parsed = parse(attempt.report.get("output") or "")
         if not should_relaunch(attempt.code, attempt.report, parsed):
             break
-        print(
-            f"{mode}: attempt {attempt_number}: the session ended without its results (infrastructure)"
-            + ("; launching again" if attempt_number < max_attempts else ""),
-            flush=True,
-        )
+        if fmt == "human":
+            print(
+                f"{mode}: attempt {attempt_number}: the session ended without its results (infrastructure)"
+                + ("; launching again" if attempt_number < max_attempts else ""),
+                flush=True,
+            )
     else:
         died = True
     code = INFRA if died else attempt.code
@@ -1368,10 +1394,27 @@ def run_mode(
         catalogue,
     )
 
-    if opts.repeat > 1:
-        for iteration in parsed.iterations:
-            print(f"{mode} iteration {iteration['n']}: {iteration['summary'] or 'no summary'}")
-        found = update_flakes(
+    if fmt == "human":
+        if opts.repeat > 1:
+            for iteration in parsed.iterations:
+                print(f"{mode} iteration {iteration['n']}: {iteration['summary'] or 'no summary'}")
+            found = update_flakes(
+                settings,
+                mode,
+                run_id,
+                opts.repeat,
+                runs,
+                f"{SESSION_DIED} ({max_attempts} attempts)" if died else None,
+            )
+            for line in flake_lines(settings, mode, found, len(runs)):
+                print(line)
+        for test in tests:
+            if test["status"] == "fail":
+                prefix = f"[{test['iteration']}] " if opts.repeat > 1 and "iteration" in test else ""
+                seed = f" (seed {test['seed']})" if "seed" in test else ""
+                print(f"FAIL {prefix}{test.get('file', '?')}: {test['name']}{seed}\n   {test.get('message') or ''}")
+    elif opts.repeat > 1:
+        update_flakes(
             settings,
             mode,
             run_id,
@@ -1379,13 +1422,6 @@ def run_mode(
             runs,
             f"{SESSION_DIED} ({max_attempts} attempts)" if died else None,
         )
-        for line in flake_lines(settings, mode, found, len(runs)):
-            print(line)
-    for test in tests:
-        if test["status"] == "fail":
-            prefix = f"[{test['iteration']}] " if opts.repeat > 1 and "iteration" in test else ""
-            seed = f" (seed {test['seed']})" if "seed" in test else ""
-            print(f"FAIL {prefix}{test.get('file', '?')}: {test['name']}{seed}\n   {test.get('message') or ''}")
     lines = phase_lines(mode, attempt.launched, built, float(report.get("seconds") or 0), parsed, tests, opts.slowest)
     save_json(
         os.path.join(settings.out, f"{mode}.timing.json"),
@@ -1399,20 +1435,22 @@ def run_mode(
             ],
         },
     )
-    for line in lines:
-        print(line)
-    print(f"{mode}: {summary}")
-    if (seed := stored["seed"]) is not None:
-        print(f"seed {seed} (property and model tests; replay with --seed {seed})")
-    if carried:
-        print(f"{carried} earlier failures this run did not run again are kept in last.json for --failed")
+    if fmt == "human":
+        for line in lines:
+            print(line)
+        print(f"{mode}: {summary}")
+        if (seed := stored["seed"]) is not None:
+            print(f"seed {seed} (property and model tests; replay with --seed {seed})")
+        if carried:
+            print(f"{carried} earlier failures this run did not run again are kept in last.json for --failed")
 
     if code == 0 and failed_count(parsed):
         code = 1
     if code in (0, 1) and parsed.results is None and not tests and report.get("result") is None:
         code = INFRA
     if code == 0 and executed(parsed) == 0 and (tests or parsed.results is not None):
-        print("no test ran: nothing matched the selection, or only skips")
+        if fmt == "human":
+            print("no test ran: nothing matched the selection, or only skips")
         code = 1
     if ignored := ignored_keys(parsed, sent):
         print(
@@ -1421,6 +1459,63 @@ def run_mode(
             file=sys.stderr,
         )
         code = INFRA
+
+    root_path = Path(settings.root)
+    snapshot_events = [ev for ev in parsed.snapshots if isinstance(ev, dict)]
+    regression_events = [ev for ev in parsed.regressions if isinstance(ev, dict)]
+    snap_updates: list[dict] = []
+    if getattr(opts, "update_snapshots", False) or getattr(opts, "prune_snapshots", False):
+        if getattr(opts, "update_snapshots", False) and snapshot_events:
+            snap_updates.extend(snapshots_mod.apply_inline_updates(root_path, snapshot_events))
+        unfiltered = not (selection.filter or selection.filters or selection.patterns or selection.excludes or selection.files or selection.failed is not None)
+        prune_set = (
+            run_mod._collect_snapshot_prune_set(root_path, settings.conf, [parsed], snapshot_events, unfiltered)
+            if getattr(opts, "prune_snapshots", False)
+            else None
+        )
+        file_events = snapshot_events if getattr(opts, "update_snapshots", False) else []
+        if file_events or prune_set:
+            snap_updates.extend(snapshots_mod.apply_file_updates(root_path, file_events, prune=prune_set or None))
+    saved_regressions: list[dict] = []
+    if getattr(opts, "save_regressions", False) and regression_events:
+        saved_regressions = run_mod.save_regression_tokens(root_path, regression_events)
+
+    if fmt == "agent":
+        studio_res = run_mod.RunResult(
+            status=code,
+            entries=[run_mod.EntryRun(entry=f"studio:{mode}", code=code, seconds=float(report.get("seconds") or 0), output=output)],
+            tests=tests,
+        )
+        print(agent.format_run_agent(studio_res, root=root_path))
+    elif fmt == "json":
+        counts = (parsed.verdict or {}).get("counts") if isinstance(parsed.verdict, dict) else None
+        if not isinstance(counts, dict):
+            passed_n = sum(1 for t in tests if t.get("status") == "pass")
+            failed_n = sum(1 for t in tests if t.get("status") == "fail")
+            skipped_n = sum(1 for t in tests if t.get("status") == "skip")
+            counts = {"passed": passed_n, "failed": failed_n, "skipped": skipped_n, "total": len(tests)}
+        errors = [
+            f"{t.get('file', '?')}: {t.get('name', '?')}: {t.get('message') or 'failed'}"
+            for t in tests
+            if t.get("status") == "fail"
+        ]
+        print(
+            agent.json_dumps_compact(
+                agent.json_envelope(
+                    "studio",
+                    code,
+                    summary={**counts, "mode": mode, "seconds": report.get("seconds") or 0},
+                    errors=errors,
+                    data={
+                        "runId": run_id,
+                        "skipped_by_reason": parsed.skipped_by_reason,
+                        "snapshots_updated": snap_updates,
+                        "regressions_saved": saved_regressions,
+                    },
+                )
+            )
+        )
+
     state.update({"parsed": parsed, "tests": tests, "results": parsed.results, "summary": summary, "exit": code})
     override = hooks.call("report", state)
     if isinstance(override, int) and not isinstance(override, bool):
@@ -1610,6 +1705,29 @@ def add_arguments(parser: argparse.ArgumentParser, settings: Settings | None = N
         metavar="CMD",
         help="start Studio with CMD instead of the platform's Studio (default [studio].launcher)",
     )
+    parser.add_argument(
+        "--affected",
+        "--changed",
+        dest="affected",
+        nargs="?",
+        const="HEAD",
+        default=None,
+        metavar="REV",
+        help="only run specs impacted by git diff against REV (default: HEAD)",
+    )
+    parser.add_argument("-u", "--update-snapshots", action="store_true", help="create/update inline and .snap snapshots")
+    parser.add_argument("--prune-snapshots", action="store_true", help="remove unused .snap keys/files")
+    parser.add_argument("--strict-assertions", action="store_true", help="fail tests with 0 assertions unless marked { smoke = true }")
+    parser.add_argument("--save-regressions", action="store_true", help="persist [sert-x:regression] tokens into test/.sert-regressions.toml")
+    parser.add_argument("--bench", action="store_true", help="execute registered sert.bench benchmarks")
+    parser.add_argument("--ci", action="store_true", help="enable CI guards (disables snapshot writes and focused tests)")
+    parser.add_argument("--agent", action="store_true", help="token-efficient output format for AI agents")
+    parser.add_argument(
+        "--format",
+        choices=("human", "agent", "json"),
+        default=None,
+        help="output format (default: human; or agent when SERT_AGENT=1)",
+    )
     parser.add_argument("--json-out", metavar="FILE", help="write each session's verdict as JSON (as `sert cloud`)")
     parser.add_argument("--check", action="store_true", help="build the place and run drift and hook checks; no Studio")
     suites_list = settings.suites if settings is not None and settings.suites else None
@@ -1746,6 +1864,9 @@ def guarded(settings: Settings, hooks: Hooks, opts) -> int:
 
 
 def execute(settings: Settings, hooks: Hooks, opts) -> int:
+    ci_active = bool(getattr(opts, "ci", False) or is_ci())
+    if (getattr(opts, "update_snapshots", False) or getattr(opts, "prune_snapshots", False)) and ci_active:
+        raise SertError("sert studio: -u / --update-snapshots cannot be used in CI mode (--ci or CI=true)")
     if opts.repeat < 1:
         raise SertError("--repeat: N must be at least 1")
     eff_clients = getattr(opts, "clients", None)
@@ -1800,6 +1921,23 @@ def execute(settings: Settings, hooks: Hooks, opts) -> int:
     selection.filters = [value for value in opts.filters if value]
     selection.excludes = [value for value in opts.exclude if value]
     selection.files = list(opts.file)
+    if getattr(opts, "affected", None) is not None and not selection.files:
+        impacted, _ = graph_mod.affected_specs(
+            Path(settings.root),
+            settings.conf,
+            base_rev=str(opts.affected or "HEAD"),
+            all_specs=settings.spec_files(),
+        )
+        if not impacted:
+            fmt = agent.output_format(opts)
+            if fmt == "agent":
+                print("OK passed=0 failed=0 skipped=0 duration=0ms affected=0")
+            elif fmt == "json":
+                print(agent.json_dumps_compact(agent.json_envelope("studio", 0, summary={"passed": 0, "failed": 0, "skipped": 0, "total": 0, "affected_specs": 0}, data={"affected_specs": []})))
+            else:
+                print(f"sert studio: 0 specs impacted by diff against {opts.affected or 'HEAD'}; skipping")
+            return 0
+        selection.files = impacted
     selection.sides = list(opts.side)
     try:
         selection.patterns = [re.compile(value, re.IGNORECASE) for value in opts.grep]

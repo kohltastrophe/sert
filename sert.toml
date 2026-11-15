@@ -12,27 +12,6 @@ min = 90
 include = ["src"]
 timeout = 0.5
 
-[mutate.specs]
-"src/core/assert.luau" = "@file=Assert"
-"src/core/bytes.luau" = "@file=Format,Sert"
-"src/core/format.luau" = "@file=Format"
-"src/core/match.luau" = "@file=Assert"
-"src/core/registry.luau" = "@file=Runner"
-"src/core/rng.luau" = "@file=Gen,Runner,Sert"
-"src/core/runner.luau" = "@file=Runner"
-"src/core/spy.luau" = "@file=Assert,Sert"
-"src/core/util.luau" = "@file=Assert,Format,Runner"
-"src/engine" = "@file=Engine,Env"
-"src/env" = "@file=Env"
-"src/init.luau" = "@file=Sert"
-"src/prop/gen.luau" = "@file=Gen"
-"src/prop/init.luau" = "@file=Gen,Laws,Model,Runner"
-"src/prop/laws.luau" = "@file=Laws"
-"src/prop/model.luau" = "@file=Model"
-"src/roblox/Layout.luau" = "@file=Roblox,layout_headless"
-"src/roblox" = "@file=Roblox"
-"src/sim" = "@file=Sim"
-
 # Compile-time probes of the public types (run by `sert lint` or `sert lint --only types`): pass files analyze clean,
 # fail files error on exactly their `-- expect-error` lines, under both solvers.
 [types]

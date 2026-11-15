@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -17,12 +19,23 @@ import sys
 import threading
 import time
 
-from sert import config as config_mod, coverage as coverage_mod, fetch, luau_lex, run as run_mod
-from sert.util import FAILED, SertError, as_list, interrupt, load_json, strip_jsonc, step_summary
+from sert import VERSION, agent, config as config_mod, coverage as coverage_mod, fetch, graph, luau_lex, run as run_mod
+from sert.util import FAILED, SertError, as_list, interrupt, load_json, strip_jsonc, step_summary, write_atomic
 
 LONG_OPEN = re.compile(r"\[(=*)\[")
 
-ALL_OPERATORS = ("stmt_del", "ret_val", "cond_inv", "rel_flip", "arith_op", "logic_op", "math_fn")
+ALL_OPERATORS = (
+    "stmt_del",
+    "ret_val",
+    "cond_inv",
+    "rel_flip",
+    "arith_op",
+    "logic_op",
+    "math_fn",
+    "off_by_one",
+    "nil_guard",
+    "remote_guard",
+)
 SWITCH = "_SERT_M.id"
 STAGED_SWITCH = "_SERT_M.id"
 MUTANT_PREAMBLE = (
@@ -134,6 +147,7 @@ class Mutant:
     mutated: str
     spec_filter: str | None = None
     status: str = "PENDING"
+    covering_specs: tuple[str, ...] = ()
 
 
 def scan_lines(text: str, keep_strings: bool = False) -> tuple[list[str], list[str], list[bool]]:
@@ -551,35 +565,6 @@ def _mark_type_tokens(tokens: list[luau_lex.Token]) -> list[bool]:
     return in_type
 
 
-def _is_if_statement(tokens: list[luau_lex.Token], idx: int, in_type: list[bool]) -> bool:
-    """Distinguish `if ... then ... end` statements from `if ... then ... else ...` expressions."""
-    p = idx - 1
-    while p >= 0 and in_type[p]:
-        p -= 1
-    if p < 0:
-        return True
-    prev = tokens[p]
-    if prev.kind == "ATTR":
-        return True
-    if prev.kind == "OP":
-        if prev.value in (";", "}"):
-            return True
-        if prev.value == ")":
-            return True
-        if prev.value in _BINARY_CONTINUATION_OPS or prev.value in _COMPOUND_OPS:
-            return False
-    if prev.kind == "KEYWORD":
-        if prev.value in ("do", "repeat", "end", "break", "continue"):
-            return True
-        if prev.value in ("then", "else"):
-            # Inside an `if`-expression (`if a then if b then 1 else 2 else 3`), `prev` is `then`/`else` of `if`-expr;
-            # check if this `if` has an `else` on the same expression without an `end` or starts a block on a new line.
-            return prev.line < tokens[idx].line
-        if prev.value in ("local", "const", "return", "elseif", "while", "until", "for", "in", "and", "or", "not", "function"):
-            return False
-    return True
-
-
 def _function_body_start(tokens: list[luau_lex.Token], fn_idx: int, in_type: list[bool]) -> int:
     """Given `tokens[fn_idx]` == `KEYWORD('function')`, return the token index of the first token in its body."""
     n = len(tokens)
@@ -673,6 +658,93 @@ def _continues_onto_next(tokens: list[luau_lex.Token], last_idx: int, in_type: l
     return False
 
 
+def _match_close_bounded(tokens: list[luau_lex.Token], idx: int, hi: int, open_op: str, close_op: str) -> int:
+    """Return token index immediately after matching `close_op` within `tokens[idx:hi]`, or -1 if unmatched."""
+    if idx >= hi or tokens[idx].kind != "OP" or tokens[idx].value != open_op or tokens[idx].is_type_angle:
+        return -1
+    depth = 0
+    k = idx
+    while k < hi:
+        tok = tokens[k]
+        if tok.kind == "OP" and not tok.is_type_angle:
+            if tok.value == open_op:
+                depth += 1
+            elif tok.value == close_op:
+                depth -= 1
+                if depth == 0:
+                    return k + 1
+        k += 1
+    return -1
+
+
+def _is_remote_handler_start(tokens: list[luau_lex.Token], fn_idx: int) -> bool:
+    """Return True if `tokens[fn_idx]` (`function`) starts `.OnServerEvent:Connect(fn)` or `.OnServerInvoke = fn`."""
+    if fn_idx >= 4 and tokens[fn_idx - 1].kind == "OP" and tokens[fn_idx - 1].value == "(":
+        if (
+            tokens[fn_idx - 2].kind == "IDENT"
+            and tokens[fn_idx - 2].value in ("Connect", "Once")
+            and tokens[fn_idx - 3].kind == "OP"
+            and tokens[fn_idx - 3].value == ":"
+            and tokens[fn_idx - 4].kind == "IDENT"
+            and tokens[fn_idx - 4].value == "OnServerEvent"
+        ):
+            return True
+    if fn_idx >= 3 and tokens[fn_idx - 1].kind == "OP" and tokens[fn_idx - 1].value == "=":
+        if (
+            tokens[fn_idx - 2].kind == "IDENT"
+            and tokens[fn_idx - 2].value == "OnServerInvoke"
+            and tokens[fn_idx - 3].kind == "OP"
+            and tokens[fn_idx - 3].value == "."
+        ):
+            return True
+    return False
+
+
+def _find_nil_guard_rhs_end(tokens: list[luau_lex.Token], in_type: list[bool], rhs_lo: int, hi: int) -> int:
+    """Find the inclusive token index ending the RHS operand of `or` starting at `rhs_lo`."""
+    sub_d = 0
+    sub_fn = 0
+    sub_if = 0
+    for r in range(rhs_lo, hi):
+        if in_type[r]:
+            continue
+        rt = tokens[r]
+        if rt.kind == "INTERP_BEGIN":
+            sub_d += 1
+        elif rt.kind == "INTERP_END":
+            if sub_d == 0 and sub_fn == 0:
+                return r - 1
+            sub_d = max(0, sub_d - 1)
+        elif rt.kind == "OP" and not rt.is_type_angle:
+            if rt.value in ("(", "{", "["):
+                sub_d += 1
+            elif rt.value in (")", "}", "]"):
+                if sub_d == 0 and sub_fn == 0:
+                    return r - 1
+                sub_d = max(0, sub_d - 1)
+            elif rt.value in (",", ";") and sub_d == 0 and sub_fn == 0 and sub_if == 0:
+                return r - 1
+        elif rt.kind == "KEYWORD":
+            if rt.value == "function":
+                sub_fn += 1
+            elif rt.value == "end":
+                if sub_fn > 0:
+                    sub_fn -= 1
+                elif sub_d == 0:
+                    return r - 1
+            elif sub_fn == 0 and sub_d == 0:
+                if rt.value == "if":
+                    sub_if += 1
+                elif rt.value == "else":
+                    if sub_if > 0:
+                        sub_if -= 1
+                    else:
+                        return r - 1
+                elif rt.value in ("elseif", "then", "or") and sub_if == 0:
+                    return r - 1
+    return hi - 1
+
+
 def _expr_mutants(
     tokens: list[luau_lex.Token],
     in_type: list[bool],
@@ -682,6 +754,8 @@ def _expr_mutants(
     ops: set[str],
     *,
     skip_simple_eq: bool = False,
+    allow_nil_guard: bool = False,
+    in_remote: bool = False,
 ) -> list[tuple[str, str]]:
     """Generate `(op_name, mutated_expr_src)` pairs for expression slice `tokens[lo:hi]` using exact token spans."""
     if lo >= hi:
@@ -708,12 +782,17 @@ def _expr_mutants(
     arith_muts: list[tuple[str, str]] = []
     logic_muts: list[tuple[str, str]] = []
     math_muts: list[tuple[str, str]] = []
+    off_by_one_muts: list[tuple[str, str]] = []
+    nil_guard_muts: list[tuple[str, str]] = []
+    remote_guard_muts: list[tuple[str, str]] = []
 
     def replace_span(s_off: int, e_off: int, replacement: str) -> str:
         rel_s = s_off - expr_start
         rel_e = e_off - expr_start
         left = base_src[:rel_s]
         right = base_src[rel_e:]
+        if not replacement:
+            return left + right
         # Avoid merging tokens such as `--` comment or `..` if tight without whitespace
         if replacement.startswith("-") and right.startswith("-"):
             replacement = replacement + " "
@@ -724,6 +803,7 @@ def _expr_mutants(
         return left + replacement + right
 
     fn_depth = 0
+    ternary_cond_depth = 0
     for k in range(lo, hi):
         if in_type[k]:
             continue
@@ -737,6 +817,11 @@ def _expr_mutants(
                 continue
         if fn_depth > 0:
             continue
+        if tok.kind == "KEYWORD":
+            if tok.value in ("if", "elseif"):
+                ternary_cond_depth += 1
+            elif tok.value == "then" and ternary_cond_depth > 0:
+                ternary_cond_depth -= 1
 
         # 1. Relational flip (`rel_flip`) — never touches `tok.is_type_angle`!
         if "rel_flip" in ops and tok.kind == "OP" and not tok.is_type_angle and tok.value in _FLIP_MAP:
@@ -785,7 +870,140 @@ def _expr_mutants(
             fn_tok = tokens[k + 2]
             math_muts.append(("math_fn", replace_span(fn_tok.start, fn_tok.end, _MATH_FN_MAP[fn_tok.value])))
 
-    return rel_muts + arith_muts + logic_muts + math_muts
+        # 5. Off-by-one length operator (`off_by_one`): `#ident` -> `(#ident - 1)`
+        if (
+            "off_by_one" in ops
+            and tok.kind == "OP"
+            and tok.value == "#"
+            and k + 1 < hi
+            and not in_type[k + 1]
+            and tokens[k + 1].kind == "IDENT"
+            and (k == lo or not (tokens[k - 1].kind == "OP" and tokens[k - 1].value in (".", ":")))
+        ):
+            cur = k + 2
+            unsafe = False
+            while cur < hi and not in_type[cur]:
+                nt = tokens[cur]
+                if nt.kind == "OP" and not nt.is_type_angle and nt.value == "." and cur + 1 < hi and tokens[cur + 1].kind == "IDENT":
+                    cur += 2
+                    continue
+                if nt.kind == "OP" and not nt.is_type_angle and nt.value == "[":
+                    nxt = _match_close_bounded(tokens, cur, hi, "[", "]")
+                    if nxt < 0:
+                        unsafe = True
+                        break
+                    cur = nxt
+                    continue
+                if nt.kind == "OP" and not nt.is_type_angle and nt.value == "(":
+                    nxt = _match_close_bounded(tokens, cur, hi, "(", ")")
+                    if nxt < 0:
+                        unsafe = True
+                        break
+                    cur = nxt
+                    continue
+                if (
+                    nt.kind == "OP"
+                    and not nt.is_type_angle
+                    and nt.value == ":"
+                    and cur + 2 < hi
+                    and tokens[cur + 1].kind == "IDENT"
+                    and tokens[cur + 2].kind == "OP"
+                    and tokens[cur + 2].value == "("
+                ):
+                    nxt = _match_close_bounded(tokens, cur + 2, hi, "(", ")")
+                    if nxt < 0:
+                        unsafe = True
+                        break
+                    cur = nxt
+                    continue
+                if nt.kind == "OP" and not nt.is_type_angle and nt.value in (":", "{"):
+                    unsafe = True
+                elif nt.kind in ("STRING", "INTERP_FULL", "INTERP_BEGIN"):
+                    unsafe = True
+                break
+            if not unsafe:
+                target_src = source[tok.start : tokens[cur - 1].end]
+                off_by_one_muts.append(("off_by_one", replace_span(tok.start, tokens[cur - 1].end, f"({target_src} - 1)")))
+
+        # 6. Nil fallback deletion (`nil_guard`): `lhs or rhs` -> `lhs` on assignment RHS / `return`
+        if (
+            allow_nil_guard
+            and "nil_guard" in ops
+            and ternary_cond_depth == 0
+            and tok.kind == "KEYWORD"
+            and tok.value == "or"
+            and k > lo
+            and k + 1 < hi
+        ):
+            rhs_last = _find_nil_guard_rhs_end(tokens, in_type, k + 1, hi)
+            if rhs_last >= k + 1:
+                nil_guard_muts.append(("nil_guard", replace_span(tokens[k - 1].end, tokens[rhs_last].end, "")))
+
+        # 7. Remote handler runtime type guard removal (`remote_guard`)
+        if in_remote and "remote_guard" in ops:
+            if (
+                tok.kind == "IDENT"
+                and tok.value in ("type", "typeof")
+                and (k == lo or not (tokens[k - 1].kind == "OP" and tokens[k - 1].value in (".", ":")))
+                and k + 1 < hi
+                and tokens[k + 1].kind == "OP"
+                and tokens[k + 1].value == "("
+            ):
+                after_p = _match_close_bounded(tokens, k + 1, hi, "(", ")")
+                if after_p > k + 3 and after_p + 1 < hi:
+                    op_tok = tokens[after_p]
+                    rhs_tok = tokens[after_p + 1]
+                    if (
+                        op_tok.kind == "OP"
+                        and not op_tok.is_type_angle
+                        and op_tok.value in ("==", "~=")
+                        and rhs_tok.kind == "STRING"
+                        and (
+                            after_p + 2 >= hi
+                            or in_type[after_p + 2]
+                            or not (
+                                tokens[after_p + 2].kind == "OP"
+                                and not tokens[after_p + 2].is_type_angle
+                                and tokens[after_p + 2].value in (".", ":", "..", "^", "*", "/", "//", "%", "+", "-")
+                            )
+                        )
+                    ):
+                        rep = "true" if op_tok.value == "==" else "false"
+                        remote_guard_muts.append(("remote_guard", replace_span(tok.start, rhs_tok.end, rep)))
+            elif (
+                tok.kind == "STRING"
+                and (
+                    k == lo
+                    or in_type[k - 1]
+                    or not (
+                        tokens[k - 1].kind == "OP"
+                        and not tokens[k - 1].is_type_angle
+                        and tokens[k - 1].value in (".", ":", "..", "^", "*", "/", "//", "%", "+", "-")
+                    )
+                )
+                and k + 4 < hi
+                and tokens[k + 1].kind == "OP"
+                and not tokens[k + 1].is_type_angle
+                and tokens[k + 1].value in ("==", "~=")
+                and tokens[k + 2].kind == "IDENT"
+                and tokens[k + 2].value in ("type", "typeof")
+                and tokens[k + 3].kind == "OP"
+                and tokens[k + 3].value == "("
+            ):
+                after_p = _match_close_bounded(tokens, k + 3, hi, "(", ")")
+                if after_p > k + 4 and (
+                    after_p >= hi
+                    or in_type[after_p]
+                    or not (
+                        tokens[after_p].kind == "OP"
+                        and not tokens[after_p].is_type_angle
+                        and tokens[after_p].value in (".", ":", "(", "[", "..", "^", "*", "/", "//", "%", "+", "-")
+                    )
+                ):
+                    rep = "true" if tokens[k + 1].value == "==" else "false"
+                    remote_guard_muts.append(("remote_guard", replace_span(tok.start, tokens[after_p - 1].end, rep)))
+
+    return rel_muts + arith_muts + logic_muts + math_muts + off_by_one_muts + nil_guard_muts + remote_guard_muts
 
 
 def _split_top_level_commas(tokens: list[luau_lex.Token], in_type: list[bool], lo: int, hi: int) -> list[tuple[int, int]]:
@@ -799,7 +1017,7 @@ def _split_top_level_commas(tokens: list[luau_lex.Token], in_type: list[bool], l
             continue
         tk = tokens[k]
         if tk.kind == "KEYWORD":
-            if tk.value in ("function", "do", "repeat") or (tk.value == "if" and _is_if_statement(tokens, k, in_type)):
+            if tk.value in ("function", "do", "repeat") or (tk.value == "if" and luau_lex.is_if_statement(tokens, k, in_type)):
                 fn_depth += 1
             elif tk.value in ("end", "until") and fn_depth > 0:
                 fn_depth -= 1
@@ -854,6 +1072,7 @@ def _mutate_token_slice(
     extra_cosmetic_re: re.Pattern[str] | None,
     *,
     is_early_guard: bool = False,
+    in_remote: bool = False,
 ) -> str | None:
     """Mutate a single statement token slice `tokens[lo:hi]`, returning the replacement Luau statement text (without indent)."""
     if lo >= hi:
@@ -931,7 +1150,14 @@ def _mutate_token_slice(
             line_mutants.append(("cond_inv", f"not ({cond_src})", desc))
 
         for op_name, mut_expr in _expr_mutants(
-            tokens, in_type, cond_lo, cond_hi, source, ops, skip_simple_eq=has_cond_inv
+            tokens,
+            in_type,
+            cond_lo,
+            cond_hi,
+            source,
+            ops,
+            skip_simple_eq=has_cond_inv,
+            in_remote=in_remote,
         ):
             if not room(len(line_mutants)):
                 break
@@ -976,7 +1202,9 @@ def _mutate_token_slice(
                 ret_branches.append(("ret_val", f"return {inv}"))
             for seg_idx in range(1, len(ret_segs)):
                 s_lo, s_hi = ret_segs[seg_idx]
-                for op_name, mut_e in _expr_mutants(tokens, in_type, s_lo, s_hi, source, ops):
+                for op_name, mut_e in _expr_mutants(
+                    tokens, in_type, s_lo, s_hi, source, ops, allow_nil_guard=True, in_remote=in_remote
+                ):
                     if not room(len(ret_branches)):
                         break
                     rebuilt = [
@@ -1005,7 +1233,9 @@ def _mutate_token_slice(
         ret_muts: list[tuple[str, str]] = []
         has_bool_expr_flip = False
         for seg_idx, (s_lo, s_hi) in enumerate(ret_segs):
-            for op_name, mut_e in _expr_mutants(tokens, in_type, s_lo, s_hi, source, ops):
+            for op_name, mut_e in _expr_mutants(
+                tokens, in_type, s_lo, s_hi, source, ops, allow_nil_guard=True, in_remote=in_remote
+            ):
                 if not room(len(ret_muts)):
                     break
                 if op_name in ("rel_flip", "logic_op") and len(ret_segs) == 1:
@@ -1077,7 +1307,9 @@ def _mutate_token_slice(
         if num_lhs == 1 and len(rhs_segs) == 1:
             r_lo, r_hi = rhs_segs[0]
             rhs_src = source[tokens[r_lo].start : tokens[r_hi - 1].end]
-            expr_muts = _expr_mutants(tokens, in_type, r_lo, r_hi, source, ops)
+            expr_muts = _expr_mutants(
+                tokens, in_type, r_lo, r_hi, source, ops, allow_nil_guard=True, in_remote=in_remote
+            )
             chosen: list[tuple[str, str]] = []
             for op_name, mut_rhs in expr_muts:
                 if not room(len(chosen)):
@@ -1101,7 +1333,9 @@ def _mutate_token_slice(
             if seg_idx == len(rhs_segs) - 1 and num_lhs > len(rhs_segs):
                 rebuilt_parts.append(seg_src)
                 continue
-            seg_muts = _expr_mutants(tokens, in_type, r_lo, r_hi, source, ops)
+            seg_muts = _expr_mutants(
+                tokens, in_type, r_lo, r_hi, source, ops, allow_nil_guard=True, in_remote=in_remote
+            )
             picked: list[tuple[str, str]] = []
             for op_name, mut_rhs in seg_muts:
                 if not room(pending_count + len(picked)):
@@ -1124,7 +1358,51 @@ def _mutate_token_slice(
 
         return f"{lhs_decl} = {', '.join(rebuilt_parts)}" if any_changed else None
 
-    # Skip other control keywords (`for`, `do`, `repeat`, `end`, `else`, `break`, `continue`, `function`, `export`, `type`)
+    # 3b. Numeric `for i = start, #x [, step] do` (`off_by_one`)
+    if first.kind == "KEYWORD" and first.value == "for":
+        if "off_by_one" not in ops or last.kind != "KEYWORD" or last.value != "do" or hi - lo < 7:
+            return None
+        eq_idx = -1
+        for k in range(lo + 1, hi - 1):
+            if in_type[k]:
+                continue
+            tk = tokens[k]
+            if tk.kind == "KEYWORD" and tk.value == "in":
+                return None
+            if tk.kind == "OP" and not tk.is_type_angle and tk.value == "=":
+                eq_idx = k
+                break
+        if eq_idx <= lo + 1 or eq_idx + 1 >= hi - 1:
+            return None
+        if _has_block_statements(tokens, in_type, eq_idx + 1, hi - 1):
+            return None
+        segs = _split_top_level_commas(tokens, in_type, eq_idx + 1, hi - 1)
+        if len(segs) not in (2, 3):
+            return None
+        lim_lo, lim_hi = segs[1]
+        if lim_lo >= lim_hi:
+            return None
+        lim_muts = _expr_mutants(tokens, in_type, lim_lo, lim_hi, source, {"off_by_one"})
+        chosen_lim: list[tuple[str, str]] = []
+        for op_name, mut_lim in lim_muts:
+            if not room(len(chosen_lim)):
+                break
+            chosen_lim.append((op_name, mut_lim))
+        if not chosen_lim:
+            return None
+        header_prefix = source[first.start : tokens[lim_lo].start]
+        header_suffix = source[tokens[lim_hi - 1].end : last.end]
+        lim_src = source[tokens[lim_lo].start : tokens[lim_hi - 1].end]
+        branches: list[str] = []
+        for idx, (op_name, mut_lim) in enumerate(chosen_lim):
+            preview_lim = (
+                mut_lim[1:-1] if (mut_lim.startswith("(") and mut_lim.endswith(")") and lim_src.startswith("#")) else mut_lim
+            )
+            mid = add_mutant(op_name, stmt_src, f"{header_prefix}{preview_lim}{header_suffix}")
+            branches.append(f"{'if' if idx == 0 else 'elseif'} {SWITCH} == {mid} then {mut_lim}")
+        return f"{header_prefix}({' '.join(branches)} else ({lim_src})){header_suffix}"
+
+    # Skip other control keywords (`do`, `repeat`, `end`, `else`, `break`, `continue`, `function`, `export`, `type`)
     if first.kind == "KEYWORD":
         return None
 
@@ -1167,7 +1445,9 @@ def _mutate_token_slice(
 
         rhs_segs = _split_top_level_commas(tokens, in_type, rhs_lo, rhs_hi)
         for seg_idx, (s_lo, s_hi) in enumerate(rhs_segs):
-            for op_name, mut_e in _expr_mutants(tokens, in_type, s_lo, s_hi, source, ops):
+            for op_name, mut_e in _expr_mutants(
+                tokens, in_type, s_lo, s_hi, source, ops, allow_nil_guard=True, in_remote=in_remote
+            ):
                 if not room(len(stmt_muts)):
                     break
                 rebuilt_rhs = ", ".join(
@@ -1204,7 +1484,7 @@ def _mutate_token_slice(
             m_idx = body_lo
             while m_idx < hi and f_depth > 0:
                 if not in_type[m_idx] and tokens[m_idx].kind == "KEYWORD":
-                    if tokens[m_idx].value in ("function", "do") or (tokens[m_idx].value == "if" and _is_if_statement(tokens, m_idx, in_type)):
+                    if tokens[m_idx].value in ("function", "do") or (tokens[m_idx].value == "if" and luau_lex.is_if_statement(tokens, m_idx, in_type)):
                         f_depth += 1
                     elif tokens[m_idx].value == "end":
                         f_depth -= 1
@@ -1223,6 +1503,7 @@ def _mutate_token_slice(
                     add_mutant,
                     extra_benign_res,
                     extra_cosmetic_re,
+                    in_remote=in_remote or _is_remote_handler_start(tokens, k),
                 )
                 if inner_repl is not None:
                     closure_edits.append((tokens[body_lo].start - first.start, tokens[m_idx - 1].end - first.start, inner_repl))
@@ -1298,11 +1579,14 @@ def instrument_source(
     # Build per-token scope state (`stack` before each token)
     n = len(tokens)
     scope_before: list[tuple[str, ...]] = [()] * n
+    in_remote_before: list[bool] = [False] * n
     stack: list[str] = []
+    remote_stack_depths: list[int] = []
     fn_sig_until = -1
     if_expr_depth = 0
     for i, tok in enumerate(tokens):
         scope_before[i] = tuple(stack)
+        in_remote_before[i] = bool(remote_stack_depths)
         if in_type[i] or i < fn_sig_until:
             continue
         if tok.kind == "INTERP_BEGIN":
@@ -1322,10 +1606,12 @@ def instrument_source(
                         break
         elif tok.kind == "KEYWORD":
             if tok.value == "function":
+                if _is_remote_handler_start(tokens, i):
+                    remote_stack_depths.append(len(stack))
                 fn_sig_until = _function_body_start(tokens, i, in_type)
                 stack.append("func")
             elif tok.value == "if":
-                if _is_if_statement(tokens, i, in_type):
+                if luau_lex.is_if_statement(tokens, i, in_type):
                     stack.append("if_stmt")
                 else:
                     if_expr_depth += 1
@@ -1345,6 +1631,8 @@ def instrument_source(
                     if stack[s_idx] in ("func", "if_stmt", "do_block"):
                         del stack[s_idx:]
                         break
+        while remote_stack_depths and len(stack) <= remote_stack_depths[-1]:
+            remote_stack_depths.pop()
 
     scope_after_all = tuple(stack)
 
@@ -1422,6 +1710,7 @@ def instrument_source(
             extra_benign_res,
             extra_cosmetic_re,
             is_early_guard=is_early_guard,
+            in_remote=in_remote_before[lo],
         )
         if mutated_stmt is not None:
             raw_line = raw_lines[line_no - 1]
@@ -1946,7 +2235,7 @@ BASELINE_TIMEOUT_FLOOR = 30.0
 WORK_DIR = Path(".sert") / "mutate"
 _SKIP_ANYWHERE = frozenset({".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"})
 _SKIP_ROOT_DIRS = frozenset({"python", "docs", "dist", "build", "actions", ".github"})
-_SKIP_IN_SERT = frozenset({"mutate", "bin", "cache"})
+_SKIP_IN_SERT = frozenset({"mutate", "fuzz", "bin", "cache"})
 _LUAU_OVERLAY_SUFFIXES = (".luau", ".lua", ".json", ".txt", ".toml")
 _DRIVE_RE = coverage_mod._DRIVE_RE
 BASELINE_FACTOR = 2.0
@@ -1961,11 +2250,16 @@ def add_parser(subparsers) -> None:
     parser.add_argument("--max-mutants", type=int, metavar="N", help="cap on total mutants evaluated (default: [mutate].max_mutants)")
     parser.add_argument(
         "--operators",
-        help="comma-separated subset of stmt_del,ret_val,cond_inv,rel_flip,arith_op,logic_op,math_fn (default: all)",
+        help="comma-separated subset of stmt_del,ret_val,cond_inv,rel_flip,arith_op,logic_op,math_fn,off_by_one,nil_guard,remote_guard (default: all)",
     )
     parser.add_argument("--diff", nargs="?", const="HEAD", default=None, metavar="REV", help="only mutate lines modified in git diff since REV (default: HEAD)")
     parser.add_argument("--coverage-file", metavar="FILE", help="LCOV file (default: coverage.out)")
     parser.add_argument("--no-coverage-run", action="store_true", help="do not run `sert run --coverage` automatically if coverage.out is missing")
+    parser.add_argument("--no-cache", action="store_true", help="ignore cached mutant verdicts in .sert/mutate/cache.json")
+    if not any("--agent" in action.option_strings for action in parser._actions):
+        parser.add_argument("--agent", action="store_true", help="emit concise agent-friendly output")
+    if not any("--format" in action.option_strings for action in parser._actions):
+        parser.add_argument("--format", choices=("human", "agent", "json"), help="output format (human, agent, or json)")
     parser.add_argument("-a", dest="program_args", nargs=argparse.REMAINDER, default=[], help="arguments for the suite, as `sert run -a`")
     parser.set_defaults(func=main)
 
@@ -2181,7 +2475,157 @@ def baseline_run(
     return elapsed
 
 
+CACHE_FILE = WORK_DIR / "cache.json"
+
+
+def _normalized_tokens_digest(source_text: str) -> str:
+    """Hash tokenized source ignoring whitespace and comments for incremental mutant caching."""
+    tokens = luau_lex.tokenize(source_text, include_comments=False)
+    payload = json.dumps([(tok.kind, tok.value) for tok in tokens], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _file_sha256_cached(root: Path, rel_path: str, memo: dict[str, str]) -> str:
+    if rel_path in memo:
+        return memo[rel_path]
+    target = root / rel_path
+    try:
+        digest = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "missing"
+    except OSError:
+        digest = "missing"
+    memo[rel_path] = digest
+    return digest
+
+
+def _mutant_cache_key(
+    file_tokens_hash: str,
+    mutant: Mutant,
+    covering_spec_hashes: list[tuple[str, str]],
+    version: str = VERSION,
+) -> str:
+    payload = json.dumps(
+        {
+            "file_tokens": file_tokens_hash,
+            "op": mutant.op,
+            "line": mutant.line,
+            "mutated": mutant.mutated,
+            "spec_filter": mutant.spec_filter,
+            "specs": covering_spec_hashes,
+            "version": version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_mutant_cache(cache_path: Path) -> dict[str, str]:
+    if not cache_path.is_file():
+        return {}
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    entries = raw.get("entries") if isinstance(raw, dict) else None
+    if not isinstance(entries, dict):
+        return {}
+    return {str(k): str(v) for k, v in entries.items() if v in ("KILLED", "SURVIVED")}
+
+
+def _save_mutant_cache(cache_path: Path, entries: dict[str, str]) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(
+            cache_path,
+            json.dumps({"version": 1, "entries": entries}, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+    except OSError:
+        pass
+
+
+def _dispatch_mutant_batches(
+    pool: ThreadPoolExecutor,
+    batch_items: list[tuple[list[Mutant], float, list[str]]],
+    work_root: Path,
+    runner: str,
+    luau_bin: str,
+    codegen: bool,
+    program_args: list[str] | tuple[str, ...],
+) -> None:
+    """Evaluate `(batch, timeout, entries)` work items on `pool` with single-mutant fallback on timeout/defer."""
+    pending: dict[object, tuple[float, list[str], bool]] = {}
+    for batch, filt_timeout, stage_entries in batch_items:
+        use_defer = len(stage_entries) == 1
+        fut = pool.submit(
+            _evaluate_mutant_batch,
+            batch,
+            work_root,
+            runner,
+            luau_bin,
+            stage_entries,
+            filt_timeout,
+            codegen,
+            program_args,
+            use_defer,
+        )
+        pending[fut] = (filt_timeout, stage_entries, use_defer)
+
+    while pending:
+        done_fut = next(as_completed(pending))
+        filt_timeout, stage_entries, use_defer = pending.pop(done_fut)
+        res = done_fut.result()
+        if res is None:
+            continue
+        head, tail = res
+        if head is not None:
+            pending[
+                pool.submit(
+                    _evaluate_single_mutant,
+                    head,
+                    work_root,
+                    runner,
+                    luau_bin,
+                    stage_entries,
+                    filt_timeout,
+                    codegen,
+                    program_args,
+                    retry_on_timeout=False,
+                )
+            ] = (filt_timeout, stage_entries, use_defer)
+        if len(tail) == 1:
+            pending[
+                pool.submit(
+                    _evaluate_single_mutant,
+                    tail[0],
+                    work_root,
+                    runner,
+                    luau_bin,
+                    stage_entries,
+                    filt_timeout,
+                    codegen,
+                    program_args,
+                )
+            ] = (filt_timeout, stage_entries, use_defer)
+        elif len(tail) > 1:
+            pending[
+                pool.submit(
+                    _evaluate_mutant_batch,
+                    tail,
+                    work_root,
+                    runner,
+                    luau_bin,
+                    stage_entries,
+                    filt_timeout,
+                    codegen,
+                    program_args,
+                    use_defer,
+                )
+            ] = (filt_timeout, stage_entries, use_defer)
+
+
 def main(args) -> int:
+    fmt = agent.output_format(args)
+    no_cache = bool(getattr(args, "no_cache", False))
     cfg = config_mod.from_args(args)
     table, cov_table = cfg.table("mutate"), cfg.table("coverage")
     codegen = bool(cfg.get("test.codegen", True))
@@ -2272,7 +2716,19 @@ def main(args) -> int:
     ]
     if not target_files:
         if diff_rev:
-            print("mutate: no covered lines modified in diff; skipping")
+            if fmt == "json":
+                payload = agent.json_envelope(
+                    "mutate",
+                    "ok",
+                    summary={"score": 100.0, "total": 0, "killed": 0, "survived": 0, "timeout": 0, "cached": 0},
+                    data={"mutants": [], "skipped": True, "reason": "no covered lines modified in diff"},
+                    exit_code=0,
+                )
+                print(agent.json_dumps_compact(payload))
+            elif fmt == "agent":
+                print("OK mutation_score=100.0% killed=0 survived=0 timeout=0 uncovered=0 total=0")
+            else:
+                print("mutate: no covered lines modified in diff; skipping")
             return 0
         raise SertError(f"mutate: no covered files under {', '.join(include)}")
 
@@ -2348,63 +2804,141 @@ def main(args) -> int:
             if not all_mutants:
                 raise SertError(f"mutate: no mutable covered statements found under {', '.join(include)}")
 
-            by_filter: dict[str, list[Mutant]] = {}
+            # Resolve zero-config covering specs per `(rel_path, line)` when `[mutate.specs]` has no manual override.
+            all_specs = graph.discover_specs(cfg.root, cfg)
+            line_cov_cache: dict[tuple[str, int], tuple[str, ...]] = {}
+            if all_specs:
+                for m in all_mutants:
+                    if m.spec_filter is None:
+                        ck = (m.file, m.line)
+                        if ck not in line_cov_cache:
+                            line_cov_cache[ck] = tuple(graph.covering_specs_for_line(cfg.root, cfg, m.file, m.line, all_specs))
+                        m.covering_specs = line_cov_cache[ck]
+
+            # Check incremental mutant cache (`.sert/mutate/cache.json`)
+            cache_path = cfg.root / CACHE_FILE
+            cache_entries = _load_mutant_cache(cache_path)
+            tokens_digest_by_file: dict[str, str] = {
+                file_muts[0].file: _normalized_tokens_digest(source_text)
+                for _sp, _stp, source_text, _inst, file_muts in staged_tasks
+                if file_muts
+            }
+            spec_sha_memo: dict[str, str] = {}
+            dep_graph = graph.build_graph(cfg.root, cfg)
+            dep_refs_memo: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+            cache_keys: dict[int, str] = {}
+            uncached_mutants: list[Mutant] = []
+            cached_count = 0
+            fallback_specs = sorted(all_specs) if all_specs else list(entries)
             for m in all_mutants:
-                by_filter.setdefault(m.spec_filter or "", []).append(m)
+                base_refs = list(m.covering_specs) if m.covering_specs else fallback_specs
+                memo_key = (m.file, tuple(base_refs))
+                spec_refs = dep_refs_memo.get(memo_key)
+                if spec_refs is None:
+                    m_norm = graph._norm_rel(m.file, cfg.root)
+                    refs_set: set[str] = set(base_refs)
+                    for s in base_refs:
+                        s_norm = graph._norm_rel(s, cfg.root)
+                        for dep in dep_graph.dependencies(s_norm, transitive=True):
+                            if dep != m_norm and (cfg.root / dep).is_file():
+                                refs_set.add(dep)
+                    spec_refs = sorted(refs_set)
+                    dep_refs_memo[memo_key] = spec_refs
+                spec_hashes = [(s, _file_sha256_cached(cfg.root, s, spec_sha_memo)) for s in spec_refs]
+                ckey = _mutant_cache_key(tokens_digest_by_file[m.file], m, spec_hashes, VERSION)
+                cache_keys[m.id] = ckey
+                cached_status = None if no_cache else cache_entries.get(ckey)
+                if cached_status in ("KILLED", "SURVIVED"):
+                    m.status = cached_status
+                    cached_count += 1
+                else:
+                    uncached_mutants.append(m)
 
-            baseline_futures = {
-                (filt, entry): pool.submit(baseline_run, runner, luau_bin, entry, filt or None, work_root, timeout_sec, codegen, program_args)
-                for filt in sorted(by_filter)
-                for entry in entries
-            }
-            baseline_by_filter: dict[str, float] = {}
-            for (filt, _entry), fut in baseline_futures.items():
-                elapsed = fut.result()
-                baseline_by_filter[filt] = max(baseline_by_filter.get(filt, 0.0), elapsed)
+            if uncached_mutants:
+                baseline_cache: dict[tuple[str, str], float] = {}
 
-            mutant_floor = timeout_sec if explicit_timeout else min(timeout_sec, MIN_MUTANT_TIMEOUT)
-            timeout_by_filter = {
-                filt: max(mutant_floor, BASELINE_FACTOR * elapsed)
-                for filt, elapsed in baseline_by_filter.items()
-            }
-            worker_count = max(1, jobs)
-            dynamic_batch_size = max(1, min(BATCH_SIZE, (len(all_mutants) + worker_count - 1) // worker_count))
-            batches = [
-                (filt_mutants[i : i + dynamic_batch_size], timeout_by_filter[filt])
-                for filt, filt_mutants in sorted(by_filter.items(), key=lambda kv: -baseline_by_filter.get(kv[0], 0.0))
-                for i in range(0, len(filt_mutants), dynamic_batch_size)
-            ]
-            use_defer = len(entries) == 1
-            pending = {
-                pool.submit(_evaluate_mutant_batch, batch, work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args, use_defer): filt_timeout
-                for batch, filt_timeout in batches
-            }
-            while pending:
-                done_fut = next(as_completed(pending))
-                filt_timeout = pending.pop(done_fut)
-                res = done_fut.result()
-                if res is None:
-                    continue
-                head, tail = res
-                if head is not None:
-                    pending[
-                        pool.submit(
-                            _evaluate_single_mutant,
-                            head,
-                            work_root,
-                            runner,
-                            luau_bin,
-                            entries,
-                            filt_timeout,
-                            codegen,
-                            program_args,
-                            retry_on_timeout=False,
+                def ensure_baselines(filter_entries_pairs: set[tuple[str, str]]) -> None:
+                    missing = [
+                        (filt, entry)
+                        for filt, entry in sorted(filter_entries_pairs)
+                        if (filt, entry) not in baseline_cache
+                    ]
+                    if missing:
+                        futs = {
+                            (filt, entry): pool.submit(
+                                baseline_run, runner, luau_bin, entry, filt or None, work_root, timeout_sec, codegen, program_args
+                            )
+                            for filt, entry in missing
+                        }
+                        for key, fut in futs.items():
+                            baseline_cache[key] = fut.result()
+
+                mutant_floor = timeout_sec if explicit_timeout else min(timeout_sec, MIN_MUTANT_TIMEOUT)
+                worker_count = max(1, jobs)
+
+                def timeout_for(filt: str, stage_entries: list[str]) -> float:
+                    max_elapsed = max((baseline_cache.get((filt, e), 0.0) for e in stage_entries), default=0.0)
+                    return max(mutant_floor, BASELINE_FACTOR * max_elapsed)
+
+                direct_mutants = [m for m in uncached_mutants if m.spec_filter is not None or not m.covering_specs]
+                routed_mutants = [m for m in uncached_mutants if m.spec_filter is None and m.covering_specs]
+
+                # 1. Direct mutants (manual `[mutate.specs]` or unrouted fallback)
+                if direct_mutants:
+                    by_filter: dict[str, list[Mutant]] = {}
+                    for m in direct_mutants:
+                        by_filter.setdefault(m.spec_filter or "", []).append(m)
+                    ensure_baselines({(filt, entry) for filt in by_filter for entry in entries})
+                    timeout_by_filter = {filt: timeout_for(filt, entries) for filt in by_filter}
+                    dyn_batch = max(1, min(BATCH_SIZE, (len(direct_mutants) + worker_count - 1) // worker_count))
+                    direct_batches = [
+                        (filt_mutants[i : i + dyn_batch], timeout_by_filter[filt], entries)
+                        for filt, filt_mutants in sorted(by_filter.items(), key=lambda kv: -timeout_by_filter[kv[0]])
+                        for i in range(0, len(filt_mutants), dyn_batch)
+                    ]
+                    _dispatch_mutant_batches(pool, direct_batches, work_root, runner, luau_bin, codegen, program_args)
+
+                # 2. Zero-config routed mutants: run fastest covering spec first, short-circuiting once KILLED
+                stage = 0
+                alive_routed = list(routed_mutants)
+                while alive_routed:
+                    by_route: dict[tuple[str, tuple[str, ...]], list[Mutant]] = {}
+                    needed_pairs: set[tuple[str, str]] = set()
+                    for m in alive_routed:
+                        spec = m.covering_specs[stage]
+                        stage_entries = (spec,) if spec in entries else tuple(entries)
+                        stage_filter = "" if spec in entries else f"@file={spec}"
+                        m.spec_filter = stage_filter or None
+                        by_route.setdefault((stage_filter, stage_entries), []).append(m)
+                        for e in stage_entries:
+                            needed_pairs.add((stage_filter, e))
+                    ensure_baselines(needed_pairs)
+                    dyn_batch = max(1, min(BATCH_SIZE, (len(alive_routed) + worker_count - 1) // worker_count))
+                    stage_batches = [
+                        (grp_mutants[i : i + dyn_batch], timeout_for(filt, list(st_entries)), list(st_entries))
+                        for (filt, st_entries), grp_mutants in sorted(
+                            by_route.items(),
+                            key=lambda kv: -timeout_for(kv[0][0], list(kv[0][1])),
                         )
-                    ] = filt_timeout
-                if len(tail) == 1:
-                    pending[pool.submit(_evaluate_single_mutant, tail[0], work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args)] = filt_timeout
-                elif len(tail) > 1:
-                    pending[pool.submit(_evaluate_mutant_batch, tail, work_root, runner, luau_bin, entries, filt_timeout, codegen, program_args, use_defer)] = filt_timeout
+                        for i in range(0, len(grp_mutants), dyn_batch)
+                    ]
+                    try:
+                        _dispatch_mutant_batches(pool, stage_batches, work_root, runner, luau_bin, codegen, program_args)
+                    finally:
+                        for m in alive_routed:
+                            m.spec_filter = None
+
+                    alive_routed = [
+                        m
+                        for m in alive_routed
+                        if m.status == "SURVIVED" and stage + 1 < len(m.covering_specs)
+                    ]
+                    stage += 1
+
+                for m in uncached_mutants:
+                    if m.status in ("KILLED", "SURVIVED") and m.id in cache_keys:
+                        cache_entries[cache_keys[m.id]] = m.status
+                _save_mutant_cache(cache_path, cache_entries)
         except BaseException:
             _kill_active_procs()
             pool.shutdown(wait=True, cancel_futures=True)
@@ -2416,12 +2950,54 @@ def main(args) -> int:
             signal.signal(signal.SIGTERM, prev_sigterm)
         shutil.rmtree(work_root, ignore_errors=True)
 
-    score = summarize(all_mutants, out=sys.stderr, root=cfg.root)
-    print(f"{score:.1f}")
-    if minimum is not None and score < float(minimum):
-        print(f"mutate: {score:.1f}% is below the {float(minimum):g}% floor", file=sys.stderr)
-        return FAILED
-    return 0
+    if fmt == "human":
+        score = summarize(all_mutants, out=sys.stderr, root=cfg.root)
+        print(f"{score:.1f}")
+        if minimum is not None and score < float(minimum):
+            print(f"mutate: {score:.1f}% is below the {float(minimum):g}% floor", file=sys.stderr)
+            return FAILED
+        return 0
+
+    score = summarize(all_mutants, out=io.StringIO(), root=cfg.root)
+    below_min = minimum is not None and score < float(minimum)
+    exit_code = FAILED if below_min else 0
+    if fmt == "agent":
+        print(agent.format_mutate_agent(all_mutants, root=cfg.root))
+    else:
+        killed = sum(1 for m in all_mutants if m.status in DETECTED)
+        timed_out = sum(1 for m in all_mutants if m.status == "TIMEOUT")
+        survived = [m for m in all_mutants if m.status == "SURVIVED"]
+        payload = agent.json_envelope(
+            "mutate",
+            "failed" if below_min else "ok",
+            summary={
+                "score": round(score, 2),
+                "total": len(all_mutants),
+                "killed": killed,
+                "survived": len(survived),
+                "timeout": timed_out,
+                "cached": cached_count,
+            },
+            data={
+                "cached": cached_count,
+                "survived": [
+                    {
+                        "id": m.id,
+                        "file": m.file,
+                        "line": m.line,
+                        "op": m.op,
+                        "original": m.original,
+                        "mutated": m.mutated,
+                        "covering_specs": list(m.covering_specs),
+                    }
+                    for m in survived
+                ],
+            },
+            errors=[f"mutate: {score:.1f}% is below the {float(minimum):g}% floor"] if below_min else [],
+            exit_code=exit_code,
+        )
+        print(agent.json_dumps_compact(payload))
+    return exit_code
 
 
 cmd_mutate = main

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -529,6 +530,17 @@ def cmd_lint_streams(args, root: Path | None = None, cfg: config_mod.Config | No
         out=out,
         err=err,
     ).run()
+
+
+def cmd_lint(args, root: Path | None = None, cfg: config_mod.Config | None = None, *, out=None, err=None) -> int:
+    ns = argparse.Namespace(
+        root=str(root) if root is not None else getattr(args, "root", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        fix=bool(getattr(args, "fix", False)),
+        skip=list(getattr(args, "skip", None) or []),
+        only=getattr(args, "only", None),
+    )
+    return cmd_lint_streams(ns, root=root, cfg=cfg, out=out, err=err)
 
 
 def main(args) -> int:
