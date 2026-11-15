@@ -338,3 +338,43 @@ sert.bench("bench probe", function(b: sert.BenchContext)
 	b:bytes(16)
 	b:iter(function() end)
 end, _benchOpts)
+
+-- Wave 1 & Wave 2: Targeted/Classified Properties & Laws (Metamorphic / Complexity)
+local _propRegOpts: sert.PropOptions = { runs = 10, regressions = { "deadbeef", "cafebabe" } }
+local _propNumRegOpts: sert.PropOptions = { runs = 10, regressions = { 42 } }
+local _propFn: sert.PropFn = function(g: sert.GenContext)
+	local x: number = g:draw(sert.gen.int(1, 20))
+	g:target(x, "value")
+	g:classify(x > 10, "large")
+	g:cover(25, x % 2 == 0, "even")
+end
+sert.prop("targeted property probe", _propFn, _propRegOpts)
+sert.prop("numeric regression probe", _propFn, _propNumRegOpts)
+
+local _metaRel: sert.MetamorphicRelation<number, number> = {
+	transform = function(x: number, _g: sert.GenContext): number return -x end,
+	relate = function(origIn: number, origOut: number, txIn: number, txOut: number)
+		sert.eq(origIn + txIn, 0)
+		sert.eq(origOut, -txOut)
+	end,
+}
+local _metaSpec: sert.MetamorphicSpec<number, number> = {
+	name = "negation law",
+	gen = sert.gen.int(-10, 10),
+	sut = function(x: number): number return x * 2 end,
+	relations = { negate = _metaRel },
+}
+sert.laws.metamorphic("negation metamorphic", _metaSpec, { runs = 5 })
+sert.laws.metamorphic(_metaSpec)
+
+local _bound: sert.ComplexityBound = "O(n log n)"
+local _compSpec: sert.ComplexitySpec<{ number }> = {
+	name = "scan complexity",
+	bound = _bound,
+	sizes = { 8, 16 },
+	gen = function(n: number): { number } return table.create(n, 1) end,
+	sut = function(xs: { number }): number return #xs end,
+	measure = function(xs: { number }): number return #xs end,
+}
+sert.laws.complexity("scan complexity law", _compSpec, { runs = 3 })
+sert.laws.complexity(_compSpec)

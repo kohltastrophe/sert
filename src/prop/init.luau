@@ -1,6 +1,7 @@
 --!strict
 -- Property testing engine (`sert.prop`): tape draws, shrinking, bounded-exhaustive enumeration, assumption tracking, and replay.
 
+local corpus = require("@self/corpus")
 local format = require("./core/format")
 local registry = require("./core/registry")
 local rng = require("./core/rng")
@@ -38,6 +39,9 @@ export type GenContext = {
 	string: (self: GenContext, charset: (string | ((g: GenContext) -> string))?, min: number?, max: number?) -> string,
 	bytes: (self: GenContext, min: number?, max: number?) -> buffer,
 	note: (self: GenContext, fmt: string | (() -> string), ...any) -> (),
+	target: (self: GenContext, score: number, label: string?) -> (),
+	classify: (self: GenContext, cond: boolean, label: string) -> (),
+	cover: (self: GenContext, minPct: number, cond: boolean, label: string) -> (),
 }
 
 export type Gen = GenContext
@@ -48,7 +52,7 @@ export type PropOptions = typeof(table.freeze({} :: {
 	runs: number?,
 	size: number?,
 	seed: number?,
-	regressions: { number }?,
+	regressions: ({ number } | { string } | { number | string })?,
 	exhaustive: registry.ExhaustiveOption?,
 	shrinkBudget: ShrinkBudget?,
 	timeout: number?,
@@ -66,6 +70,7 @@ export type PropResult = {
 	message: string?,
 	original: string?,
 	seed: number?,
+	replay: string?,
 	tape: { number }?,
 	shrunk: { number }?,
 	notes: { string }?,
@@ -194,6 +199,7 @@ end
 function prop.isGenerator(value: any): boolean return type(value) == "function" and GENERATOR_MARKS[value] == true end
 
 type NoteEntry = string | () -> string
+type CoverEntry = { minPct: number, hit: boolean }
 type GenState = {
 	forced: { number }?,
 	rng: number,
@@ -207,6 +213,9 @@ type GenState = {
 	vacuous: (string | boolean)?,
 	assumedOut: string?,
 	exhausted: boolean?,
+	targets: { [string]: number }?,
+	classified: { [string]: boolean }?,
+	covers: { [string]: CoverEntry }?,
 }
 type GenImpl = GenContext & { _s: GenState }
 
@@ -536,6 +545,68 @@ function GenMethods.bytes(self: GenImpl, min: number?, max: number?): buffer
 	return b
 end
 
+function GenMethods.target(self: GenImpl, score: number, label: string?)
+	if type(score) ~= "number" or score ~= score then return end
+	if label ~= nil and type(label) ~= "string" then
+		error(`g:target: expected string label or nil, got {util.typeof(label)}`, util.outside())
+	end
+	local key = if label ~= nil then label else "_default"
+	local state = self._s
+	local targets = state.targets
+	local tMap: { [string]: number }
+	if targets == nil then
+		tMap = {}
+		state.targets = tMap
+	else
+		tMap = targets
+	end
+	local prev = tMap[key]
+	if prev == nil or score > prev then tMap[key] = score end
+end
+
+function GenMethods.classify(self: GenImpl, cond: boolean, label: string)
+	if type(label) ~= "string" or #label == 0 then
+		error(`g:classify: expected non-empty string label, got {util.typeof(label)}`, util.outside())
+	end
+	local state = self._s
+	local classified = state.classified
+	local cMap: { [string]: boolean }
+	if classified == nil then
+		cMap = {}
+		state.classified = cMap
+	else
+		cMap = classified
+	end
+	local hit = if cond then true else false
+	cMap[label] = (cMap[label] == true) or hit
+end
+
+function GenMethods.cover(self: GenImpl, minPct: number, cond: boolean, label: string)
+	if type(minPct) ~= "number" or minPct ~= minPct or minPct < 0 or minPct > 100 then
+		error(`g:cover: expected minPct in [0, 100], got {format.repr(minPct)}`, util.outside())
+	end
+	if type(label) ~= "string" or #label == 0 then
+		error(`g:cover: expected non-empty string label, got {util.typeof(label)}`, util.outside())
+	end
+	local state = self._s
+	local covers = state.covers
+	local covMap: { [string]: CoverEntry }
+	if covers == nil then
+		covMap = {}
+		state.covers = covMap
+	else
+		covMap = covers
+	end
+	local hit = if cond then true else false
+	local existing = covMap[label]
+	if existing == nil then
+		covMap[label] = { minPct = minPct, hit = hit }
+	else
+		existing.minPct = math.max(existing.minPct, minPct)
+		existing.hit = existing.hit or hit
+	end
+end
+
 local GenMeta = { __index = GenMethods }
 
 function prop.isGen(value: any): boolean return type(value) == "table" and getmetatable(value) == GenMeta end
@@ -815,7 +886,80 @@ prop.tapeText = tapeText
 
 local function indent(text: string, pad: string): string return (string.gsub(text, "\n([^\n])", "\n" .. pad .. "%1")) end
 
-local function report(name: string, result: PropResult, where: string, replay: string): string
+local Z_99 = 2.3263478740408408
+local Z2_99 = Z_99 * Z_99
+local MAX_TARGET_PER_LABEL = 2
+
+local function sortedStringKeys(map: { [string]: any }): { string }
+	local keys: { string } = {}
+	for k in next, map do
+		table.insert(keys, k)
+	end
+	table.sort(keys)
+	return keys
+end
+
+local function formatClassifyLines(counts: { [string]: number }, total: number, pad: string): { string }
+	if total <= 0 or next(counts) == nil then return {} end
+	local keys = sortedStringKeys(counts)
+	local lines = {}
+	for _, label in keys do
+		local hitCount = counts[label]
+		local pct = hitCount * 100 / total
+		table.insert(lines, `{pad}{label}: {hitCount}/{total} ({string.format("%.1f", pct)}%)`)
+	end
+	return lines
+end
+
+local function wilsonCoverFailure(coverStats: { [string]: { minPct: number, hits: number } }, total: number): string?
+	if total <= 0 or next(coverStats) == nil then return nil end
+	local keys = sortedStringKeys(coverStats)
+	for _, label in keys do
+		local entry = coverStats[label]
+		local minPct = entry.minPct
+		if minPct > 0 then
+			local hits = entry.hits
+			local pHat = hits / total
+			local observedPct = pHat * 100
+			if observedPct < minPct then
+				local p0 = minPct / 100
+				local denom = 1 + Z2_99 / total
+				local center = pHat + Z2_99 / (2 * total)
+				local rad = Z_99 * math.sqrt(math.max(0, pHat * (1 - pHat) / total + Z2_99 / (4 * total * total)))
+				local upper = (center + rad) / denom
+				if upper < p0 or (minPct == 100 and hits < total) then
+					return `coverage check failed for "{label}": observed {hits}/{total} ({string.format(
+						"%.1f",
+						observedPct
+					)}%, 99% upper bound {string.format("%.1f", upper * 100)}%) < required {string.format(
+						"%.1f",
+						minPct
+					)}%`
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function encodeTokenSafe(seed: number, size: number, tape: { number }): string?
+	local ok, token = pcall(corpus.encode, seed, size, tape)
+	if ok and type(token) == "string" then return token end
+	return nil
+end
+
+local function emitRegressionMarker(fullName: string, file: string, seed: number, token: string)
+	if registry.isolateDepth > 0 and registry.output.depth() == 0 then return end
+	local payload = format.json({
+		name = fullName,
+		file = file,
+		seed = seed,
+		token = token,
+	})
+	registry.output.marker(`[sert-x:regression] {payload}`)
+end
+
+local function report(name: string, result: PropResult, where: string, replay: string, classLines: { string }?): string
 	local lines = { `property "{name}" failed: {indent(result.message :: string, "   ")}` }
 	if result.original ~= result.message then
 		table.insert(lines, `   first failure: {indent(result.original :: string, "   ")}`)
@@ -839,7 +983,14 @@ local function report(name: string, result: PropResult, where: string, replay: s
 			table.insert(lines, "      " .. indent(note, "      "))
 		end
 	end
+	if classLines ~= nil and #classLines > 0 then
+		table.insert(lines, "   classification:")
+		for _, line in classLines do
+			table.insert(lines, line)
+		end
+	end
 	table.insert(lines, `   {replay}`)
+	if result.replay ~= nil then table.insert(lines, `   replay = "{result.replay}"`) end
 	return table.concat(lines, "\n")
 end
 
@@ -890,10 +1041,225 @@ local function vacuity(name: string, cases: number, exhaustive: boolean, vacuous
 	}
 end
 
-local function parseReplaySeed(raw: (number | string)?): number?
-	if type(raw) == "number" then return raw end
-	if type(raw) == "string" then return tonumber(raw) end
-	return nil
+local function printClassifyIfVerbose(
+	fullName: string,
+	run: RunOptions,
+	isMutant: boolean,
+	counts: { [string]: number },
+	total: number
+)
+	if isMutant or run.quiet == true or run.silent == true or run.compact == true then return end
+	if total <= 0 or next(counts) == nil then return end
+	local lines = { `property "{fullName}" classification ({total} cases):` }
+	for _, line in formatClassifyLines(counts, total, "   ") do
+		table.insert(lines, line)
+	end
+	registry.output.print(table.concat(lines, "\n"))
+end
+
+type RegressionEntry = {
+	raw: number | string,
+	parsed: corpus.ReplaySpec,
+}
+
+local function appendRegressionItem(
+	propName: string,
+	item: any,
+	outList: { RegressionEntry },
+	seen: { [string]: boolean }
+)
+	if type(item) ~= "number" and type(item) ~= "string" then
+		error(`property "{propName}": invalid regression entry {format.repr(item)}`, util.outside())
+	end
+	local parsed = corpus.parseReplay(item)
+	if parsed == nil then
+		error(`property "{propName}": invalid regression token {format.repr(item)}`, util.outside())
+	end
+	local dedupKey = if parsed.kind == "tape" then `tape:{item}` else `seed:{parsed.seed}`
+	if seen[dedupKey] then return end
+	seen[dedupKey] = true
+	table.insert(outList, { raw = item, parsed = parsed })
+end
+
+local function collectFromBucket(
+	propName: string,
+	bucket: any,
+	outList: { RegressionEntry },
+	seen: { [string]: boolean }
+)
+	if type(bucket) == "table" then
+		for i = 1, #bucket do
+			appendRegressionItem(propName, bucket[i], outList, seen)
+		end
+	elseif type(bucket) == "string" or type(bucket) == "number" then
+		appendRegressionItem(propName, bucket, outList, seen)
+	end
+end
+
+local function collectRegressionsFromMap(
+	propName: string,
+	source: any,
+	fullName: string,
+	shortName: string,
+	filter: string,
+	file: string,
+	outList: { RegressionEntry },
+	seen: { [string]: boolean }
+)
+	if type(source) ~= "table" then return end
+	if source[1] ~= nil then collectFromBucket(propName, source, outList, seen) end
+	collectFromBucket(propName, source[fullName], outList, seen)
+	if shortName ~= fullName then collectFromBucket(propName, source[shortName], outList, seen) end
+	if filter ~= fullName and filter ~= shortName then collectFromBucket(propName, source[filter], outList, seen) end
+	if file ~= "?" and type(source[file]) == "table" and source[file][1] == nil then
+		local fileBucket = source[file]
+		collectFromBucket(propName, fileBucket[fullName], outList, seen)
+		if shortName ~= fullName then collectFromBucket(propName, fileBucket[shortName], outList, seen) end
+		if filter ~= fullName and filter ~= shortName then
+			collectFromBucket(propName, fileBucket[filter], outList, seen)
+		end
+	end
+end
+
+local function trailingSegment(fullName: string): string
+	local tail = string.match(fullName, " > ([^>]+)$")
+	return tail or fullName
+end
+
+type TargetPoolEntry = {
+	score: number,
+	tape: { number },
+	ranges: { number },
+}
+
+local function mutateTape(
+	tape: { number },
+	ranges: { number },
+	nextU: () -> number,
+	altPool: { TargetPoolEntry }?
+): { number }
+	local copy = table.clone(tape)
+	local len = #copy
+	if len == 0 then return copy end
+
+	local numEdits = if len > 1 and (nextU() % 4 == 0) then 2 else 1
+	for _ = 1, numEdits do
+		local idx = 1 + nextU() % len
+		for _ = 1, 4 do
+			if (ranges[idx] or 0) > 0 then break end
+			idx = 1 + nextU() % len
+		end
+		local maxVal = math.max(ranges[idx] or 0, 0)
+		if maxVal > 0 then
+			local cur = copy[idx]
+			local op = nextU() % 10
+			if op < 3 then
+				local step = if maxVal >= 4 and (nextU() % 2 == 0) then 1 + nextU() % math.min(4, maxVal) else 1
+				local sign = if nextU() % 2 == 0 then 1 else -1
+				copy[idx] = math.clamp(cur + sign * step, 0, maxVal)
+			elseif op < 7 then
+				local bits = 1
+				local rem = maxVal
+				while rem >= 2 and bits < 53 do
+					bits += 1
+					rem = rem // 2
+				end
+				local shift = nextU() % bits
+				local step = math.floor(2 ^ shift)
+				local sign = if nextU() % 2 == 0 then 1 else -1
+				copy[idx] = math.clamp(cur + sign * step, 0, maxVal)
+			elseif op == 7 and maxVal <= 0xFFFFFFFF and cur <= 0xFFFFFFFF then
+				local bits = 1
+				local rem = maxVal
+				while rem >= 2 and bits < 32 do
+					bits += 1
+					rem = rem // 2
+				end
+				local bitIdx = nextU() % bits
+				copy[idx] = math.clamp(bit32.bxor(cur, bit32.lshift(1, bitIdx)), 0, maxVal)
+			elseif op == 8 then
+				local edgePick = nextU() % 3
+				copy[idx] = if edgePick == 0 then 0 elseif edgePick == 1 then maxVal else maxVal // 2
+			else
+				if maxVal < U32 - 1 then
+					copy[idx] = nextU() % (maxVal + 1)
+				else
+					local wide = (nextU() % U21) * U32 + nextU() - 1
+					copy[idx] = math.clamp(if maxVal < U53 then wide % (maxVal + 1) else wide, 0, maxVal)
+				end
+			end
+		end
+	end
+
+	if len >= 2 and (nextU() % 10 == 0) then
+		if altPool ~= nil and #altPool > 0 then
+			local partner = altPool[1 + nextU() % #altPool]
+			local pLen = #partner.tape
+			if pLen > 1 then
+				local cut = 1 + nextU() % math.min(len, pLen)
+				for i = cut, pLen do
+					local maxVal = math.max(ranges[i] or partner.ranges[i] or 0, 0)
+					copy[i] = math.clamp(partner.tape[i], 0, maxVal)
+				end
+			end
+		elseif len > 2 then
+			local i = 1 + nextU() % len
+			local j = 1 + nextU() % len
+			if i ~= j then
+				local rI = math.max(ranges[i] or 0, 0)
+				local rJ = math.max(ranges[j] or 0, 0)
+				local aVal, bVal = copy[i], copy[j]
+				copy[i] = math.clamp(bVal, 0, rI)
+				copy[j] = math.clamp(aVal, 0, rJ)
+			end
+		end
+	end
+
+	return copy
+end
+
+local function reportTargetToFuzz(fuzzCtrl: any, label: string, score: number, fullName: string)
+	if type(fuzzCtrl) ~= "table" then return end
+	if type(fuzzCtrl.onTarget) == "function" then pcall(fuzzCtrl.onTarget, label, score, fullName) end
+	if type(fuzzCtrl.reportTarget) == "function" then pcall(fuzzCtrl.reportTarget, score, label, fullName) end
+	if not table.isfrozen(fuzzCtrl) and getmetatable(fuzzCtrl) == nil then
+		if fuzzCtrl.maxScore == nil or score > fuzzCtrl.maxScore then fuzzCtrl.maxScore = score end
+		if fuzzCtrl.targets == nil then fuzzCtrl.targets = {} end
+		if type(fuzzCtrl.targets) == "table" and not table.isfrozen(fuzzCtrl.targets) then
+			local prev = fuzzCtrl.targets[label]
+			if prev == nil or score > prev then fuzzCtrl.targets[label] = score end
+		end
+	end
+end
+
+local function finalizeFailure(
+	fullName: string,
+	filter: string,
+	file: string,
+	command: string,
+	fn: PropFn,
+	caseSeed: number,
+	caseSize: number,
+	exhaustive: boolean,
+	gen: GenImpl,
+	err: any,
+	limits: ShrinkBudget?,
+	isMutant: boolean,
+	whereText: string,
+	classCounts: { [string]: number },
+	classTrials: number
+): PropResult
+	local res = fail(fn, caseSeed, caseSize, exhaustive, gen, err, limits)
+	local tokenSeed = if exhaustive then 0 else caseSeed
+	local token = encodeTokenSafe(tokenSeed, caseSize, res.shrunk :: { number })
+	res.replay = token
+	local replayCmd = if exhaustive
+		then `replay: {command} --filter "{filter}" --exhaustive`
+		else `replay: {command} --filter "{filter}" --replay={token or tostring(caseSeed)}`
+	local classLines = formatClassifyLines(classCounts, classTrials, "      ")
+	res.report = report(fullName, res, whereText, replayCmd, classLines)
+	if not isMutant and token ~= nil then emitRegressionMarker(fullName, file, tokenSeed, token) end
+	return res
 end
 
 local function runProperty(
@@ -902,13 +1268,57 @@ local function runProperty(
 	fn: PropFn,
 	options: PropOptions,
 	runOptions: RunOptions?,
-	capMutant: boolean?
+	capMutant: boolean?,
+	fileOverride: string?,
+	shortNameOverride: string?,
+	fromRegistry: boolean?
 ): PropResult
 	local run: RunOptions = runOptions or {}
 	local command = run.command or "python3 tools/sert.py run"
+	local current = registry.currentRun()
+	local file: string = if fileOverride ~= nil and fileOverride ~= ""
+		then fileOverride
+		elseif options.file ~= nil then registry.normalizeSpecFile(options.file)
+		elseif current ~= nil and current.file ~= "?" then current.file
+		else "?"
+	local shortName: string = shortNameOverride or trailingSegment(name)
 	local isMutant = capMutant == true
 		and (run.mutant ~= nil or run.mutants ~= nil or (registry.isolateDepth == 0 and mutant.get() ~= nil))
 	local shrinkLimits: ShrinkBudget? = if isMutant then MUTANT_SHRINK else options.shrinkBudget
+
+	local classCounts: { [string]: number } = {}
+	local classTrials = 0
+	local coverStats: { [string]: { minPct: number, hits: number } } = {}
+	local coverTrials = 0
+
+	local function recordClassify(gInst: GenImpl)
+		classTrials += 1
+		local classified = gInst._s.classified
+		if classified ~= nil then
+			for label, hit in next, classified do
+				classCounts[label] = (classCounts[label] or 0) + (if hit then 1 else 0)
+			end
+		end
+	end
+
+	local function recordCover(gInst: GenImpl)
+		coverTrials += 1
+		local covers = gInst._s.covers
+		if covers ~= nil then
+			for label, entry in next, covers do
+				local stat = coverStats[label]
+				if stat == nil then
+					stat = { minPct = entry.minPct, hits = 0 }
+					coverStats[label] = stat
+				else
+					stat.minPct = math.max(stat.minPct, entry.minPct)
+				end
+				if entry.hit then
+					stat.hits += 1
+				end
+			end
+		end
+	end
 
 	if run.exhaustive then
 		local bound = options.exhaustive
@@ -920,21 +1330,37 @@ local function runProperty(
 		while true do
 			programs += 1
 			local gen = newGen(0, bound.size, prefix, true)
+			registry.recordAssertion("prop")
 			local ok, err = pcall(fn :: (GenContext) -> ...any, gen)
 			if not ok and isAssumedOut(gen, err) then
 				if why == nil then why = gen._s.assumedOut or "assumption failed" end
 			elseif not ok then
-				local result = fail(fn, 0, bound.size, true, gen, err, shrinkLimits)
-				result.cases = programs
-				result.report = report(
+				recordClassify(gen)
+				local res = finalizeFailure(
 					name,
-					result,
+					filter,
+					file,
+					command,
+					fn,
+					0,
+					bound.size,
+					true,
+					gen,
+					err,
+					shrinkLimits,
+					isMutant,
 					`exhaustive · size {bound.size} · program {programs} · tape {tapeText(gen._s.out)}`,
-					`replay: {command} --filter "{filter}" --exhaustive`
+					classCounts,
+					classTrials
 				)
-				return result
+				res.cases = programs
+				return res
 			else
 				vacuous, why = tally(gen._s.vacuous, vacuous, why)
+				if gen._s.vacuous == nil then
+					recordClassify(gen)
+					recordCover(gen)
+				end
 			end
 			local out, ranges = gen._s.out, gen._s.ranges
 			local last = #out
@@ -942,8 +1368,30 @@ local function runProperty(
 				last -= 1
 			end
 			if last == 0 then
-				return vacuity(name, programs, true, vacuous, why)
-					or { ok = true, cases = programs, exhaustive = true, attempts = 0 }
+				local vac = vacuity(name, programs, true, vacuous, why)
+				if vac ~= nil then return vac end
+				local covFail = wilsonCoverFailure(coverStats, coverTrials)
+				if covFail ~= nil then
+					local covLines = { `property "{name}" failed: {covFail}` }
+					local cLines = formatClassifyLines(classCounts, classTrials, "      ")
+					if #cLines > 0 then
+						table.insert(covLines, "   classification:")
+						for _, line in cLines do
+							table.insert(covLines, line)
+						end
+					end
+					return {
+						ok = false,
+						cases = programs,
+						exhaustive = true,
+						message = covFail,
+						original = covFail,
+						report = table.concat(covLines, "\n"),
+						attempts = 0,
+					}
+				end
+				printClassifyIfVerbose(name, run, isMutant, classCounts, classTrials)
+				return { ok = true, cases = programs, exhaustive = true, attempts = 0 }
 			end
 			prefix = table.move(out, 1, last, 1, {})
 			prefix[last] += 1
@@ -965,21 +1413,44 @@ local function runProperty(
 
 	local base = options.seed or run.seed or DEFAULT_BASE
 	local size = options.size or 40
-	local replaySeed = parseReplaySeed(run.replay)
 
-	if replaySeed ~= nil then
-		local gen = newGen(replaySeed, size, nil, false)
+	if run.replay ~= nil then
+		local replaySpec = corpus.parseReplay(run.replay)
+		if replaySpec == nil then
+			error(`property "{name}": malformed replay token {format.repr(run.replay)}`, util.outside())
+		end
+		local rSeed = replaySpec.seed
+		local rSize = if replaySpec.kind == "tape" then replaySpec.size else size
+		local rTape: { number }? = if replaySpec.kind == "tape" then replaySpec.tape else nil
+		local gen = newGen(rSeed, rSize, rTape, false)
+		registry.recordAssertion("prop")
 		local ok, err = pcall(fn :: (GenContext) -> ...any, gen)
 		if not ok and not isAssumedOut(gen, err) then
-			local result = fail(fn, replaySeed, size, false, gen, err, shrinkLimits)
-			result.cases = 1
-			result.report = report(
+			recordClassify(gen)
+			local replayLimits: ShrinkBudget? = if replaySpec.kind == "tape" then { tries = 0 } else shrinkLimits
+			local res = finalizeFailure(
 				name,
-				result,
-				`seed: base {base} · replay · case seed {replaySeed}`,
-				`replay: {command} --filter "{filter}" --replay={replaySeed}`
+				filter,
+				file,
+				command,
+				fn,
+				rSeed,
+				rSize,
+				false,
+				gen,
+				err,
+				replayLimits,
+				isMutant,
+				`seed: base {base} · replay · case seed {rSeed}`,
+				classCounts,
+				classTrials
 			)
-			return result
+			res.cases = 1
+			return res
+		end
+		if ok and gen._s.vacuous == nil then
+			recordClassify(gen)
+			printClassifyIfVerbose(name, run, isMutant, classCounts, classTrials)
 		end
 		return { ok = true, cases = 1, exhaustive = false, attempts = 0 }
 	end
@@ -987,42 +1458,326 @@ local function runProperty(
 	local targetRuns = run.runs or options.runs or 100
 	if isMutant then targetRuns = math.min(targetRuns, MUTANT_RUNS) end
 
+	local fuzzCtrl: any = rawget(mutant._sharedG, "__SERT_FUZZ")
+	local targetPools: { [string]: { TargetPoolEntry } } = {}
+	local targetLabels: { string } = {}
+	local reportedMax: { [string]: number } = {}
+	local nameHash = fnv1a32(name)
+	local mutRngState = caseSeedOf(nameHash, base, 0x7A96E7)
+	if mutRngState == 0 then mutRngState = 1 end
+
+	local function nextMut(): number
+		mutRngState = xorshift32(mutRngState)
+		return mutRngState
+	end
+
+	local function recordTargetSamples(gInst: GenImpl)
+		local targets = gInst._s.targets
+		if targets == nil then return end
+		for label, score in next, targets do
+			local prevMax = reportedMax[label]
+			if prevMax == nil or score > prevMax then
+				reportedMax[label] = score
+				if not isMutant and type(fuzzCtrl) == "table" then reportTargetToFuzz(fuzzCtrl, label, score, name) end
+			end
+			local pool = targetPools[label]
+			if pool == nil then
+				pool = {}
+				targetPools[label] = pool
+				table.insert(targetLabels, label)
+				table.sort(targetLabels)
+			end
+			if #pool < MAX_TARGET_PER_LABEL or score > pool[#pool].score then
+				local entry: TargetPoolEntry = {
+					score = score,
+					tape = table.clone(gInst._s.out),
+					ranges = table.clone(gInst._s.ranges),
+				}
+				table.insert(pool, entry)
+				table.sort(pool, function(a: TargetPoolEntry, b: TargetPoolEntry) return a.score > b.score end)
+				while #pool > MAX_TARGET_PER_LABEL do
+					table.remove(pool)
+				end
+			end
+		end
+	end
+
+	local regressions: { RegressionEntry } = {}
+	local seenReg: { [string]: boolean } = {}
+	collectRegressionsFromMap(name, run.regressions, name, shortName, filter, file, regressions, seenReg)
+	collectRegressionsFromMap(
+		name,
+		rawget(mutant._sharedG, "__SERT_REGRESSIONS"),
+		name,
+		shortName,
+		filter,
+		file,
+		regressions,
+		seenReg
+	)
+	if options.regressions ~= nil then
+		local optRegs = options.regressions :: { any }
+		for i = 1, #optRegs do
+			appendRegressionItem(name, optRegs[i], regressions, seenReg)
+		end
+	end
+
 	local vacuous, why: string? = true, nil
 	local validCases = 0
 	local discards = 0
 	local maxDiscards = math.max(targetRuns * 10, 100)
 
-	for regIndex, regSeed in (options.regressions or {}) :: { number } do
-		local gen = newGen(regSeed, size, nil, false)
-		local ok, err = pcall(fn :: (GenContext) -> ...any, gen)
-		if not ok and isAssumedOut(gen, err) then
-			discards += 1
-			if why == nil then why = gen._s.assumedOut or "assumption failed" end
-		elseif not ok then
-			local result = fail(fn, regSeed, size, false, gen, err, shrinkLimits)
-			result.cases = validCases + 1
-			result.report = report(
-				name,
-				result,
-				`seed: base {base} · regression {regIndex} · case seed {regSeed}`,
-				`replay: {command} --filter "{filter}" --replay={regSeed}`
+	local allowFuzz = not isMutant
+		and type(fuzzCtrl) == "table"
+		and type(fuzzCtrl.runProperty) == "function"
+		and (
+			not fuzzCtrl._isCliFuzzer
+			or (
+				registry.isolateDepth == 0
+				and registry.output.depth() == 0
+				and (fromRegistry == true or not registry.inline())
 			)
-			return result
-		else
-			validCases += 1
-			vacuous, why = tally(gen._s.vacuous, vacuous, why)
+		)
+
+	if not (allowFuzz and fuzzCtrl._isCliFuzzer == true) then
+		for regIndex, regEntry in regressions do
+			local regSpec = regEntry.parsed
+			local regSeed = regSpec.seed
+			local regSize = if regSpec.kind == "tape" then regSpec.size else size
+			local regTape: { number }? = if regSpec.kind == "tape" then regSpec.tape else nil
+			local gen = newGen(regSeed, regSize, regTape, false)
+			registry.recordAssertion("prop")
+			local ok, err = pcall(fn :: (GenContext) -> ...any, gen)
+			if not ok and isAssumedOut(gen, err) then
+				discards += 1
+				if why == nil then why = gen._s.assumedOut or "assumption failed" end
+			elseif not ok then
+				recordClassify(gen)
+				local res = finalizeFailure(
+					name,
+					filter,
+					file,
+					command,
+					fn,
+					regSeed,
+					regSize,
+					false,
+					gen,
+					err,
+					shrinkLimits,
+					isMutant,
+					`seed: base {base} · regression {regIndex} · case seed {regSeed}`,
+					classCounts,
+					classTrials
+				)
+				res.cases = validCases + 1
+				return res
+			else
+				validCases += 1
+				vacuous, why = tally(gen._s.vacuous, vacuous, why)
+				if gen._s.vacuous == nil then
+					recordClassify(gen)
+					recordCover(gen)
+					recordTargetSamples(gen)
+				end
+			end
 		end
 	end
 
 	local regressionCount = validCases
-	local nameHash = fnv1a32(name)
+
+	if allowFuzz then
+		local fuzzCases = 0
+		local fuzzSeq = 0
+		local lastFailure: any = nil
+
+		local function fuzzTrial(tapeOverride: { number }?, seedOverride: number?, sizeOverride: number?)
+			fuzzSeq += 1
+			local effSeed = if seedOverride ~= nil then seedOverride else caseSeedOf(nameHash, base, fuzzSeq)
+			local effSize = if sizeOverride ~= nil then sizeOverride else size
+			local tGen = newGen(effSeed, effSize, tapeOverride, false)
+			registry.recordAssertion("prop")
+			local tOk, tErr = pcall(fn :: (GenContext) -> ...any, tGen)
+			if not tOk and isAssumedOut(tGen, tErr) then
+				discards += 1
+				if why == nil then why = tGen._s.assumedOut or "assumption failed" end
+				local out: { [string]: any } = {
+					ok = false,
+					assumed = true,
+					vacuous = false,
+					tape = table.clone(tGen._s.out),
+					ranges = table.clone(tGen._s.ranges),
+					seed = effSeed,
+					size = effSize,
+					message = tGen._s.assumedOut or "assumption failed",
+				}
+				return out
+			elseif not tOk then
+				fuzzCases += 1
+				recordClassify(tGen)
+				local info: { [string]: any } = {
+					ok = false,
+					assumed = false,
+					vacuous = false,
+					tape = table.clone(tGen._s.out),
+					ranges = table.clone(tGen._s.ranges),
+					targets = if tGen._s.targets ~= nil then table.clone(tGen._s.targets) else nil,
+					seed = effSeed,
+					size = effSize,
+					message = format.errorText(tErr),
+					_gen = tGen,
+					_err = tErr,
+				}
+				lastFailure = info
+				return info
+			else
+				fuzzCases += 1
+				vacuous, why = tally(tGen._s.vacuous, vacuous, why)
+				if tGen._s.vacuous == nil then
+					recordClassify(tGen)
+					recordCover(tGen)
+					recordTargetSamples(tGen)
+				end
+				local okOut: { [string]: any } = {
+					ok = true,
+					assumed = false,
+					vacuous = tGen._s.vacuous ~= nil,
+					tape = table.clone(tGen._s.out),
+					ranges = table.clone(tGen._s.ranges),
+					targets = if tGen._s.targets ~= nil then table.clone(tGen._s.targets) else nil,
+					seed = effSeed,
+					size = effSize,
+				}
+				return okOut
+			end
+		end
+
+		local function fuzzShrink(
+			failInfo: any?,
+			seedOverride: number?,
+			sizeOverride: number?,
+			limitsOverride: ShrinkBudget?
+		): PropResult
+			local targetFail = if type(failInfo) == "table" and failInfo._gen ~= nil then failInfo else lastFailure
+			if targetFail == nil then
+				error(`property "{name}": shrinkFn called with no failing trial`, util.outside())
+			end
+			local sSeed = seedOverride or targetFail.seed
+			local sSize = sizeOverride or targetFail.size
+			local res = finalizeFailure(
+				name,
+				filter,
+				file,
+				command,
+				fn,
+				sSeed,
+				sSize,
+				false,
+				targetFail._gen,
+				targetFail._err,
+				limitsOverride or shrinkLimits,
+				isMutant,
+				`seed: base {base} · fuzz · case seed {sSeed}`,
+				classCounts,
+				classTrials
+			)
+			res.cases = regressionCount + fuzzCases
+			lastFailure = nil
+			return res
+		end
+
+		local runFuzz: (any) -> any = fuzzCtrl.runProperty
+		local ctrlRes = runFuzz({
+			fn = fn,
+			name = name,
+			filter = filter,
+			options = options,
+			runOptions = run,
+			trial = fuzzTrial,
+			shrinkFn = fuzzShrink,
+			meta = {
+				name = name,
+				shortName = shortName,
+				filter = filter,
+				file = file,
+				baseSeed = base,
+				size = size,
+				runs = targetRuns,
+				remainingRuns = math.max(0, targetRuns - regressionCount),
+				maxDiscards = maxDiscards,
+				regressionCount = regressionCount,
+			},
+		})
+
+		if type(ctrlRes) == "table" then
+			if ctrlRes._gen ~= nil and ctrlRes.ok == false and ctrlRes.assumed ~= true then
+				return fuzzShrink(ctrlRes)
+			end
+			if type(ctrlRes.ok) == "boolean" then
+				if ctrlRes.ok == false then
+					if ctrlRes.report == nil and lastFailure ~= nil then return fuzzShrink(lastFailure) end
+					return ctrlRes :: PropResult
+				end
+			end
+		elseif lastFailure ~= nil then
+			return fuzzShrink(lastFailure)
+		end
+
+		local fuzzTotal = regressionCount + fuzzCases
+		local fuzzVac = vacuity(name, fuzzTotal, false, vacuous, why)
+		if fuzzVac ~= nil then return fuzzVac end
+		local fuzzCov = wilsonCoverFailure(coverStats, coverTrials)
+		if fuzzCov ~= nil then
+			local covLines = { `property "{name}" failed: {fuzzCov}` }
+			local cLines = formatClassifyLines(classCounts, classTrials, "      ")
+			if #cLines > 0 then
+				table.insert(covLines, "   classification:")
+				for _, line in cLines do
+					table.insert(covLines, line)
+				end
+			end
+			return {
+				ok = false,
+				cases = fuzzTotal,
+				exhaustive = false,
+				message = fuzzCov,
+				original = fuzzCov,
+				report = table.concat(covLines, "\n"),
+				attempts = 0,
+			}
+		end
+		printClassifyIfVerbose(name, run, isMutant, classCounts, classTrials)
+		return { ok = true, cases = fuzzTotal, exhaustive = false, attempts = 0 }
+	end
+
 	local runIndex = 0
 	local validGenerated = 0
+	local mutatePhase = 0
 
 	while validGenerated < targetRuns do
 		runIndex += 1
 		local caseSeed = caseSeedOf(nameHash, base, runIndex)
-		local gen = newGen(caseSeed, size, nil, false)
+		local forcedTape: { number }? = nil
+		if #targetLabels > 0 then
+			local useTarget = (mutatePhase % 10 == 2 or mutatePhase % 10 == 5 or mutatePhase % 10 == 8)
+			mutatePhase += 1
+			if useTarget then
+				local lbl = targetLabels[1 + nextMut() % #targetLabels]
+				local pool = targetPools[lbl]
+				if pool ~= nil and #pool > 0 then
+					local pickIdx = if #pool > 1 and (nextMut() % 4 == 0) then 2 else 1
+					local parent = pool[pickIdx]
+					if #parent.tape > 0 then
+						local altPool = if #targetLabels > 1
+							then targetPools[targetLabels[1 + nextMut() % #targetLabels]]
+							else pool
+						forcedTape = mutateTape(parent.tape, parent.ranges, nextMut, altPool)
+					end
+				end
+			end
+		end
+		local gen = newGen(caseSeed, size, forcedTape, false)
+		registry.recordAssertion("prop")
 		local ok, err = pcall(fn :: (GenContext) -> ...any, gen)
 		if not ok and isAssumedOut(gen, err) then
 			discards += 1
@@ -1042,24 +1797,62 @@ local function runProperty(
 				}
 			end
 		elseif not ok then
-			local result = fail(fn, caseSeed, size, false, gen, err, shrinkLimits)
-			result.cases = regressionCount + validGenerated + 1
-			result.report = report(
+			recordClassify(gen)
+			local res = finalizeFailure(
 				name,
-				result,
+				filter,
+				file,
+				command,
+				fn,
+				caseSeed,
+				size,
+				false,
+				gen,
+				err,
+				shrinkLimits,
+				isMutant,
 				`seed: base {base} · run {runIndex} of {targetRuns} · case seed {caseSeed}`,
-				`replay: {command} --filter "{filter}" --replay={caseSeed}`
+				classCounts,
+				classTrials
 			)
-			return result
+			res.cases = regressionCount + validGenerated + 1
+			return res
 		else
 			validGenerated += 1
 			vacuous, why = tally(gen._s.vacuous, vacuous, why)
+			if gen._s.vacuous == nil then
+				recordClassify(gen)
+				recordCover(gen)
+				recordTargetSamples(gen)
+			end
 		end
 	end
 
 	local totalCases = regressionCount + validGenerated
-	return vacuity(name, totalCases, false, vacuous, why)
-		or { ok = true, cases = totalCases, exhaustive = false, attempts = 0 }
+	local vacResult = vacuity(name, totalCases, false, vacuous, why)
+	if vacResult ~= nil then return vacResult end
+	local covFail = wilsonCoverFailure(coverStats, coverTrials)
+	if covFail ~= nil then
+		local covLines = { `property "{name}" failed: {covFail}` }
+		local cLines = formatClassifyLines(classCounts, classTrials, "      ")
+		if #cLines > 0 then
+			table.insert(covLines, "   classification:")
+			for _, line in cLines do
+				table.insert(covLines, line)
+			end
+		end
+		return {
+			ok = false,
+			cases = totalCases,
+			exhaustive = false,
+			message = covFail,
+			original = covFail,
+			report = table.concat(covLines, "\n"),
+			attempts = 0,
+		}
+	end
+	printClassifyIfVerbose(name, run, isMutant, classCounts, classTrials)
+	return { ok = true, cases = totalCases, exhaustive = false, attempts = 0 }
 end
 
 function prop.run(
@@ -1120,7 +1913,7 @@ local function definePropEntry(
 			cloned.replay = seeded
 			runOpts = cloned
 		end
-		local result = prop.run(fullName, fn, options, runOpts, current.last, current.name)
+		local result = runProperty(fullName, current.name, fn, options or {}, runOpts, current.last, current.file, name)
 		if not result.ok then
 			if result.seed ~= nil then registry.recordInlineSeed(current.name, result.seed) end
 			error(result.report or result.message or "property failed", 0)
@@ -1144,17 +1937,39 @@ local function definePropEntry(
 	end
 
 	local propFn = fn :: PropFn
+	local shortName = name
 	local attachment: registry.PropAttachment
+	local registeredEntry: registry.Test
 	attachment = {
 		name = name,
 		exhaustive = if options ~= nil then options.exhaustive else nil,
 		defaultSeed = if options ~= nil and options.seed ~= nil then options.seed else DEFAULT_BASE,
 		exec = function(runOptions: RunOptions, capMutant: boolean): registry.PropExecResult
-			return prop.run(attachment.name, propFn, options, runOptions, capMutant, attachment.name)
+			return runProperty(
+				attachment.name,
+				attachment.name,
+				propFn,
+				options or {},
+				runOptions,
+				capMutant,
+				registeredEntry.file,
+				shortName,
+				true
+			)
 		end,
 	}
-	registry.registerEntry(name, function()
-		local res = prop.run(attachment.name, propFn, options, registry.currentOptions(), false, attachment.name)
+	registeredEntry = registry.registerEntry(name, function()
+		local res = runProperty(
+			attachment.name,
+			attachment.name,
+			propFn,
+			options or {},
+			registry.currentOptions(),
+			false,
+			registeredEntry.file,
+			shortName,
+			true
+		)
 		if not res.ok then error(res.report or res.message or "property failed", 0) end
 	end, "run", target, focused, testOpts, attachment)
 end

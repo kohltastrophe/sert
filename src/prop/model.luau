@@ -41,7 +41,7 @@ export type Options = typeof(table.freeze({} :: {
 	runs: number?,
 	size: number?,
 	seed: number?,
-	regressions: { number }?,
+	regressions: ({ number } | { string } | { number | string })?,
 	exhaustive: registry.ExhaustiveOption?,
 	shrinkBudget: prop.ShrinkBudget?,
 	timeout: number?,
@@ -404,6 +404,7 @@ function model.property<State, Sut>(rawSpec: Spec<State, Sut>, options: Options?
 	end
 
 	return function(g: GenContext)
+		registry.recordAssertion("model")
 		local state, sut = startSpec(spec, hostWorld)
 		local ok, err = pcall(function()
 			model.checkInvariants(spec, invKeys, state, sut, hostWorld)
@@ -448,6 +449,7 @@ end
 
 --- Replays an explicit `{ { name, arg }, ... }` or `{ { command = name, arg = arg }, ... }` trace against `spec` and returns `(state, sut)`.
 function model.replay<State, Sut>(rawSpec: Spec<State, Sut>, trace: { Step }, world: any?): (State, Sut)
+	registry.recordAssertion("model")
 	local spec: Spec<State, Sut> = validateSpec(rawSpec, "sert.model.replay", true)
 	if type(trace) ~= "table" then
 		error(`sert.model.replay: expected a trace table, got {util.typeof(trace)}`, util.outside())
@@ -501,6 +503,69 @@ local function resolveModelArgs(
 	error(`{where}: expected a name string or spec table, got {util.typeof(nameOrSpec)}`, util.outside())
 end
 
+local function registerModelProp(
+	name: string,
+	propFn: (g: GenContext) -> (),
+	propOpts: prop.PropOptions,
+	replayOpt: (number | string)?,
+	fixedFocus: boolean,
+	target: registry.Target?
+)
+	if replayOpt == nil then
+		if fixedFocus then
+			prop.focus(name, propFn, propOpts)
+		else
+			prop(name, propFn, propOpts)
+		end
+		return
+	end
+	if registry.inline() then
+		local current = registry.currentRun() :: registry.Current
+		local curOpts = registry.currentOptions()
+		local cloned: registry.RunOptions = if curOpts ~= nil then table.clone(curOpts) else {}
+		if cloned.replay == nil then cloned.replay = replayOpt end
+		local optsCopy: any = table.clone(propOpts)
+		if optsCopy.file == nil and current.file ~= "?" then optsCopy.file = current.file end
+		local res = prop.run(`{current.name} > {name}`, propFn, optsCopy, cloned, current.last, current.name)
+		if not res.ok then
+			if res.seed ~= nil then registry.recordInlineSeed(current.name, res.seed) end
+			error(res.report or res.message or "model check failed", 0)
+		end
+		return
+	end
+	local testOpts: registry.TestOptions = {
+		timeout = propOpts.timeout,
+		skip = propOpts.skip,
+		focus = propOpts.focus,
+		file = propOpts.file,
+		target = target or propOpts.target,
+	}
+	local focused = fixedFocus or (propOpts.focus == true)
+	local attachment: registry.PropAttachment
+	local regEntry: registry.Test
+	attachment = {
+		name = name,
+		exhaustive = propOpts.exhaustive,
+		defaultSeed = if propOpts.seed ~= nil then propOpts.seed else prop.DEFAULT_BASE,
+		exec = function(runOptions: registry.RunOptions, capMutant: boolean): registry.PropExecResult
+			local cloned = table.clone(runOptions)
+			if cloned.replay == nil then cloned.replay = replayOpt end
+			local optsCopy: any = table.clone(propOpts)
+			if optsCopy.file == nil then optsCopy.file = regEntry.file end
+			return prop.run(attachment.name, propFn, optsCopy, cloned, capMutant, attachment.name)
+		end,
+	}
+	regEntry = registry.registerEntry(name, function()
+		local curOpts = registry.currentOptions()
+		local cloned: registry.RunOptions = if curOpts ~= nil then table.clone(curOpts) else {}
+		if cloned.replay == nil then cloned.replay = replayOpt end
+		local optsCopy: any = table.clone(propOpts)
+		if optsCopy.file == nil then optsCopy.file = regEntry.file end
+		local res = prop.run(attachment.name, propFn, optsCopy, cloned, false, attachment.name)
+		if not res.ok then error(res.report or res.message or "model check failed", 0) end
+	end, "run", target or propOpts.target, focused, testOpts, attachment)
+end
+
 local function buildModelTarget(
 	apiPrefix: string,
 	target: registry.Target?,
@@ -514,7 +579,11 @@ local function buildModelTarget(
 		if target ~= nil and propOpts.target == nil then propOpts.target = target end
 		if fixedSkip then propOpts.skip = true end
 		if fixedFocus then propOpts.focus = true end
-		prop(name, propFn, propOpts)
+		if fixedSkip then
+			prop.skip(name, nil, propOpts)
+		else
+			registerModelProp(name, propFn, propOpts, if opts ~= nil then opts.replay else nil, fixedFocus, target)
+		end
 	end
 
 	local ns: { [string]: any } = {}
@@ -536,7 +605,7 @@ local function buildModelTarget(
 			local propOpts = model.propOptions(opts)
 			if target ~= nil and propOpts.target == nil then propOpts.target = target end
 			propOpts.focus = true
-			prop.focus(name, propFn, propOpts)
+			registerModelProp(name, propFn, propOpts, if opts ~= nil then opts.replay else nil, true, target)
 		end
 	end
 
@@ -560,7 +629,7 @@ setmetatable(model, {
 		local name, spec, opts = resolveModelArgs("sert.model", nameOrSpec, specOrOpts, maybeOpts)
 		local propFn = model.property(spec, opts)
 		local propOpts = model.propOptions(opts)
-		prop(name, propFn, propOpts)
+		registerModelProp(name, propFn, propOpts, if opts ~= nil then opts.replay else nil, false, nil)
 	end,
 })
 

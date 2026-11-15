@@ -64,17 +64,24 @@ export type GenContext = prop.GenContext
 export type Gen = prop.Gen
 export type Generator<T> = gen.Generator<T>
 export type FloatOptions = gen.FloatOptions
+export type PropFn = prop.PropFn
 export type PropOptions = prop.PropOptions
 export type PropResult = prop.PropResult
 
 export type ModelCommand<State = any, Sut = any, Arg = any, Res = any> = model.Command<State, Sut, Arg, Res>
 export type ModelSpec<State = any, Sut = any> = model.Spec<State, Sut>
 export type ModelOptions = model.Options
+export type ModelStep = model.Step
 
+export type Equals<T> = laws.Equals<T>
 export type CodecSpec<T = any, E = any> = laws.CodecSpec<T, E>
 export type OrderSpec<T = any> = laws.OrderSpec<T>
 export type AlgebraSpec<T = any> = laws.AlgebraSpec<T>
 export type DifferentialSpec<A = any, B = any> = laws.DifferentialSpec<A, B>
+export type MetamorphicRelation<A = any, B = any> = laws.MetamorphicRelation<A, B>
+export type MetamorphicSpec<A = any, B = any> = laws.MetamorphicSpec<A, B>
+export type ComplexityBound = laws.ComplexityBound
+export type ComplexitySpec<Input = any> = laws.ComplexitySpec<Input>
 
 export type Env = env.Env
 export type EnvNamespace = env.EnvNamespace

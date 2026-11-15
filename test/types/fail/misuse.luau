@@ -96,6 +96,25 @@ sert.bench("b", function() end, { iterations = "ten" }) -- expect-error
 -- Wave 1 & Wave 2: TestOptions, RunOptions, PropOptions & GenContext target/cover/classify
 sert.test("bad smoke", function() end, { smoke = "yes" }) -- expect-error
 sert.test("bad tags", function() end, { tags = { 123 } }) -- expect-error
+sert.prop("bad reg", function(_g: sert.GenContext) end, { regressions = 123 }) -- expect-error
+sert.prop("bad target", function(g: sert.GenContext)
+	g:target("score") -- expect-error
+	g:target(1, 2) -- expect-error
+	g:cover("50%", true, "even") -- expect-error
+	g:cover(50, true, 123) -- expect-error
+	g:classify(true, 123) -- expect-error
+end)
 sert.run({ updateSnapshots = "yes" }) -- expect-error
 sert.run({ bench = "yes" }) -- expect-error
 sert.run({ regressions = 123 }) -- expect-error
+
+-- Wave 1 & Wave 2: Laws (Metamorphic & Complexity)
+local intGen = gen.int(1, 2)
+local idFn = function(x: number): number return x end
+local lenFn = function(n: number): number return n end
+sert.laws.metamorphic(123) -- expect-error
+sert.laws.complexity(123) -- expect-error
+local _badMeta: sert.MetamorphicSpec<number, number> = { gen = intGen, sut = 123, relations = {} } -- expect-error
+local _badMetaRel: sert.MetamorphicSpec<number, number> = { gen = intGen, sut = idFn, relations = "bad" } -- expect-error
+local _badComp: sert.ComplexitySpec<number> = { bound = "O(2^n)", gen = lenFn } -- expect-error
+local _badCompSizes: sert.ComplexitySpec<number> = { bound = "O(n)", sizes = { "big" }, gen = lenFn } -- expect-error

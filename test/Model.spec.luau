@@ -128,28 +128,32 @@ sert.describe("sert.model unified Spec<State, Sut>", function()
 			local teardowns = { 0 }
 			local buggy = makeQueueSpec(3, teardowns)
 
-			local res = sert.model.check(buggy, {
-				runs = 60,
-				length = 25,
-				seed = 4242,
-				raise = false,
-			})
+			local res: any
+			local replayRes: any
+			sert.capture(function()
+				res = sert.model.check(buggy, {
+					runs = 60,
+					length = 25,
+					seed = 4242,
+					raise = false,
+				})
 
-			sert.eq(res.ok, false)
-			sert.ok(res.seed ~= nil)
-			sert.ok(res.notes ~= nil)
-			-- Minimal bug trigger requires exactly 3 pushes (with the 3rd push == 10)!
-			local traceNotes = res.notes :: { string }
-			sert.eq(#traceNotes, 3)
-			sert.contains(traceNotes[3], '"push", 10')
-			sert.gt(teardowns[1], 0)
+				sert.eq(res.ok, false)
+				sert.ok(res.seed ~= nil)
+				sert.ok(res.notes ~= nil)
+				-- Minimal bug trigger requires exactly 3 pushes (with the 3rd push == 10)!
+				local traceNotes = res.notes :: { string }
+				sert.eq(#traceNotes, 3)
+				sert.contains(traceNotes[3], '"push", 10')
+				sert.gt(teardowns[1], 0)
 
-			local replayRes = sert.model.check(buggy, {
-				length = 25,
-				seed = 4242,
-				replay = res.seed,
-				raise = false,
-			})
+				replayRes = sert.model.check(buggy, {
+					length = 25,
+					seed = 4242,
+					replay = res.seed,
+					raise = false,
+				})
+			end)
 			sert.eq(replayRes.ok, false)
 			sert.eq(replayRes.notes, res.notes)
 
@@ -255,5 +259,67 @@ sert.describe("sert.model unified Spec<State, Sut>", function()
 			},
 		}, { runs = 5, length = 4 })
 		sert.eq(arrRes.ok, true)
+	end)
+
+	sert.test("propagates v1 replay tokens, v1 regressions, and records 'model' assertions", function()
+		local buggy = makeQueueSpec(3)
+		local firstFail: any
+		sert.capture(
+			function()
+				firstFail = sert.model.check(buggy, {
+					runs = 60,
+					length = 25,
+					seed = 4242,
+					raise = false,
+				})
+			end
+		)
+		sert.eq(firstFail.ok, false)
+		sert.ok(firstFail.replay ~= nil and string.sub(firstFail.replay :: string, 1, 3) == "v1:")
+		local tok = firstFail.replay :: string
+
+		local v1CheckRes: any
+		local regRes: any
+		sert.capture(function()
+			v1CheckRes = sert.model.check(buggy, {
+				length = 25,
+				replay = tok,
+				raise = false,
+			})
+			regRes = sert.model.check(buggy, {
+				length = 25,
+				runs = 5,
+				regressions = { tok },
+				raise = false,
+			})
+		end)
+		sert.eq(v1CheckRes.ok, false)
+		sert.eq(v1CheckRes.cases, 1)
+		sert.eq(v1CheckRes.notes, firstFail.notes)
+
+		sert.eq(regRes.ok, false)
+		sert.eq(regRes.cases, 1)
+		sert.eq(regRes.notes, firstFail.notes)
+
+		local isoModelRes = runIsolated(
+			function()
+				sert.model("replayed model entry", buggy, {
+					length = 25,
+					replay = tok,
+				})
+			end
+		)
+		sert.eq(isoModelRes.failed, 1)
+		sert.contains(isoModelRes.failures[1], `replay = "{tok}"`)
+
+		local strictRes = runIsolated(function()
+			sert.model("healthy model audit", makeQueueSpec(nil), { runs = 10, length = 8, seed = 5 })
+			sert.test("manual model.replay counts as asserted", function()
+				local spec = makeQueueSpec(nil)
+				sert.model.replay(spec, { { "push", 1 }, { "pop" } })
+			end)
+		end, { strictAssertions = true })
+		sert.eq(strictRes.passed, 2)
+		sert.eq(strictRes.failed, 0)
 	end)
 end)

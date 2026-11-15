@@ -15,6 +15,7 @@ local SPECS: { string } = {
 	"Perf.spec",
 	"Snapshot.spec",
 	"Gen.spec",
+	"Fuzz.spec",
 	"Model.spec",
 	"Laws.spec",
 	"Engine.spec",

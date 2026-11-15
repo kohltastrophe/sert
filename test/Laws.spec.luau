@@ -290,4 +290,225 @@ sert.describe("sert.laws violation detection", function()
 		sert.eq(brokenDiff.failed, 1)
 		sert.contains(brokenDiff.failures[1], "differential law")
 	end)
+
+	sert.test("laws.metamorphic registers sorted relation props and detects violations", function()
+		local regOrder: { string } = {}
+		local sub = registry.newState()
+		registry.isolateDepth += 1
+		local ok, res = pcall(function(): sert.Results
+			return registry.withState(sub, function(): sert.Results
+				laws.metamorphic("sorted list metamorphic", {
+					gen = gen.list(gen.int(-20, 20), 0, 12),
+					sut = function(xs: { number }): { number }
+						local copy = table.clone(xs)
+						table.sort(copy)
+						return copy
+					end,
+					relations = {
+						z_shift = {
+							transform = function(xs: { number }, _g: sert.Gen): { number }
+								local shifted = table.create(#xs, 0)
+								for i, v in xs do
+									shifted[i] = v + 5
+								end
+								return shifted
+							end,
+							relate = function(_x: { number }, y: { number }, _tx: { number }, ty: { number })
+								sert.eq(#ty, #y)
+								for i, v in y do
+									sert.eq(ty[i], v + 5)
+								end
+							end,
+						},
+						a_reverse = {
+							transform = function(xs: { number }, _g: sert.Gen): { number }
+								local rev = table.create(#xs, 0)
+								for i = #xs, 1, -1 do
+									rev[#xs - i + 1] = xs[i]
+								end
+								return rev
+							end,
+							relate = function(_x: { number }, y: { number }, _tx: { number }, ty: { number })
+								sert.eq(ty, y)
+							end,
+						},
+						m_append = {
+							transform = function(xs: { number }, g: sert.Gen): { number }
+								local ext = table.clone(xs)
+								table.insert(ext, g:int(-20, 20))
+								return ext
+							end,
+							relate = function(_x: { number }, y: { number }, _tx: { number }, ty: { number })
+								sert.eq(#ty, #y + 1)
+							end,
+						},
+					},
+				}, { runs = 25, seed = 42 })
+				for _, entry in sub.tests do
+					table.insert(regOrder, entry.name)
+				end
+				return sert.run({ quiet = true, raise = false })
+			end)
+		end)
+		registry.isolateDepth -= 1
+		sert.ok(ok)
+		sert.eq(regOrder, {
+			"sorted list metamorphic > a_reverse",
+			"sorted list metamorphic > m_append",
+			"sorted list metamorphic > z_shift",
+		})
+		sert.eq((res :: sert.Results).passed, 3)
+		sert.eq((res :: sert.Results).failed, 0)
+
+		local brokenMeta = runIsolated(function()
+			laws.metamorphic("broken sign relation", {
+				gen = gen.int(1, 50),
+				sut = function(x: number): number return x + 1 end,
+				relations = {
+					double = {
+						transform = function(x: number): number return x * 2 end,
+						relate = function(_x: number, y: number, _tx: number, ty: number) sert.eq(ty, y * 2) end,
+					},
+				},
+			}, { runs = 15, seed = 7 })
+		end)
+		sert.eq(brokenMeta.failed, 1)
+
+		sert.throws(function()
+			laws.metamorphic("empty", {
+				gen = gen.int(1, 5),
+				sut = function(x: number): number return x end,
+				relations = {} :: any,
+			})
+		end, "must not be empty")
+	end)
+
+	sert.test("laws.complexity enforces O(1)/O(log n)/O(n)/O(n log n) via measure and interleaved timed sut", function()
+		local passRes = runIsolated(function()
+			laws.complexity("const measure", {
+				bound = "O(1)",
+				gen = function(n: number) return n end,
+				measure = function(_n: number) return 7 end,
+			})
+			laws.complexity("log measure", {
+				bound = "O(log n)",
+				gen = function(n: number) return n end,
+				measure = function(n: number) return math.ceil(math.log(n) / math.log(2)) end,
+			})
+			laws.complexity("linear measure", {
+				bound = "O(n)",
+				gen = function(n: number) return n end,
+				measure = function(n: number) return 3 * n + 10 end,
+			})
+			laws.complexity("n log n measure", {
+				bound = "O(n log n)",
+				gen = function(n: number) return n end,
+				measure = function(n: number) return n * math.log(n) end,
+			})
+			laws.complexity("linear timed sut", {
+				bound = "O(n)",
+				sizes = { 64, 256, 1024, 4096 },
+				gen = function(n: number): { number }
+					local arr = table.create(n, 1)
+					return arr
+				end,
+				sut = function(arr: { number }): number
+					local s = 0
+					for i = 1, #arr do
+						s += arr[i]
+					end
+					return s
+				end,
+			})
+		end)
+		sert.eq(passRes.passed, 5)
+		sert.eq(passRes.failed, 0)
+
+		local failRes = runIsolated(function()
+			laws.complexity("quadratic measure fails O(n)", {
+				bound = "O(n)",
+				gen = function(n: number) return n end,
+				measure = function(n: number) return n * n end,
+			})
+			laws.complexity("growth 2x fails O(1) 1.75x slack", {
+				bound = "O(1)",
+				sizes = { 10, 20 },
+				gen = function(n: number) return n end,
+				measure = function(n: number) return n end,
+			})
+			laws.complexity("quadratic timed sut fails O(n)", {
+				bound = "O(n)",
+				sizes = { 64, 256, 1024 },
+				gen = function(n: number): number return n end,
+				sut = function(n: number): number
+					local acc = 0
+					for i = 1, n do
+						for j = 1, n do
+							acc += (i + j) % 7
+						end
+					end
+					return acc
+				end,
+			})
+		end)
+		sert.eq(failRes.failed, 3)
+
+		sert.throws(function()
+			local badAny: any = laws.complexity
+			badAny("invalid bound", {
+				bound = "O(n^2)",
+				gen = function(n: number) return n end,
+				measure = function(n: number) return n end,
+			})
+		end, "expected bound")
+		sert.throws(function()
+			laws.complexity("no sut or measure", {
+				bound = "O(1)",
+				gen = function(n: number) return n end,
+			})
+		end, "either spec.measure or spec.sut")
+	end)
 end)
+
+laws.metamorphic("table filter and sort invariants", {
+	gen = gen.list(gen.int(-100, 100), 0, 20),
+	sut = function(xs: { number }): { number }
+		local copy = table.clone(xs)
+		table.sort(copy)
+		return copy
+	end,
+	relations = {
+		negate_reverses = {
+			transform = function(xs: { number }, _g: sert.Gen): { number }
+				local neg = table.create(#xs, 0)
+				for i, v in xs do
+					neg[i] = -v
+				end
+				return neg
+			end,
+			relate = function(_x: { number }, y: { number }, _tx: { number }, ty: { number })
+				sert.eq(#ty, #y)
+				for i = 1, #y do
+					local rev = y[#y - i + 1]
+					sert.eq(ty[i], if rev == 0 then 0 else -rev)
+				end
+			end,
+		},
+		permutation_invariant = {
+			transform = function(xs: { number }, _g: sert.Gen): { number }
+				local rev = table.create(#xs, 0)
+				for i = #xs, 1, -1 do
+					rev[#xs - i + 1] = xs[i]
+				end
+				return rev
+			end,
+			relate = function(_x: { number }, y: { number }, _tx: { number }, ty: { number }) sert.eq(ty, y) end,
+		},
+	},
+}, { runs = 30 })
+
+laws.complexity("binary search O(log n) model", {
+	bound = "O(log n)",
+	gen = function(n: number): number return n end,
+	measure = function(n: number): number return math.floor(math.log(n) / math.log(2)) + 1 end,
+})
