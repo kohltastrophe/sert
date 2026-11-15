@@ -4,9 +4,12 @@
 
 local registry = require("./core/registry")
 local util = require("./core/util")
+local Audio = require("./engine/audio")
 local Datatypes = require("./engine/datatypes")
 local Generated = require("./engine/generated")
+local InputActions = require("./engine/input_actions")
 local InstanceDouble = require("./engine/instance")
+local Parallel = require("./engine/parallel")
 local Scheduler = require("./engine/scheduler")
 local ServiceRegistry = require("./engine/services")
 local Signal = require("./engine/signal")
@@ -75,6 +78,7 @@ local function buildInput(env: any, ctx: any): any
 	function driver.press(_self: any, keyCode: any)
 		if isMouseButton(keyCode) then
 			beginButton(keyCode, false)
+			InputActions.evaluate(env)
 			return
 		end
 		for _, held in state.keys do
@@ -85,6 +89,7 @@ local function buildInput(env: any, ctx: any): any
 		table.insert(state.keys, io)
 		setLastType(Enum.UserInputType.Keyboard)
 		uis.InputBegan:Fire(io, wasProcessed)
+		InputActions.evaluate(env)
 		local box = env._focusedBox
 		if box ~= nil and (keyCode == Enum.KeyCode.Return or keyCode == Enum.KeyCode.KeypadEnter) then
 			box:ReleaseFocus(true)
@@ -94,6 +99,7 @@ local function buildInput(env: any, ctx: any): any
 	function driver.release(_self: any, keyCode: any)
 		if isMouseButton(keyCode) then
 			endButton(keyCode, false)
+			InputActions.evaluate(env)
 			return
 		end
 		for i, held in state.keys do
@@ -101,6 +107,7 @@ local function buildInput(env: any, ctx: any): any
 				table.remove(state.keys, i)
 				held._props.UserInputState = Enum.UserInputState.End
 				uis.InputEnded:Fire(held, env._focusedBox ~= nil)
+				InputActions.evaluate(env)
 				return
 			end
 		end
@@ -117,6 +124,7 @@ local function buildInput(env: any, ctx: any): any
 		)
 		setLastType(Enum.UserInputType.MouseMovement)
 		uis.InputChanged:Fire(io, false)
+		InputActions.evaluate(env)
 	end
 
 	local function hitTestGui(gui: any, point: any): boolean
@@ -238,17 +246,28 @@ local function buildInput(env: any, ctx: any): any
 		local suffix = if mouseButton == Enum.UserInputType.MouseButton2 then "2" else "1"
 		local io = beginButton(mouseButton, onGui)
 		local isButton = gui ~= nil and gui:IsA("GuiButton")
-		if isButton then gui[`MouseButton{suffix}Down`]:Fire(x, y) end
+		if isButton then
+			env._heldUiButtons[gui] = true
+			InputActions.evaluate(env)
+			gui[`MouseButton{suffix}Down`]:Fire(x, y)
+		else
+			InputActions.evaluate(env)
+		end
 		endButton(mouseButton, onGui)
 		if isButton then
+			env._heldUiButtons[gui] = nil
+			InputActions.evaluate(env)
 			gui[`MouseButton{suffix}Up`]:Fire(x, y)
 			gui[`MouseButton{suffix}Click`]:Fire()
 			if suffix == "1" then gui.Activated:Fire(io, 1) end
-		elseif gui ~= nil and gui:IsA("TextBox") then
-			if gui.ClearTextOnFocus ~= false and env._focusedBox ~= gui then gui.Text = "" end
-			gui:CaptureFocus()
-		elseif env._focusedBox ~= nil then
-			env._focusedBox:ReleaseFocus(false)
+		else
+			InputActions.evaluate(env)
+			if gui ~= nil and gui:IsA("TextBox") then
+				if gui.ClearTextOnFocus ~= false and env._focusedBox ~= gui then gui.Text = "" end
+				gui:CaptureFocus()
+			elseif env._focusedBox ~= nil then
+				env._focusedBox:ReleaseFocus(false)
+			end
 		end
 	end
 
@@ -564,6 +583,7 @@ export type Env = {
 	CatalogSearchParams: any,
 	RaycastParams: any,
 	OverlapParams: any,
+	SharedTable: any,
 	PhysicalProperties: any,
 	PathWaypoint: any,
 	DateTime: any,
@@ -655,6 +675,7 @@ export type EnvNamespace = {
 	PhysicalProperties: any,
 	PathWaypoint: any,
 	DateTime: any,
+	SharedTable: any,
 }
 
 local DATATYPE_GLOBALS = Datatypes.DATATYPE_GLOBALS
@@ -692,6 +713,7 @@ local ROBLOX_DATATYPES: { [string]: any } = if IS_ROBLOX
 		PhysicalProperties = PhysicalProperties,
 		PathWaypoint = PathWaypoint,
 		DateTime = DateTime,
+		SharedTable = SharedTable,
 	}
 	else {}
 
@@ -1142,6 +1164,8 @@ local function mountCoreServices(
 			end
 			props.Heartbeat:Fire(step)
 			drainIfSched()
+			Audio.advanceAll(env, step)
+			drainIfSched()
 			InstanceDouble.flushLayouts(env)
 			drainIfSched()
 		end
@@ -1181,8 +1205,14 @@ local function buildEnvGlobals(env: any, ctx: any, InstanceLib: any)
 		defer = taskOps.defer,
 		delay = taskOps.delay,
 		cancel = taskOps.cancel,
-		synchronize = function() end,
-		desynchronize = function() end,
+		synchronize = function()
+			local fn: any = rawget(env, "_setDesynchronized")
+			if type(fn) == "function" then (fn :: (boolean) -> ())(false) end
+		end,
+		desynchronize = function()
+			local fn: any = rawget(env, "_setDesynchronized")
+			if type(fn) == "function" then (fn :: (boolean) -> ())(true) end
+		end,
 	})
 	env.task = customTask
 
@@ -1250,6 +1280,7 @@ local function frameBusy(env: any): boolean
 	local ctxAny: any = env._ctx
 	if ctxAny == nil then return false end
 	if #ctxAny.renderSteps > 0 or (ctxAny.activeTweens ~= nil and #ctxAny.activeTweens > 0) then return true end
+	if Audio.hasPlaying(env) then return true end
 	local rs = ctxAny.runService
 	if rs ~= nil then
 		for _, name in
@@ -1740,6 +1771,8 @@ function Env.new(options: Options?): Env
 		elseif client ~= nil and client.teleportData ~= nil then util.copy(client.teleportData)
 		else nil
 
+	local isDesynchronized, setDesynchronized = Parallel.makeThreadTracker()
+
 	local env: any = {
 		world = world,
 		server = server,
@@ -1755,6 +1788,9 @@ function Env.new(options: Options?): Env
 		_layerCollectors = setmetatable({}, { __mode = "k" }),
 		_layerCollectorList = {},
 		datatypes = dt,
+		_heldUiButtons = {},
+		_isDesynchronized = isDesynchronized,
+		_setDesynchronized = setDesynchronized,
 		_loaded = {},
 		_loading = {},
 		_mountedByPath = {},

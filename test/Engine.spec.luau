@@ -747,6 +747,10 @@ describe("Engine extended datatypes, persistence versions, and boundary serializ
 		local globalStore = dsMock:GetGlobalDataStore()
 		globalStore:SetAsync("g", 1)
 		sert.eq((globalStore:GetAsync("g")), 1)
+		sert.gt(DataStore.check({ coins = 10 }), 0)
+		sert.throws(function()
+			DataStore.check(function() end)
+		end)
 
 		local store = dsMock:GetDataStore("Players")
 		local v1 = store:SetAsync("u1", { coins = 10 }, { 101 })
@@ -919,6 +923,220 @@ describe("Engine extended datatypes, persistence versions, and boundary serializ
 			sert.ok(ms:evict() ~= nil)
 		end
 	)
+end)
+
+describe("Wave 2 engine doubles: SharedTable, InputAction, Wire & Audio, Actor", function()
+	test(
+		"SharedTable supports construction, cloning, freezing, increment, update, clear, #, iteration, and globals",
+		function()
+			local Datatypes = require("../src/engine/datatypes")
+			Datatypes.installCallerGlobals()
+			local gTarget: { [string]: any } = {}
+			Datatypes.installGlobals(gTarget)
+			sert.ok(gTarget.SharedTable ~= nil)
+
+			local e = sert.env.new()
+			sert.ok(e.globals.SharedTable ~= nil and e.SharedTable ~= nil)
+			local SharedTable = e.SharedTable
+			local CFrame = e.CFrame
+
+			local empty = SharedTable.new()
+			sert.eq(SharedTable.size(empty), 0)
+			sert.eq(#empty, 0)
+			sert.matches(tostring(empty), "SharedTable%(0%)")
+
+			local arr = SharedTable.new({ "alpha", "beta" })
+			sert.eq(#arr, 2)
+			sert.eq(SharedTable.size(arr), 2)
+			sert.eq(arr[1], "alpha")
+			sert.eq(arr[2], "beta")
+
+			local st = SharedTable.new({
+				cf = CFrame.new(1, 2, 3),
+				nested = { score = 10 },
+				tag = "one",
+			})
+			sert.eq(SharedTable.size(st), 3)
+			sert.eq(st.cf, CFrame.new(1, 2, 3))
+			sert.eq(st.nested.score, 10)
+
+			local keyCount = 0
+			for k, v in st do
+				keyCount += 1
+				sert.ok(st[k] == v)
+			end
+			sert.eq(keyCount, 3)
+
+			-- SharedTable.new(existing) clones deeply; clone(st, false) aliases nested tables; clone(st, true) isolates them
+			local copied = SharedTable.new(st)
+			copied.nested.score = 99
+			sert.eq(st.nested.score, 10)
+
+			local shallow = SharedTable.clone(st, false)
+			shallow.nested.score = 42
+			sert.eq(st.nested.score, 42)
+			local deep = SharedTable.clone(st, true)
+			deep.nested.score = 777
+			sert.eq(st.nested.score, 42)
+
+			-- cloneAndFreeze enforces read-only invariants recursively when deep = true
+			local frozen = SharedTable.cloneAndFreeze(st, true)
+			sert.ok(SharedTable.isFrozen(frozen))
+			sert.ok(SharedTable.isFrozen(frozen.nested))
+			sert.eq(SharedTable.isFrozen(st), false)
+			sert.throws(function() frozen.x = 1 end, "frozen")
+			sert.throws(function() frozen.nested.score = 1 end, "frozen")
+			sert.throws(function() SharedTable.increment(frozen, "count", 1) end, "frozen")
+			sert.throws(function() SharedTable.clear(frozen) end, "frozen")
+
+			-- increment initializes missing keys from 0 and returns previous value
+			sert.eq(SharedTable.increment(st, "hits", 3), 0)
+			sert.eq(st.hits, 3)
+			sert.eq(SharedTable.increment(st, "hits", 5), 3)
+			sert.eq(st.hits, 8)
+			sert.throws(function() SharedTable.increment(st, "tag", 2) end, "not a number")
+			sert.throws(function() SharedTable.increment(st, {} :: any, 1) end, "invalid key")
+			sert.throws(function() SharedTable.increment(st, "hits", "bad" :: any) end, "expected number")
+
+			-- update & clear
+			SharedTable.update(st, "label", function(prev: any) return if prev == nil then "ready" else prev .. "!" end)
+			sert.eq(st.label, "ready")
+			SharedTable.update(st, "label", function(prev: any) return tostring(prev) .. ":ok" end)
+			sert.eq(st.label, "ready:ok")
+			SharedTable.clear(st)
+			sert.eq(SharedTable.size(st), 0)
+			sert.throws(function() local _ = SharedTable.new("not_a_table" :: any) end, "expected table")
+		end
+	)
+
+	test("InputAction supports Bool/Direction/ViewportPosition states and Pressed/Released/StateChanged", function()
+		local e = sert.env.new()
+		local ctx = e.Instance.new("InputContext", e.game:GetService("StarterGui"))
+		local events: { string } = {}
+
+		local jump = e.Instance.new("InputAction", ctx)
+		jump.Type = e.Enum.InputActionType.Bool
+		sert.eq(jump:GetState(), false)
+		jump.Pressed:Connect(function() table.insert(events, "pressed") end)
+		jump.Released:Connect(function() table.insert(events, "released") end)
+		jump.StateChanged:Connect(function(state: any) table.insert(events, `state:{tostring(state)}`) end)
+
+		jump:Fire(true)
+		e:flush()
+		sert.eq(jump:GetState(), true)
+		sert.eq(events, { "pressed", "state:true" })
+
+		-- Duplicate true state does not re-fire
+		jump:Fire(true)
+		e:flush()
+		sert.eq(#events, 2)
+
+		jump:Fire(false)
+		e:flush()
+		sert.eq(jump:GetState(), false)
+		sert.eq(events, { "pressed", "state:true", "released", "state:false" })
+
+		-- Axis & ViewportPosition defaults + Fire updates
+		local throttle = e.Instance.new("InputAction", ctx)
+		throttle.Type = e.Enum.InputActionType.Direction1D
+		sert.eq(throttle:GetState(), 0)
+		throttle:Fire(0.5)
+		sert.eq(throttle:GetState(), 0.5)
+
+		local move2 = e.Instance.new("InputAction", ctx)
+		move2.Type = e.Enum.InputActionType.Direction2D
+		sert.eq(move2:GetState(), e.Vector2.zero)
+		move2:Fire(e.Vector2.new(1, -0.5))
+		sert.eq(move2:GetState(), e.Vector2.new(1, -0.5))
+
+		local move3 = e.Instance.new("InputAction", ctx)
+		move3.Type = e.Enum.InputActionType.Direction3D
+		sert.eq(move3:GetState(), e.Vector3.zero)
+		move3:Fire(e.Vector3.new(0, 1, -1))
+		sert.eq(move3:GetState(), e.Vector3.new(0, 1, -1))
+
+		local pointer = e.Instance.new("InputAction", ctx)
+		pointer.Type = e.Enum.InputActionType.ViewportPosition
+		sert.eq(pointer:GetState(), e.Vector2.zero)
+		pointer:Fire(e.Vector2.new(320, 180))
+		sert.eq(pointer:GetState(), e.Vector2.new(320, 180))
+
+		-- Disabling action suppresses StateChanged
+		jump.Enabled = false
+		jump:Fire(true)
+		e:flush()
+		sert.eq(#events, 4)
+	end)
+
+	test("Wire validates pins, auto-maintains Connected, and notifies audio nodes via GetConnectedWires", function()
+		local e = sert.env.new()
+		local player = e.Instance.new("AudioPlayer", e.workspace)
+		local fader = e.Instance.new("AudioFader", e.workspace)
+		local outDev = e.Instance.new("AudioDeviceOutput", e.workspace)
+
+		sert.eq(player:GetInputPins(), {})
+		sert.eq(player:GetOutputPins(), { "Output" })
+		sert.eq(fader:GetInputPins(), { "Input" })
+		sert.eq(fader:GetOutputPins(), { "Output" })
+		sert.eq(outDev:GetInputPins(), { "Input" })
+
+		local log: { string } = {}
+		player.WiringChanged:Connect(
+			function(connected: boolean, pin: string, _wire: any, other: any)
+				table.insert(log, `player:{tostring(connected)}:{pin}:{other.ClassName}`)
+			end
+		)
+		fader.WiringChanged:Connect(
+			function(connected: boolean, pin: string, _wire: any, other: any)
+				table.insert(log, `fader:{tostring(connected)}:{pin}:{other.ClassName}`)
+			end
+		)
+
+		local w1 = e.Instance.new("Wire", e.workspace)
+		w1.SourceInstance = player
+		w1.SourceName = "Output"
+		w1.TargetInstance = fader
+		w1.TargetName = "Input"
+		sert.eq(w1.Connected, true)
+		sert.eq(player:GetConnectedWires("Output"), { w1 })
+		sert.eq(fader:GetConnectedWires("Input"), { w1 })
+		e:flush()
+		sert.eq(log, { "player:true:Output:AudioFader", "fader:true:Input:AudioPlayer" })
+
+		-- Invalid pin name clears Connected and fires WiringChanged(false)
+		w1.TargetName = "NonExistentPin"
+		sert.eq(w1.Connected, false)
+		sert.eq(fader:GetConnectedWires("Input"), {})
+		e:flush()
+		sert.eq(log, {
+			"player:true:Output:AudioFader",
+			"fader:true:Input:AudioPlayer",
+			"player:false:Output:AudioFader",
+			"fader:false:Input:AudioPlayer",
+		})
+	end)
+
+	test("Actor delivers BindToMessage and BindToMessageParallel callbacks and supports Disconnect", function()
+		local e = sert.env.new()
+		local actor = e.Instance.new("Actor", e.workspace)
+		local received: { string } = {}
+
+		local connA = actor:BindToMessage(
+			"chat",
+			function(sender: string, msg: string) table.insert(received, `serial:{sender}:{msg}`) end
+		)
+		actor:BindToMessageParallel("tick", function(n: number) table.insert(received, `par:{n}`) end)
+
+		actor:SendMessage("chat", "Ada", "hello")
+		actor:SendMessage("tick", 7)
+		e:flush()
+		sert.eq(received, { "serial:Ada:hello", "par:7" })
+
+		connA:Disconnect()
+		actor:SendMessage("chat", "Ada", "ignored")
+		e:flush()
+		sert.eq(#received, 2)
+	end)
 end)
 
 describe("Scheduler helpers and Signal.fromWorld", function()

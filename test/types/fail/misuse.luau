@@ -134,3 +134,75 @@ recMisuse:finish("bad-handle", 1) -- expect-error
 sert.sim.explore(123) -- expect-error
 sert.sim.explore({ maxRuns = "ten" }, function() end) -- expect-error
 sert.sim.explore("named", function() end, { stateHash = "bad" }) -- expect-error
+
+-- Wave 1 & Wave 2: Conformance
+sert.roblox.conformance(123, function() end) -- expect-error
+sert.roblox.conformance("c", function(_r: Instance, ctx: sert.ConformanceContext)
+	ctx.step("1") -- expect-error
+end)
+sert.roblox.conformance("c", function() end, { target = "invalidTarget" }) -- expect-error
+sert.roblox.conformance("c", function() end, { container = "ReplicatedStorage" }) -- expect-error
+sert.roblox.conformance("c", function() end, { env = { strict = "yes" } }) -- expect-error
+
+-- Reject unknown key access on exported/sealed option, spec, and result types
+local function _badUnknownKeys(
+	bOpts: sert.BenchOptions,
+	tOpts: sert.TestOptions,
+	pOpts: sert.PropOptions,
+	cOpts: sert.ConformanceOptions,
+	eOpts: sert.SimExploreOptions,
+	mSpec: sert.MetamorphicSpec<number, number>,
+	xSpec: sert.ComplexitySpec<number>,
+	rOpts: sert.RunOptions,
+	res: sert.Results
+)
+	local _1 = bOpts.unknownBenchKey -- expect-error
+	local _2 = tOpts.unknownTestKey -- expect-error
+	local _3 = pOpts.unknownPropKey -- expect-error
+	local _4 = cOpts.unknownConfKey -- expect-error
+	local _5 = eOpts.unknownExploreKey -- expect-error
+	local _6 = mSpec.unknownMetaKey -- expect-error
+	local _7 = xSpec.unknownCompKey -- expect-error
+	local _8 = rOpts.unknownRunKey -- expect-error
+	local _9 = res.skippedByReason.focus -- expect-error
+	local _10 = { _1, _2, _3, _4, _5, _6, _7, _8, _9 }
+end
+
+-- Wave 2: New sert.env / engine APIs
+local function _misuseEnvApis(e: sert.Env)
+	local ws = e.workspace :: Workspace
+	ws:Blockcast("not-cf", Vector3.one, Vector3.one) -- expect-error
+	ws:Spherecast(Vector3.zero, "radius", Vector3.one) -- expect-error
+	ws:Shapecast("not-part", Vector3.one) -- expect-error
+	ws:GetPartBoundsInBox("not-cf", Vector3.one) -- expect-error
+	ws:GetPartsInPart("not-part") -- expect-error
+
+	local phys: PhysicsService = e:getService("PhysicsService")
+	phys:RegisterCollisionGroup(123) -- expect-error
+
+	local inputCtx = e.Instance.new("InputContext") :: InputContext
+	inputCtx.Priority = "high" -- expect-error
+	local inputAct = e.Instance.new("InputAction") :: InputAction
+	inputAct.Type = "InvalidType" -- expect-error
+	local inputBind = e.Instance.new("InputBinding") :: InputBinding
+	inputBind.KeyCode = "NotAKeyCode" -- expect-error
+
+	local st: SharedTable = SharedTable.new({ n = 1 })
+	local stIncrement = SharedTable.increment
+	stIncrement(st, "n", "bad") -- expect-error
+	local reg: SharedTableRegistry = e:getService("SharedTableRegistry")
+	reg:SetSharedTable(123, st) -- expect-error
+	local part = e.Instance.new("Part") :: Part
+	local _badActor: string = part:GetActor() -- expect-error
+
+	local aPlayer = e.Instance.new("AudioPlayer") :: AudioPlayer
+	aPlayer.PlaybackRegion = "bad" -- expect-error
+	local wire = e.Instance.new("Wire") :: Wire
+	wire.SourceInstance = "not-instance" -- expect-error
+
+	local pager = e.Instance.new("UIPageLayout") :: UIPageLayout
+	pager:JumpTo("not-gui") -- expect-error
+	local label = e.Instance.new("TextLabel") :: TextLabel
+	label.RichText = "yes" -- expect-error
+	local _badContentText: number = label.ContentText -- expect-error
+end

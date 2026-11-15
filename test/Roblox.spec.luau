@@ -787,7 +787,7 @@ describe("sert.roblox.Runner: markers, args, edit & cloud", function()
 			end)
 			makeSpecModule(e, customRootB, "Second.spec", function(_m: any)
 				return function(ctx: any)
-					ctx.sert.test("second root pass", function() ctx.sert.ok(true) end)
+					ctx.sert.test("second root pass", function(tc: any) ctx.sert.eq(tc.name, "second root pass") end)
 				end
 			end)
 
@@ -931,7 +931,10 @@ describe("sert.roblox.Runner: runOnce, server & client", function()
 			end)
 			makeSpecModule(e1, sp1, "BootClient.spec", function(_m: any)
 				return function(ctx: any)
-					ctx.sert.test.client("starterPlayer client spec", function() ctx.sert.ok(true) end)
+					ctx.sert.test.client(
+						"starterPlayer client spec",
+						function(tc: any) ctx.sert.eq(tc.name, "starterPlayer client spec") end
+					)
 				end
 			end)
 
@@ -974,7 +977,7 @@ describe("sert.roblox.Runner: runOnce, server & client", function()
 			local sss2 = e2:getService("ServerScriptService")
 			makeSpecModule(e2, sss2, "MatchSrv.spec", function(_m: any)
 				return function(ctx: any)
-					ctx.sert.test.server("lobby ready", function() ctx.sert.ok(true) end)
+					ctx.sert.test.server("lobby ready", function(tc: any) ctx.sert.eq(tc.name, "lobby ready") end)
 				end
 			end)
 
@@ -1078,7 +1081,10 @@ describe("sert.roblox.Runner: runOnce, server & client", function()
 			eOneShot.clock = function(self: any): number return self.now end
 			makeSpecModule(eOneShot, eOneShot:getService("ServerScriptService"), "BootSpec.spec", function(_m: any)
 				return function(ctx: any)
-					ctx.sert.test.server("oneshot server spec", function() ctx.sert.ok(true) end)
+					ctx.sert.test.server(
+						"oneshot server spec",
+						function(tc: any) ctx.sert.eq(tc.name, "oneshot server spec") end
+					)
 				end
 			end)
 			eOneShot.workspace:SetAttribute("sert_Args", '{"runId":"oneshot-1","clients":0}')
@@ -1121,9 +1127,9 @@ describe("sert.roblox.Runner: runOnce, server & client", function()
 			makeSpecModule(eWarm, sssWarm, "WarmReload.spec", function(_m: any)
 				moduleLoads += 1
 				return function(ctx: any)
-					ctx.sert.test.server("warm reload pass", function()
+					ctx.sert.test.server("warm reload pass", function(tc: any)
 						testRuns += 1
-						ctx.sert.ok(true)
+						ctx.sert.eq(tc.name, "warm reload pass")
 					end)
 				end
 			end)
@@ -1179,7 +1185,10 @@ describe("sert.roblox.Runner: runOnce, server & client", function()
 			local spPre = ePreCli:getService("StarterPlayer")
 			makeSpecModule(ePreCli, spPre, "PreBootClient.spec", function(_m: any)
 				return function(ctx: any)
-					ctx.sert.test.client("preboot client spec", function() ctx.sert.ok(true) end)
+					ctx.sert.test.client(
+						"preboot client spec",
+						function(tc: any) ctx.sert.eq(tc.name, "preboot client spec") end
+					)
 				end
 			end)
 			local preReq = ePreCli.Instance.new("StringValue")

@@ -8,6 +8,7 @@ local sert = require("../src")
 
 local describe = sert.describe
 local test = sert.test
+local Flicker = sert.roblox.Flicker
 local Layout = sert.roblox.Layout
 
 local function runIsolated(register: () -> (), opts: sert.RunOptions?): sert.Results
@@ -562,4 +563,183 @@ describe("sert.roblox.Layout: noOverlap, noTextOverflow, minTouchTarget, aligned
 			sert.eq(regRuns, 4)
 		end
 	)
+end)
+
+describe("UIPageLayout, RichText stripping, and Layout/Flicker assertion auditing", function()
+	test("UIPageLayout computes page positions, Circular wrapping, Next/Previous/JumpTo, and Stopped signal", function()
+		local e = sert.env.new({ isClient = true, isServer = false })
+		local sg = e.Instance.new("ScreenGui", e:getService("Players").LocalPlayer.PlayerGui)
+		local carousel = e.Instance.new("Frame", sg)
+		carousel.Size = e.UDim2.fromOffset(200, 100)
+
+		local pageLayout = e.Instance.new("UIPageLayout", carousel)
+		pageLayout.Padding = e.UDim.new(0, 20)
+		pageLayout.Circular = true
+
+		local pA = e.Instance.new("Frame", carousel)
+		pA.Name = "A"
+		pA.LayoutOrder = 1
+		local pB = e.Instance.new("Frame", carousel)
+		pB.Name = "B"
+		pB.LayoutOrder = 2
+		local pC = e.Instance.new("Frame", carousel)
+		pC.Name = "C"
+		pC.LayoutOrder = 3
+
+		local stoppedPages: { any } = {}
+		pageLayout.Stopped:Connect(function(page: any) table.insert(stoppedPages, page) end)
+
+		e:step(1 / 60)
+		sert.eq(pageLayout.CurrentPage, pA)
+		-- Page stride is width (200) + padding (20) = 220; Circular wraps last page C to left (-220)
+		sert.eq(pA.AbsolutePosition, e.Vector2.new(0, 0))
+		sert.eq(pB.AbsolutePosition, e.Vector2.new(220, 0))
+		sert.eq(pC.AbsolutePosition, e.Vector2.new(-220, 0))
+
+		pageLayout:Next()
+		e:step(1 / 60)
+		sert.eq(pageLayout.CurrentPage, pB)
+		sert.eq(pA.AbsolutePosition, e.Vector2.new(-220, 0))
+		sert.eq(pB.AbsolutePosition, e.Vector2.new(0, 0))
+
+		-- Wrap backwards cleanly when Circular == true
+		pageLayout:JumpTo(pA)
+		pageLayout:Previous()
+		e:step(1 / 60)
+		sert.eq(pageLayout.CurrentPage, pC)
+		pageLayout:Next()
+		e:step(1 / 60)
+		sert.eq(pageLayout.CurrentPage, pA)
+
+		-- JumpToIndex (0-based)
+		pageLayout:JumpToIndex(1)
+		e:step(1 / 60)
+		sert.eq(pageLayout.CurrentPage, pB)
+		sert.ok(#stoppedPages >= 4)
+
+		-- Non-circular places pages strictly sequentially and clamps at ends; Vertical shifts along Y
+		pageLayout.Circular = false
+		pageLayout:JumpToIndex(0)
+		pageLayout:Previous()
+		e:step(1 / 60)
+		sert.eq(pageLayout.CurrentPage, pA)
+		sert.eq(pC.AbsolutePosition, e.Vector2.new(440, 0))
+		pageLayout.FillDirection = e.Enum.FillDirection.Vertical
+		e:step(1 / 60)
+		sert.eq(pB.AbsolutePosition, e.Vector2.new(0, 120))
+	end)
+
+	test("RichText = true strips tags, translates <br/> and XML entities for ContentText & TextBounds", function()
+		local e = sert.env.new({ isClient = true, isServer = false })
+		local sg = e.Instance.new("ScreenGui", e:getService("Players").LocalPlayer.PlayerGui)
+
+		local host = e.Instance.new("Frame", sg)
+		host.Size = e.UDim2.fromOffset(300, 120)
+
+		local richLbl = e.Instance.new("TextLabel", host)
+		richLbl.RichText = true
+		richLbl.TextSize = 16
+		richLbl.Size = e.UDim2.fromOffset(220, 60)
+		richLbl.Text = "<b>Hi</b> &lt;1&gt; &amp; &quot;2&quot;<br />&apos;line2&apos;"
+
+		local plainLbl = e.Instance.new("TextLabel", host)
+		plainLbl.RichText = false
+		plainLbl.TextSize = 16
+		plainLbl.Size = e.UDim2.fromOffset(220, 60)
+		plainLbl.Text = "<b>Hi</b>"
+
+		e:step(1 / 60)
+		sert.eq(richLbl.ContentText, "Hi <1> & \"2\"\n'line2'")
+		sert.eq(plainLbl.ContentText, "<b>Hi</b>")
+		-- 2 lines separated by <br /> must be taller than single-line RichText text
+		sert.gt(richLbl.TextBounds.Y, 20)
+		Layout.noTextOverflow(richLbl :: any)
+
+		-- Long hidden markup must NOT falsely trigger noTextOverflow when visible ContentText fits
+		local markupHeavy = e.Instance.new("TextLabel", host)
+		markupHeavy.RichText = true
+		markupHeavy.TextSize = 14
+		markupHeavy.Size = e.UDim2.fromOffset(100, 32)
+		markupHeavy.Text = '<font color="#ff0000" size="14"><b>OK</b></font>'
+		e:step(1 / 60)
+		sert.eq(markupHeavy.ContentText, "OK")
+		Layout.noTextOverflow(markupHeavy :: any)
+	end)
+
+	test("all Layout assertion helpers and Flicker.steady/expect record assertions under sert audit", function()
+		local function withHud(fn: (e: any, sg: any, card: any, a: any, b: any, btn: any, lbl: any) -> ())
+			local e = sert.env.new({ isClient = true, isServer = false })
+			local sg = e.Instance.new("ScreenGui", e:getService("Players").LocalPlayer.PlayerGui)
+			local card = e.Instance.new("Frame", sg)
+			card.Position = e.UDim2.fromOffset(20, 80)
+			card.Size = e.UDim2.fromOffset(280, 140)
+			local a = e.Instance.new("Frame", card)
+			a.Position = e.UDim2.fromOffset(10, 10)
+			a.Size = e.UDim2.fromOffset(100, 48)
+			local b = e.Instance.new("Frame", card)
+			b.Position = e.UDim2.fromOffset(130, 10)
+			b.Size = e.UDim2.fromOffset(100, 48)
+			local btn = e.Instance.new("TextButton", card)
+			btn.Position = e.UDim2.fromOffset(10, 70)
+			btn.Size = e.UDim2.fromOffset(120, 48)
+			btn.Text = "Go"
+			local lbl = e.Instance.new("TextLabel", card)
+			lbl.Position = e.UDim2.fromOffset(140, 70)
+			lbl.Size = e.UDim2.fromOffset(120, 48)
+			lbl.Text = "Ready"
+			e:step(1 / 60)
+			fn(e, sg, card, a, b, btn, lbl)
+		end
+
+		local res = runIsolated(function()
+			test("visible", function()
+				withHud(function(_e, _sg, card) Layout.visible(card :: any) end)
+			end)
+			test("fitsParent", function()
+				withHud(function(_e, _sg, _card, a) Layout.fitsParent(a :: any) end)
+			end)
+			test("within", function()
+				withHud(function(_e, _sg, card, a) Layout.within(a :: any, card :: any) end)
+			end)
+			test("fitsViewport", function()
+				withHud(function(_e, _sg, card) Layout.fitsViewport(card :: any) end)
+			end)
+			test("noOverlap", function()
+				withHud(function(_e, _sg, card) Layout.noOverlap(card :: any) end)
+			end)
+			test("noTextOverflow", function()
+				withHud(function(_e, _sg, _card, _a, _b, _btn, lbl) Layout.noTextOverflow(lbl :: any) end)
+			end)
+			test("minTouchTarget", function()
+				withHud(function(_e, _sg, _card, _a, _b, btn) Layout.minTouchTarget(btn :: any) end)
+			end)
+			test("aligned", function()
+				withHud(function(_e, _sg, _card, a, b) Layout.aligned({ a :: any, b :: any }, "top") end)
+			end)
+			test("audit", function()
+				withHud(function(_e, _sg, card) Layout.audit(card :: any) end)
+			end)
+			test("matrix", function()
+				Layout.matrix(function(container, _p, e)
+					local box = e.Instance.new("Frame", container)
+					box.Size = e.UDim2.fromOffset(80, 48)
+					return box
+				end, { presets = { "Phone" } })
+			end)
+			test("Flicker.steady", function()
+				withHud(function(e, _sg, card)
+					Flicker.steady(card :: any, { frames = 2, step = function() e:step(1 / 60) end })
+				end)
+			end)
+			test("Flicker.expect", function()
+				withHud(function(_e, _sg, card)
+					local rec = Flicker.record(card :: any, { frames = 2, step = function() end })
+					Flicker.expect(rec)
+				end)
+			end)
+		end, { strictAssertions = true })
+
+		sert.eq(res.passed, 12)
+		sert.eq(res.failed, 0)
+	end)
 end)

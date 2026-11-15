@@ -434,7 +434,98 @@ local _exploreOut3: sert.SimExploreOutcome? = sert.sim.explore(
 )
 local _exploreOut4: sert.SimExploreOutcome? = sert.sim.explore(function(w) local _now: number = w:now() end)
 local _pruned: number = if _exploreOut1 ~= nil then _exploreOut1.pruned else 0
+local _envSettleOpts: sert.EnvSettleOptions = { maxFrames = 10, dt = 1 / 60 }
 local _simBfsOpts: sert.SimBfsOptions = { maxStates = 10 }
 local _simBfsRes: sert.SimBfsResult? = nil
 local _simTraceStep: sert.SimTraceStep? = nil
 local _simRemoteErr: sert.SimRemoteError? = nil
+
+-- Wave 1 & Wave 2: Portable Conformance & New sert.env / Engine Doubles
+local _confTarget: sert.ConformanceTarget = "roblox"
+local _confContainer: sert.ContainerKind = "PlayerGui"
+local _confOpts: sert.ConformanceOptions = {
+	target = _confTarget,
+	container = _confContainer,
+	tags = { "conformance" },
+	timeout = 5,
+}
+local _confFn: sert.ConformanceFn = function(root: Instance, ctx: sert.ConformanceContext)
+	local _isRoblox: boolean = ctx.isRoblox
+	local _target: "portable" | sert.ConformanceTarget = ctx.target
+	local _ws: any = ctx.workspace
+	local _shared: any = ctx.SharedTable
+	ctx.step(1 / 60)
+	local _inst: Instance? = root:FindFirstChild("Probe")
+end
+local _confApi: sert.ConformanceApi = sert.roblox.conformance
+_confApi("conformance probe", _confFn, _confOpts)
+sert.roblox.conformance.skip("skipped conformance", _confFn, _confOpts)
+sert.roblox.conformance.focus("focused conformance", _confFn, _confOpts)
+
+local _robloxSide: sert.RobloxSide? = nil
+local _robloxReq: sert.RobloxRequest? = nil
+local _layoutRect: sert.LayoutRect? = nil
+local _presetName: sert.PresetName = "Phone"
+local _auditOpts: sert.AuditOptions = {}
+local _matrixOpts: sert.MatrixOptions = {}
+local _sweepSnap: sert.SweepSnapshot? = nil
+
+local function _probeEnvEngineApis(e: sert.Env)
+	-- Spatial casts & CollisionGroup (PhysicsService)
+	local ws = e.workspace :: Workspace
+	local castParams = e.RaycastParams.new()
+	castParams.CollisionGroup = "Players"
+	local overlapParams = e.OverlapParams.new()
+	local part = e.Instance.new("Part", ws) :: Part
+	part.CollisionGroup = "Players"
+	local _bHit: RaycastResult? =
+		ws:Blockcast(CFrame.new(0, 0, 0), Vector3.new(2, 2, 2), Vector3.new(0, -10, 0), castParams)
+	local _sHit: RaycastResult? = ws:Spherecast(Vector3.new(0, 5, 0), 1, Vector3.new(0, -10, 0), castParams)
+	local _shHit: RaycastResult? = ws:Shapecast(part, Vector3.new(0, -10, 0), castParams)
+	local _boxParts: { BasePart } = ws:GetPartBoundsInBox(CFrame.new(), Vector3.new(4, 4, 4), overlapParams)
+	local _inPart: { BasePart } = ws:GetPartsInPart(part, overlapParams)
+	local phys: PhysicsService = e:getService("PhysicsService")
+	phys:RegisterCollisionGroup("Players")
+	phys:CollisionGroupSetCollidable("Default", "Players", false)
+
+	-- InputContext / InputAction / InputBinding
+	local inputCtx = e.Instance.new("InputContext", e.game:GetService("StarterGui"))
+	local inputAct = e.Instance.new("InputAction", inputCtx)
+	inputAct.Type = e.Enum.InputActionType.Bool
+	local inputBind = e.Instance.new("InputBinding", inputAct)
+	inputBind.KeyCode = e.Enum.KeyCode.Space
+
+	-- SharedTable / SharedTableRegistry / Actor / task.desynchronize & synchronize
+	local reg: SharedTableRegistry = e:getService("SharedTableRegistry")
+	local st: SharedTable = e.SharedTable.new({ score = 0 })
+	reg:SetSharedTable("Stats", st)
+	local _fetched: SharedTable = reg:GetSharedTable("Stats")
+	local _prev: number = e.SharedTable.increment(st, "score", 1)
+	local actor = e.Instance.new("Actor", ws)
+	local _ownedActor: Actor? = part:GetActor()
+	e.task.desynchronize()
+	e.task.synchronize()
+	local _ = actor
+
+	-- Audio Wire / AudioPlayer / AudioFader / AudioAnalyzer / AudioDeviceOutput
+	local aPlayer = e.Instance.new("AudioPlayer", ws)
+	local aFader = e.Instance.new("AudioFader", ws)
+	local aAnalyzer = e.Instance.new("AudioAnalyzer", ws)
+	local aOut = e.Instance.new("AudioDeviceOutput", ws)
+	local wire = e.Instance.new("Wire", ws)
+	wire.SourceInstance = aPlayer
+	wire.TargetInstance = aFader
+	local _wireConnected: boolean = wire.Connected
+	local _audioUnused = { aAnalyzer, aOut }
+
+	-- UIPageLayout / RichText ContentText
+	local sg = e.Instance.new("ScreenGui", e.LocalPlayer.PlayerGui)
+	local pagerHost = e.Instance.new("Frame", sg)
+	local pager = e.Instance.new("UIPageLayout", pagerHost) :: UIPageLayout
+	pager:Next()
+	pager:Previous()
+	local label = e.Instance.new("TextLabel", pagerHost) :: TextLabel
+	label.RichText = true
+	label.Text = "<b>Hi</b>"
+	local _contentText: string = label.ContentText
+end

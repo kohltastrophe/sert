@@ -22,8 +22,10 @@ local SPECS: { string } = {
 	"Env.spec",
 	"Sim.spec",
 	"Linearize.spec",
+	"Conformance.spec",
 	"Roblox.spec",
 	"layout_headless.spec",
+	"roblox/specs/conformance/EngineParity.spec",
 }
 
 local function isZeroReturnRequireError(err: any): boolean

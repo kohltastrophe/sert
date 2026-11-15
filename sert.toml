@@ -1,7 +1,7 @@
 # sert's own configuration: the toolkit tests itself with its own CLI (PYTHONPATH=python python3 -m sert ...).
 
 [test]
-specs = ["test/*.spec.luau"]
+specs = ["test/*.spec.luau", "test/roblox/specs/conformance/*.spec.luau"]
 codegen = false
 
 [coverage]

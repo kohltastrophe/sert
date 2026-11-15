@@ -4,6 +4,7 @@
 local Rng = require("../core/rng")
 local mutantSlot = require("../core/mutant")
 local Generated = require("./generated")
+local Parallel = require("./parallel")
 
 local Datatypes: any = {}
 local nativeType, nativeTypeof = type, typeof
@@ -67,8 +68,10 @@ local DATATYPE_GLOBALS = table.freeze({
 	"OverlapParams",
 	"PhysicalProperties",
 	"PathWaypoint",
+	"SharedTable",
 })
 Datatypes.DATATYPE_GLOBALS = DATATYPE_GLOBALS
+Datatypes.SharedTable = Parallel.SharedTable
 
 local customUtf8 = table.freeze(setmetatable({
 	graphemes = function(str: string, i: number?, j: number?)

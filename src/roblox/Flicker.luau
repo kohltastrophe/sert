@@ -290,6 +290,7 @@ end
 
 --- Asserts that `result` has zero flicker, raising a caller-framed diagnostic without mutating `result`.
 function Flicker.expect(result: Result, label: string?): Result
+	registry.recordAssertion("layout")
 	local judged: Result = if result.ok == nil then Flicker.judge(result) else table.clone(result :: any) :: Result
 	if label ~= nil then judged.label = label end
 	if not judged.ok then error(Flicker.describe(judged, label), util.outside()) end

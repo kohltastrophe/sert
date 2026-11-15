@@ -397,6 +397,7 @@ end
 
 --- Asserts that no two visible sibling `GuiObject` children of `container` overlap beyond `tolerance` pixels.
 function Layout.noOverlap(container: Instance, opts: NoOverlapOptions?)
+	registry.recordAssertion("layout")
 	local tolerance = if opts and opts.tolerance then opts.tolerance else 0.5
 	local recursive = if opts and opts.recursive ~= nil then opts.recursive else false
 	local byName, byInst = buildIgnoreLookup(if opts then opts.ignore else nil)
@@ -463,6 +464,7 @@ end
 --- Asserts that `child` (or every direct visible `GuiObject` child when `child` has children and `margin` is given)
 --- fits inside its parent `GuiBase2d` (checking `CanvasSize` along scrollable axes on `ScrollingFrame`s).
 function Layout.fitsParent(child: GuiObject, margin: Margin?, tolerance: number?)
+	registry.recordAssertion("layout")
 	local eps = tolerance or 0.5
 	local mL, mT, mR, mB = unpackMargin(margin)
 	local parent = child.Parent
@@ -533,6 +535,7 @@ end
 
 --- Asserts that `descendant` lies inside `ancestor` by at least `margin` pixels.
 function Layout.within(descendant: GuiObject, ancestor: GuiBase2d, margin: Margin?, tolerance: number?)
+	registry.recordAssertion("layout")
 	local eps = tolerance or 0.5
 	local mL, mT, mR, mB = unpackMargin(margin)
 	local ap: Vector2 = v2(0, 0)
@@ -586,6 +589,7 @@ end
 
 --- Asserts that every visible non-clipped `GuiObject` under `root` fits inside the usable screen viewport.
 function Layout.fitsViewport(root: Instance, opts: FitsViewportOptions?)
+	registry.recordAssertion("layout")
 	local eps = if opts and opts.tolerance then opts.tolerance else 0.5
 	local vpMin, vpMax = resolveViewportBounds(root, if opts then opts.viewport else nil)
 	local byName, byInst = buildIgnoreLookup(if opts then opts.ignore else nil)
@@ -646,6 +650,7 @@ end
 
 --- Asserts that every visible text element under `root` fits its padded inner bounds (`ContentText` + `UIPadding` + `TextFits`).
 function Layout.noTextOverflow(root: Instance, opts: NoTextOverflowOptions?)
+	registry.recordAssertion("layout")
 	local eps = if opts and opts.tolerance then opts.tolerance else 1.0
 	local byName, byInst = buildIgnoreLookup(if opts then opts.ignore else nil)
 
@@ -687,6 +692,7 @@ end
 
 --- Asserts that every visible interactive button/textbox under `root` meets minimum touch-target dimensions (default 44x44px).
 function Layout.minTouchTarget(root: Instance, opts: MinTouchTargetOptions?)
+	registry.recordAssertion("layout")
 	local rawMin = if opts and opts.minSize then opts.minSize else 44
 	local minW = if type(rawMin) == "number" then rawMin else rawMin.X
 	local minH = if type(rawMin) == "number" then rawMin else rawMin.Y
@@ -723,6 +729,7 @@ end
 
 --- Asserts that `gui` is effectively visible on screen.
 function Layout.visible(gui: GuiObject)
+	registry.recordAssertion("layout")
 	if not geometry.visible(gui) then
 		error(
 			string.format(
@@ -752,6 +759,7 @@ end
 
 --- Asserts that every `GuiObject` in `elements` aligns along `edge` within `tolerance` pixels.
 function Layout.aligned(elements: { GuiObject }, edge: AlignEdge, tolerance: number?)
+	registry.recordAssertion("layout")
 	local eps = tolerance or 1.0
 	if #elements < 2 then return end
 	local ref = edgeCoord(elements[1], edge)
@@ -811,6 +819,7 @@ end
 --- Settles `root` and runs composite layout checks (`fitsViewport`, `UIListLayout`/`UIGridLayout` `noOverlap`,
 --- `noTextOverflow`, and optional `touchTargets`).
 function Layout.audit(root: Instance, opts: AuditOptions?)
+	registry.recordAssertion("layout")
 	local sharedIgnore = if opts then opts.ignore else nil
 
 	local settleOpt = if opts and opts.settle ~= nil then opts.settle else true
@@ -887,6 +896,7 @@ local function runMatrixOnce(
 	mountFn: (container: Instance, preset: ViewportPreset, env: any?) -> any,
 	opts: MatrixOptions
 )
+	registry.recordAssertion("layout")
 	local presets = resolvePresets(opts.presets)
 	local isStudio = typeof(game) == "Instance"
 

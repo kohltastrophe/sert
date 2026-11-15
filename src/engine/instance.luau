@@ -7,8 +7,11 @@
 ]=]
 
 local Util = require("../core/util")
+local Audio = require("./audio")
 local Datatypes = require("./datatypes")
 local Generated = require("./generated")
+local InputActions = require("./input_actions")
+local Parallel = require("./parallel")
 local Serialize = require("./serialize")
 local Signal = require("./signal")
 
@@ -690,6 +693,9 @@ end
 
 local function setParent(inst: any, newParent: any?, allowDestroyedDetach: boolean?)
 	local env = rawget(inst, "_env")
+	if not allowDestroyedDetach then
+		Parallel.assertSerial(env, "Property " .. tostring(inst._props.ClassName) .. ".Parent")
+	end
 	if isLockedService(inst, env) then
 		local cur = parentNameOf(rawget(inst, "_parent"))
 		local target = parentNameOf(newParent)
@@ -852,6 +858,12 @@ local function setParent(inst: any, newParent: any?, allowDestroyedDetach: boole
 		end
 		if not rawget(inst, "_destroying") then relayout(inst) end
 	end
+	local cls = inst._props.ClassName
+	if cls == "Wire" then
+		Audio.syncWire(inst)
+	elseif cls == "InputContext" or cls == "InputAction" or cls == "InputBinding" then
+		if env ~= nil then InputActions.evaluate(env) end
+	end
 	if env ~= nil then
 		local onReparent: ((any, any) -> ())? = env._onReparent
 		if onReparent ~= nil then onReparent(inst, newParent) end
@@ -886,6 +898,7 @@ LAYOUT_KEYS = {
 	VerticalAlignment = true,
 	SortOrder = true,
 	Padding = true,
+	Circular = true,
 	Wraps = true,
 	CellSize = true,
 	CellPadding = true,
@@ -918,6 +931,7 @@ local TEXT_CLASSES: { [string]: boolean } = {
 LAYOUT_MODIFIER_CLASSES = {
 	UIListLayout = true,
 	UIGridLayout = true,
+	UIPageLayout = true,
 	UIPadding = true,
 	UIScale = true,
 	UISizeConstraint = true,
@@ -1132,14 +1146,27 @@ local function measureTextWithFontSize(
 	return math.ceil(maxLineW - 1e-9), totalLines * lineH
 end
 
+local RICH_TEXT_ENTITIES: { [string]: string } = {
+	lt = "<",
+	gt = ">",
+	amp = "&",
+	quot = '"',
+	apos = "'",
+}
+
+local function stripRichText(rawText: string): string
+	local withNewlines = string.gsub(rawText, "<[bB][rR]%s*/?>", "\n")
+	local noTags = string.gsub(withNewlines, "<[^>]+>", "")
+	return (string.gsub(noTags, "&(%a+);", RICH_TEXT_ENTITIES))
+end
+
 local function updateTypography(inst: any, absSize: any)
 	local props = inst._props
 	if not TEXT_CLASSES[props.ClassName] then return end
 	local V2 = vectorOf(inst)
 	local rawText = tostring(props.Text or "")
-	local stripped = string.gsub(rawText, "<[^>]+>", "")
-	setGeometry(inst, "ContentText", stripped)
-	local visibleText = if props.RichText == true then stripped else rawText
+	local visibleText = if props.RichText == true then stripRichText(rawText) else rawText
+	setGeometry(inst, "ContentText", visibleText)
 	if #visibleText == 0 then
 		setGeometry(inst, "TextBounds", V2.new(0, 0))
 		setGeometry(inst, "TextFits", true)
@@ -1317,6 +1344,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 	local children = rawget(node, "_children")
 	local listLayout: any = nil
 	local gridLayout: any = nil
+	local pageLayout: any = nil
 	if children ~= nil then
 		for _, child in children do
 			local cCls = child._props.ClassName
@@ -1324,6 +1352,8 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 				listLayout = child
 			elseif cCls == "UIGridLayout" and gridLayout == nil then
 				gridLayout = child
+			elseif cCls == "UIPageLayout" and pageLayout == nil then
+				pageLayout = child
 			end
 		end
 	end
@@ -1578,6 +1608,84 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 		for _, child in otherChildren do
 			layoutSubtree(child, false)
 		end
+	elseif isGuiBase and pageLayout ~= nil and children ~= nil then
+		local visibleGuiChildren: { any } = {}
+		local otherChildren: { any } = {}
+		for _, child in children do
+			if isClass(child._props.ClassName, "GuiObject") then
+				if child._props.Visible ~= false then
+					table.insert(visibleGuiChildren, child)
+				else
+					table.insert(otherChildren, child)
+				end
+			else
+				table.insert(otherChildren, child)
+			end
+		end
+		local plProps = pageLayout._props
+		local ordered = sortGuiChildren(visibleGuiChildren, plProps.SortOrder)
+		local n = #ordered
+		if n == 0 then
+			setGeometry(pageLayout, "AbsoluteContentSize", V2.new(0, 0))
+		else
+			local fillDir = enumName(plProps.FillDirection, "Horizontal")
+			local isHoriz = fillDir ~= "Vertical"
+			local hAlign = enumName(plProps.HorizontalAlignment, "Left")
+			local vAlign = enumName(plProps.VerticalAlignment, "Top")
+			local padBasis = if isHoriz then contentW else contentH
+			local padPx = udimValue(plProps.Padding, padBasis)
+			local circular = plProps.Circular == true
+
+			local curPage = plProps.CurrentPage
+			if
+				curPage == NONE
+				or curPage == nil
+				or rawget(curPage, "_destroyed")
+				or rawget(curPage, "_parent") ~= node
+			then
+				curPage = ordered[1]
+			end
+			local curIdx = table.find(ordered, curPage) or 1
+			local strideX = if isHoriz then (contentW + padPx) else 0
+			local strideY = if not isHoriz then (contentH + padPx) else 0
+
+			for i, child in ordered do
+				local rel = i - curIdx
+				if circular and n >= 3 then
+					if rel > n * 0.5 then
+						rel -= n
+					elseif rel < -n * 0.5 then
+						rel += n
+					end
+				end
+				local sz = computeChildSize(child, contentW, contentH)
+				local pin = rawget(child, "_absPin")
+				if pin ~= nil and pin.size ~= nil then sz = pin.size end
+				setGeometry(child, "AbsoluteSize", sz)
+
+				if pin == nil or pin.position == nil then
+					local slotX = contentX + rel * strideX
+					local slotY = contentY + rel * strideY
+					local px = if hAlign == "Center"
+						then slotX + (contentW - sz.X) * 0.5
+						elseif hAlign == "Right" then slotX + contentW - sz.X
+						else slotX
+					local py = if vAlign == "Center"
+						then slotY + (contentH - sz.Y) * 0.5
+						elseif vAlign == "Bottom" then slotY + contentH - sz.Y
+						else slotY
+					setGeometry(child, "AbsolutePosition", V2.new(px, py))
+				end
+				layoutSubtree(child, true)
+			end
+			local totalW = if isHoriz then math.max(0, n * contentW + math.max(0, n - 1) * padPx) else contentW
+			local totalH = if not isHoriz then math.max(0, n * contentH + math.max(0, n - 1) * padPx) else contentH
+			setGeometry(pageLayout, "AbsoluteContentSize", V2.new(totalW, totalH))
+		end
+
+		for _, child in otherChildren do
+			layoutSubtree(child, false)
+		end
 	elseif children ~= nil then
 		for _, child in children do
 			layoutSubtree(child, false)
@@ -1594,7 +1702,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 			local reqW, reqH = 0, 0
 			if TEXT_CLASSES[className] then
 				local rawText = tostring(props.Text or "")
-				local visibleText = if props.RichText == true then string.gsub(rawText, "<[^>]+>", "") else rawText
+				local visibleText = if props.RichText == true then stripRichText(rawText) else rawText
 				local textSize = if type(props.TextSize) == "number" and props.TextSize > 0 then props.TextSize else 14
 				local wrapForMeasure = props.TextWrapped == true and not autoX
 				local tw, th = measureTextWithFontSize(visibleText, textSize, wrapForMeasure, contentW)
@@ -1609,6 +1717,12 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 				end
 			elseif gridLayout ~= nil then
 				local acs = gridLayout._props.AbsoluteContentSize
+				if acs ~= nil then
+					reqW = math.max(reqW, acs.X)
+					reqH = math.max(reqH, acs.Y)
+				end
+			elseif pageLayout ~= nil then
+				local acs = pageLayout._props.AbsoluteContentSize
 				if acs ~= nil then
 					reqW = math.max(reqW, acs.X)
 					reqH = math.max(reqH, acs.Y)
@@ -1678,6 +1792,12 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 					reqW = math.max(reqW, acs.X)
 					reqH = math.max(reqH, acs.Y)
 				end
+			elseif pageLayout ~= nil then
+				local acs = pageLayout._props.AbsoluteContentSize
+				if acs ~= nil then
+					reqW = math.max(reqW, acs.X)
+					reqH = math.max(reqH, acs.Y)
+				end
 			elseif children ~= nil then
 				for _, child in children do
 					if isClass(child._props.ClassName, "GuiObject") and child._props.Visible ~= false then
@@ -1705,7 +1825,7 @@ function parentDependsOnChildren(parent: any): boolean
 	if pChildren ~= nil then
 		for _, ch in pChildren do
 			local cName = ch._props.ClassName
-			if cName == "UIListLayout" or cName == "UIGridLayout" then return true end
+			if cName == "UIListLayout" or cName == "UIGridLayout" or cName == "UIPageLayout" then return true end
 		end
 	end
 	return false
@@ -1929,6 +2049,8 @@ function BaseMethods.FindFirstAncestorWhichIsA(self: any, targetClass: string): 
 	return findAncestor(self, BaseMethods.IsA, targetClass)
 end
 
+function BaseMethods.GetActor(self: any): any return findAncestor(self, matchClass, "Actor") end
+
 function BaseMethods.WaitForChild(self: any, name: string, timeOut: number?): any
 	local found = BaseMethods.FindFirstChild(self, name)
 	if found ~= nil then return found end
@@ -2017,6 +2139,7 @@ function BaseMethods.QueryDescendants(self: any, selector: string): { any }
 end
 
 function BaseMethods.ClearAllChildren(self: any)
+	Parallel.assertSerial(rawget(self, "_env"), "Function Instance.ClearAllChildren")
 	local children = rawget(self, "_children")
 	if children ~= nil then
 		for _, child in table.clone(children) :: { any } do
@@ -2088,6 +2211,11 @@ local function destroyNode(self: any, parentDestroying: boolean?)
 	if env ~= nil and env._focusedBox == self then env._focusedBox = nil end
 	rawset(self, "_destroyed", true)
 	rawset(self, "_destroying", nil)
+	Audio.onInstanceDestroy(self)
+	if env ~= nil then
+		local cls = self._props.ClassName
+		if cls == "InputContext" or cls == "InputAction" or cls == "InputBinding" then InputActions.evaluate(env) end
+	end
 	self._props.OnServerInvoke = nil
 	self._props.OnClientInvoke = nil
 	for _, field in { "_boundServerChannels", "_boundClientChannels" } do
@@ -2161,7 +2289,10 @@ local function destroyNode(self: any, parentDestroying: boolean?)
 	end
 end
 
-function BaseMethods.Destroy(self: any) destroyNode(self, false) end
+function BaseMethods.Destroy(self: any)
+	Parallel.assertSerial(rawget(self, "_env"), "Function Instance.Destroy")
+	destroyNode(self, false)
+end
 
 local function copyAttributeOrPropValue(val: any): any
 	return Util.copy(val, {
@@ -2235,6 +2366,7 @@ end
 
 function BaseMethods.Clone(self: any): any
 	local env = rawget(self, "_env")
+	Parallel.assertSerial(env, "Function Instance.Clone")
 	if rawget(self, "_hasGui") == true and getLayoutState(env).hasDirty then flushLayouts(env) end
 	local clonedMap: { [any]: any } = {}
 	local rootCopy = cloneSubtree(self, clonedMap)
@@ -2259,6 +2391,7 @@ end
 --- `Instance.fromExisting(existing)`: a copy of `existing` without its descendants, whatever its Archivable.
 function InstanceDouble.fromExisting(existing: any): any
 	local env = rawget(existing, "_env")
+	Parallel.assertSerial(env, "Function Instance.fromExisting")
 	if rawget(existing, "_hasGui") == true and getLayoutState(env).hasDirty then flushLayouts(env) end
 	local copy = copyNode(existing)
 	for k, v in existing._props do
@@ -2295,6 +2428,7 @@ function BaseMethods.GetAttribute(self: any, attr: string): any
 end
 
 function BaseMethods.SetAttribute(self: any, attr: string, value: any)
+	Parallel.assertSerial(rawget(self, "_env"), "Function Instance.SetAttribute")
 	if
 		type(attr) ~= "string"
 		or not string.match(attr, "^[%w_%.%-/]+$")
@@ -2345,6 +2479,7 @@ function BaseMethods.GetAttributeChangedSignal(self: any, attr: string): any
 end
 
 function BaseMethods.AddTag(self: any, tag: string)
+	Parallel.assertSerial(rawget(self, "_env"), "Function Instance.AddTag")
 	local tags = rawget(self, "_tags")
 	if tags == nil then
 		tags = {}
@@ -2402,6 +2537,7 @@ function InstanceDouble.getTagged(env: any, tag: string): { any }
 end
 
 function BaseMethods.RemoveTag(self: any, tag: string)
+	Parallel.assertSerial(rawget(self, "_env"), "Function Instance.RemoveTag")
 	local tags = rawget(self, "_tags")
 	if tags ~= nil and tags[tag] then
 		tags[tag] = nil
@@ -2586,8 +2722,13 @@ local HumanoidMethods = {
 }
 
 local HumanoidDescriptionMethods = {
-	GetAccessories = function(self: any, _includeRigid: boolean?): { any } return self._props._accessories or {} end,
-	SetAccessories = function(self: any, list: { any }, _includeRigid: boolean?) self._props._accessories = list end,
+	GetAccessories = function(self: any, _includeRigid: boolean?): { any }
+		local saved = self._props._accessories
+		return if saved ~= nil then Util.copy(saved) else {}
+	end,
+	SetAccessories = function(self: any, list: { any }, _includeRigid: boolean?)
+		self._props._accessories = if list ~= nil then Util.copy(list) else nil
+	end,
 }
 
 local TextBoxMethods = {
@@ -2715,42 +2856,67 @@ local BasePlayerGuiMethods = {
 	end,
 }
 
-local function stepUIPageLayout(self: any, delta: number)
+local function getPageLayoutPages(self: any): { any }
 	local parent = rawget(self, "_parent")
-	if parent == nil then return end
-	local pages = {}
-	for _, child in parent:GetChildren() do
-		if child:IsA("GuiObject") then table.insert(pages, child) end
+	if parent == nil then return {} end
+	local rawPages: { any } = {}
+	local children = rawget(parent, "_children")
+	if children ~= nil then
+		for _, child in children do
+			if isClass(child._props.ClassName, "GuiObject") and child._props.Visible ~= false then
+				table.insert(rawPages, child)
+			end
+		end
 	end
-	local cur = table.find(pages, self._props.CurrentPage) or 1
-	if pages[cur + delta] ~= nil then self:JumpTo(pages[cur + delta]) end
+	return sortGuiChildren(rawPages, self._props.SortOrder)
+end
+
+local function stepUIPageLayout(self: any, delta: number)
+	local pages = getPageLayoutPages(self)
+	local n = #pages
+	if n == 0 then return end
+	local parent = rawget(self, "_parent")
+	local curProp = self._props.CurrentPage
+	if
+		curProp == NONE
+		or curProp == nil
+		or rawget(curProp, "_destroyed") == true
+		or rawget(curProp, "_parent") ~= parent
+	then
+		curProp = pages[1]
+	end
+	local cur = table.find(pages, curProp) or 1
+	local targetIdx = cur + delta
+	if self._props.Circular == true then targetIdx = ((targetIdx - 1) % n) + 1 end
+	if pages[targetIdx] ~= nil then self:JumpTo(pages[targetIdx]) end
 end
 
 local UIPageLayoutMethods = {
 	JumpTo = function(self: any, page: any)
+		local parent = rawget(self, "_parent")
+		if
+			page == nil
+			or page == NONE
+			or type(page) ~= "table"
+			or rawget(page, "_isInstance") ~= true
+			or not isClass(page._props.ClassName, "GuiObject")
+			or rawget(page, "_parent") ~= parent
+		then
+			return
+		end
 		local prev = self._props.CurrentPage
 		if prev ~= page then
 			if prev ~= nil and prev ~= NONE then getSignal(self, "PageLeave"):Fire(prev) end
-			if page ~= nil and page ~= NONE then
-				getSignal(self, "PageEnter"):Fire(page)
-				getSignal(self, "Stopped"):Fire(page)
-			end
 			setCoupledProp(self, "CurrentPage", page)
+			if parent ~= nil then relayout(parent) end
+			getSignal(self, "PageEnter"):Fire(page)
+			getSignal(self, "Stopped"):Fire(page)
 		end
 	end,
 	JumpToIndex = function(self: any, index: number)
-		local parent = rawget(self, "_parent")
-		if parent == nil then return end
-		local idx = 0
-		for _, child in parent:GetChildren() do
-			if child:IsA("GuiObject") then
-				if idx == index then
-					self:JumpTo(child)
-					return
-				end
-				idx += 1
-			end
-		end
+		local pages = getPageLayoutPages(self)
+		local page = pages[index + 1]
+		if page ~= nil then self:JumpTo(page) end
 	end,
 	Next = function(self: any) stepUIPageLayout(self, 1) end,
 	Previous = function(self: any) stepUIPageLayout(self, -1) end,
@@ -3467,11 +3633,33 @@ defClass("ProximityPromptService", {
 	props = { Enabled = true, MaxPromptsVisible = 16 },
 	events = { "PromptTriggered", "PromptButtonHoldBegan", "PromptButtonHoldEnded", "PromptShown", "PromptHidden" },
 })
+Audio.configure(setCoupledProp, getSignal)
+
 defClass("UIPageLayout", {
-	props = { CurrentPage = NONE },
-	readOnly = { "CurrentPage" },
+	props = {
+		CurrentPage = NONE,
+		FillDirection = Enum.FillDirection.Horizontal,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = Datatypes.UDim.new(0, 0),
+		Circular = false,
+		AbsoluteContentSize = Vector2.zero,
+	},
+	readOnly = { "CurrentPage", "AbsoluteContentSize" },
 	methods = UIPageLayoutMethods,
 })
+defClass("Actor", { methods = Parallel.ActorMethods })
+defClass("InputAction", { methods = InputActions.InputActionMethods })
+defClass("InputBinding", { methods = InputActions.InputBindingMethods })
+defClass("AudioPlayer", {
+	props = { IsPlaying = false, IsReady = true, TimeLength = 1 },
+	readOnly = { "IsPlaying", "IsReady", "TimeLength" },
+	methods = Audio.AudioPlayerMethods,
+})
+defClass("AudioAnalyzer", { methods = Audio.AudioAnalyzerMethods })
+defClass("AudioEmitter", { methods = Audio.AudioEmitterMethods })
+defClass("AudioListener", { methods = Audio.AudioListenerMethods })
+defClass("AudioFader", { methods = Audio.SharedNodeMethods })
+defClass("AudioDeviceOutput", { methods = Audio.SharedNodeMethods })
 defClass("HapticEffect", {
 	props = { Type = Enum.HapticEffectType.Custom, Looped = false, Playing = false },
 	readOnly = { "Playing" },
@@ -3651,6 +3839,37 @@ function InstanceMeta.__index(self: any, key: any): any
 			if key == "OnServerEvent" or key == "OnClientEvent" then ensureRemoteBound(self) end
 			return sig
 		elseif member.kind == "property" then
+			if className == "UIPageLayout" and key == "CurrentPage" then
+				local val = self._props[key]
+				local parent = rawget(self, "_parent")
+				if
+					val == NONE
+					or val == nil
+					or rawget(val, "_destroyed") == true
+					or rawget(val, "_parent") ~= parent
+				then
+					local pages = getPageLayoutPages(self)
+					return pages[1]
+				end
+				return val
+			end
+			if className == "InputAction" and key == "PreferredBinding" then
+				local val = self._props[key]
+				if
+					val ~= NONE
+					and val ~= nil
+					and type(val) == "table"
+					and rawget(val, "_destroyed") ~= true
+					and rawget(val, "_parent") == self
+				then
+					return val
+				end
+				for _, child in self:GetChildren() do
+					if child:IsA("InputBinding") then return child end
+				end
+				return nil
+			end
+			Audio.refreshAnalyzerIfNeeded(self, key)
 			local val = self._props[key]
 			return if val == NONE then nil else val
 		end
@@ -3760,6 +3979,9 @@ function InstanceMeta.__newindex(self: any, key: any, value: any)
 	local schema = CLASSES[className]
 	local member = if schema ~= nil then schema.members[key] else nil
 	local env = rawget(self, "_env")
+	if not rawget(self, "_replicating") then
+		Parallel.assertSerial(env, "Property " .. tostring(className) .. "." .. tostring(key))
+	end
 	local dt = if env ~= nil then env.datatypes else nil
 	local isStrict = isStrictEnv(env)
 
@@ -3823,6 +4045,16 @@ function InstanceMeta.__newindex(self: any, key: any, value: any)
 		if coupledKey2 ~= nil then firePropChanged(self, coupledKey2, coupledVal2) end
 		if isHumanoid and (key == "Health" or coupledKey1 == "Health") then
 			humanoidHealthChanged(self, props.Health)
+		end
+		if
+			className == "Wire"
+			and (key == "SourceInstance" or key == "TargetInstance" or key == "SourceName" or key == "TargetName")
+		then
+			Audio.syncWire(self)
+		elseif
+			env ~= nil and (className == "InputContext" or className == "InputAction" or className == "InputBinding")
+		then
+			InputActions.evaluate(env)
 		end
 		local onPropChange: ((any, any, any) -> ())? = if env ~= nil then env._onPropChange else nil
 		if onPropChange ~= nil then onPropChange(self, key, value) end
@@ -3952,6 +4184,7 @@ local function allocInstanceId(env: any?): number
 end
 
 function InstanceDouble.createInstance(env: any?, className: string, parent: any?, bypassAbstract: boolean?): any
+	if not bypassAbstract then Parallel.assertSerial(env, "Function Instance.new") end
 	local isStrict = isStrictEnv(env)
 	if not bypassAbstract then
 		-- Strict mode creates only creatable classes; lenient mode also allows class names the dump doesn't know.

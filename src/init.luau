@@ -90,6 +90,7 @@ export type EnvSignalBehavior = env.SignalBehavior
 export type EnvHost = env.Host
 export type EnvInput = env.Input
 export type EnvKick = env.Kick
+export type EnvSettleOptions = env.SettleOptions
 
 export type SimWorld = sim.World
 export type SimWorldOptions = sim.WorldOptions
@@ -117,12 +118,25 @@ export type SimExploreOutcome = sim.ExploreOutcome
 export type RobloxConfig = roblox.Config
 export type RobloxContext = roblox.Context
 export type RobloxVerdict = roblox.Verdict
+export type RobloxSide = roblox.Side
+export type RobloxRequest = roblox.Request
+export type LayoutRect = roblox.Rect
+export type PresetName = roblox.PresetName
 export type ViewportPreset = roblox.ViewportPreset
 export type SettleOptions = roblox.SettleOptions
+export type AuditOptions = roblox.AuditOptions
+export type MatrixOptions = roblox.MatrixOptions
 export type FlickerOptions = roblox.FlickerOptions
 export type FlickerResult = roblox.FlickerResult
 export type RemoteFuzzSpec = roblox.RemoteFuzzSpec
 export type SweepOptions = roblox.SweepOptions
+export type SweepSnapshot = roblox.SweepSnapshot
+export type ConformanceTarget = roblox.ConformanceTarget
+export type ContainerKind = roblox.ContainerKind
+export type ConformanceOptions = roblox.ConformanceOptions
+export type ConformanceContext = roblox.ConformanceContext
+export type ConformanceFn = roblox.ConformanceFn
+export type ConformanceApi = roblox.ConformanceApi
 
 export type JsonOptions = format.JsonOptions
 

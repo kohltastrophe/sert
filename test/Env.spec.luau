@@ -735,7 +735,7 @@ describe("Instance subclasses: Model, BasePart, Humanoid, ValueBase, and hierarc
 			sert.eq(desc.ClassName, "HumanoidDescription")
 			local accSpec = { { AssetId = 12345 } }
 			desc:SetAccessories(accSpec, true)
-			sert.eq(desc:GetAccessories(true), accSpec)
+			sert.eq(desc:GetAccessories(true), { { AssetId = 12345 } })
 			local customDesc = e.Instance.new("HumanoidDescription")
 			hum:ApplyDescription(customDesc)
 			sert.eq(hum:GetAppliedDescription(), customDesc)
@@ -1827,5 +1827,501 @@ describe("env:mount, env:settle, extended input driver, client replication & RBX
 		brokenMod.Name = "BrokenLexical"
 		rawset(brokenMod, "_loader", function() return "syntax error: unexpected symbol" end)
 		sert.throws(function() e:require(brokenMod) end, "failed to load: syntax error: unexpected symbol")
+	end)
+end)
+
+describe("Wave 2 env features: 3D spatial SAT/casts, InputContext/Actions, Parallel Actors, Audio", function()
+	test(
+		"Workspace supports exact 3D OBB SAT, Ball/Cylinder raycasts, Blockcast/Spherecast/Shapecast, CollisionGroups, and BruteForceAllSlow",
+		function()
+			local e = sert.env.new()
+			local ws = e.workspace
+			local V3, CF, Enum = e.Vector3, e.CFrame, e.Enum
+			local phys = e:getService("PhysicsService")
+
+			-- 1) Rotated OBB 15-axis SAT: diagonally tilted thin slats whose world AABBs overlap yet are 3D disjoint vs intersecting
+			local rotA = e.Instance.new("Part", ws)
+			rotA.Name = "RotA"
+			rotA.Size = V3.new(10, 1, 1)
+			rotA.CFrame = CF.new(0, 5, 0) * CF.Angles(0, math.rad(45), 0)
+
+			-- Parallel +45-deg slat offset perpendicular to its length along (+0.707, 0, +0.707): world AABBs overlap strongly, OBBs do NOT touch
+			local rotDisjoint = e.Instance.new("Part", ws)
+			rotDisjoint.Name = "RotDisjoint"
+			rotDisjoint.Size = V3.new(10, 1, 1)
+			rotDisjoint.CFrame = CF.new(2, 5, 2) * CF.Angles(0, math.rad(45), 0)
+
+			local paramsA = e.RaycastParams.new()
+			local ovParams = e.OverlapParams.new()
+			ovParams.FilterType = Enum.RaycastFilterType.Include
+			ovParams.FilterDescendantsInstances = { rotDisjoint }
+
+			local hitsDisjoint = ws:GetPartsInPart(rotA, ovParams)
+			sert.eq(hitsDisjoint, {})
+
+			ovParams.FilterDescendantsInstances = { rotA, rotDisjoint }
+			local rotTouch = e.Instance.new("Part", ws)
+			rotTouch.Name = "RotTouch"
+			rotTouch.Size = V3.new(2, 1, 2)
+			rotTouch.CFrame = CF.new(0.4, 5, 0.4) * CF.Angles(0, math.rad(45), 0)
+			ovParams.FilterDescendantsInstances = { rotA, rotDisjoint }
+			sert.eq(ws:GetPartsInPart(rotTouch, ovParams), { rotA })
+
+			-- 12-edge rotated probe intersecting RotA around corner
+			local boxHits = ws:GetPartBoundsInBox(
+				CF.new(0, 5, 0) * CF.Angles(math.rad(20), math.rad(45), 0),
+				V3.new(2, 2, 2),
+				ovParams
+			)
+			sert.eq(boxHits, { rotA })
+
+			-- Closest-point radius query near rotated tip (diagonal corner around (3.535, 5, -3.535))
+			local radHits = ws:GetPartBoundsInRadius(V3.new(4.2, 5, -4.2), 1.5, ovParams)
+			sert.eq(radHits, { rotA })
+			local radMiss = ws:GetPartBoundsInRadius(V3.new(6.5, 5, -6.5), 0.5, ovParams)
+			sert.eq(radMiss, {})
+
+			-- 2) Exact Ball & X-axis Cylinder Raycasts
+			local ball = e.Instance.new("Part", ws)
+			ball.Name = "SphereTarget"
+			ball.Shape = Enum.PartType.Ball
+			ball.Size = V3.new(6, 6, 6)
+			ball.CFrame = CF.new(30, 3, 0)
+			ball.Material = Enum.Material.Neon
+
+			local ballParams = e.RaycastParams.new()
+			ballParams.FilterType = Enum.RaycastFilterType.Include
+			ballParams.FilterDescendantsInstances = { ball }
+			local rBall = ws:Raycast(V3.new(20, 3, 0), V3.new(20, 0, 0), ballParams)
+			sert.ok(rBall ~= nil)
+			sert.eq(rBall.Instance, ball)
+			sert.near(rBall.Distance, 7, 1e-4)
+			sert.near(rBall.Position, V3.new(27, 3, 0), 1e-4)
+			sert.near(rBall.Normal, V3.new(-1, 0, 0), 1e-4)
+			sert.eq(rBall.Material, Enum.Material.Neon)
+			-- Corners inside sphere's bounding box must still miss true sphere geometry
+			sert.eq(ws:Raycast(V3.new(20, 5.9, 2.9), V3.new(20, 0, 0), ballParams), nil)
+
+			-- X-axis Cylinder rotated 90 deg around Z so its flat endcaps face +/-Y and curved barrel lies in XZ!
+			local cyl = e.Instance.new("Part", ws)
+			cyl.Name = "CylTarget"
+			cyl.Shape = Enum.PartType.Cylinder
+			cyl.Size = V3.new(8, 4, 4) -- length 8 on local X (-> world Y), radius 2 on YZ (-> world XZ)
+			cyl.CFrame = CF.new(50, 4, 0) * CF.Angles(0, 0, math.rad(90))
+			cyl.Material = Enum.Material.Metal
+
+			local cylParams = e.RaycastParams.new()
+			cylParams.FilterType = Enum.RaycastFilterType.Include
+			cylParams.FilterDescendantsInstances = { cyl }
+			local rCylSide = ws:Raycast(V3.new(44, 4, 0), V3.new(12, 0, 0), cylParams)
+			sert.ok(rCylSide ~= nil)
+			sert.near(rCylSide.Distance, 4, 1e-4)
+			sert.near(rCylSide.Position, V3.new(48, 4, 0), 1e-4)
+			sert.near(rCylSide.Normal, V3.new(-1, 0, 0), 1e-4)
+
+			local rCylCap = ws:Raycast(V3.new(50, 12, 0), V3.new(0, -10, 0), cylParams)
+			sert.ok(rCylCap ~= nil)
+			sert.near(rCylCap.Distance, 4, 1e-4)
+			sert.near(rCylCap.Position, V3.new(50, 8, 0), 1e-4)
+			sert.near(rCylCap.Normal, V3.new(0, 1, 0), 1e-4)
+			-- Bounding-box corner of cylinder (x=-1.7, z=1.9 -> dist^2=6.5 > r^2=4) misses circular cross-section
+			sert.eq(ws:Raycast(V3.new(48.3, 12, 1.9), V3.new(0, -10, 0), cylParams), nil)
+			-- Cylinder vs Box SAT overlap
+			ovParams.FilterDescendantsInstances = { cyl }
+			sert.eq(ws:GetPartBoundsInBox(CF.new(52.5, 4, 0), V3.new(2, 2, 2), ovParams), { cyl })
+
+			-- 3) Blockcast, Spherecast, and Shapecast (plus initial overlap returning nil)
+			local floor = e.Instance.new("Part", ws)
+			floor.Name = "CastWall"
+			floor.Size = V3.new(6, 6, 6)
+			floor.CFrame = CF.new(0, 20, 0)
+			floor.Material = Enum.Material.Concrete
+
+			local castParams = e.RaycastParams.new()
+			castParams.FilterType = Enum.RaycastFilterType.Include
+			castParams.FilterDescendantsInstances = { floor, ball, cyl }
+
+			local bHit = ws:Blockcast(CF.new(-10, 20, 0), V3.new(2, 2, 2), V3.new(20, 0, 0), castParams)
+			sert.ok(bHit ~= nil)
+			sert.eq(bHit.Instance, floor)
+			sert.near(bHit.Distance, 6, 1e-3)
+			sert.near(bHit.Position, V3.new(-3, 20, 0), 1e-2)
+			sert.near(bHit.Normal, V3.new(-1, 0, 0), 1e-3)
+
+			-- Initial intersection returns nil
+			sert.eq(ws:Blockcast(CF.new(0, 20, 0), V3.new(2, 2, 2), V3.new(5, 0, 0), castParams), nil)
+
+			-- Spherecast hitting corner Voronoi sphere of CastWall
+			local sCornerHit = ws:Spherecast(V3.new(-6, 26, -6), 1, V3.new(10, -10, 10), castParams)
+			sert.ok(sCornerHit ~= nil)
+			sert.eq(sCornerHit.Instance, floor)
+			sert.near(sCornerHit.Position, V3.new(-3, 23, -3), 1e-2)
+			sert.near(sCornerHit.Normal, V3.new(-1, 1, -1).Unit, 1e-2)
+
+			-- Shapecast with a Ball probe against Ball target and a Cylinder probe against Box target
+			local sphereProbe = e.Instance.new("Part", ws)
+			sphereProbe.Shape = Enum.PartType.Ball
+			sphereProbe.Size = V3.new(2, 2, 2)
+			sphereProbe.CFrame = CF.new(20, 3, 0)
+			local scBall = ws:Shapecast(sphereProbe, V3.new(20, 0, 0), ballParams)
+			sert.ok(scBall ~= nil)
+			sert.eq(scBall.Instance, ball)
+			sert.near(scBall.Distance, 6, 1e-2)
+			sert.near(scBall.Normal, V3.new(-1, 0, 0), 1e-2)
+
+			local cylProbe = e.Instance.new("Part", ws)
+			cylProbe.Shape = Enum.PartType.Cylinder
+			cylProbe.Size = V3.new(2, 2, 2)
+			cylProbe.CFrame = CF.new(-10, 20, 0)
+			castParams.FilterDescendantsInstances = { floor }
+			local scCyl = ws:Shapecast(cylProbe, V3.new(20, 0, 0), castParams)
+			sert.ok(scCyl ~= nil)
+			sert.eq(scCyl.Instance, floor)
+			sert.near(scCyl.Distance, 6, 0.05)
+
+			-- 4) PhysicsService CollisionGroup + BruteForceAllSlow
+			phys:RegisterCollisionGroup("Heroes")
+			phys:RegisterCollisionGroup("Lasers")
+			phys:CollisionGroupSetCollidable("Heroes", "Lasers", false)
+			sert.eq(phys:CollisionGroupsAreCollidable("Heroes", "Lasers"), false)
+
+			local ghostPart = e.Instance.new("Part", ws)
+			ghostPart.Size = V3.new(4, 4, 4)
+			ghostPart.CFrame = CF.new(100, 0, 0)
+			ghostPart.CollisionGroup = "Heroes"
+			ghostPart.CanQuery = false
+
+			paramsA.FilterType = Enum.RaycastFilterType.Include
+			paramsA.FilterDescendantsInstances = { ghostPart }
+			paramsA.CollisionGroup = "Lasers"
+			-- Filtered by both CanQuery == false and non-collidable group
+			sert.eq(ws:Raycast(V3.new(90, 0, 0), V3.new(20, 0, 0), paramsA), nil)
+
+			paramsA.CollisionGroup = "Heroes" -- collidable with itself, still blocked by CanQuery == false
+			sert.eq(ws:Raycast(V3.new(90, 0, 0), V3.new(20, 0, 0), paramsA), nil)
+
+			paramsA.BruteForceAllSlow = true
+			local bfHit = ws:Raycast(V3.new(90, 0, 0), V3.new(20, 0, 0), paramsA)
+			sert.ok(bfHit ~= nil and bfHit.Instance == ghostPart)
+
+			-- RenameCollisionGroup updates references; UnregisterCollisionGroup removes group
+			phys:RenameCollisionGroup("Heroes", "Players")
+			sert.ok(phys:IsCollisionGroupRegistered("Players"))
+			sert.eq(phys:IsCollisionGroupRegistered("Heroes"), false)
+			sert.eq(phys:CollisionGroupsAreCollidable("Players", "Lasers"), false)
+			sert.ok(#phys:GetRegisteredCollisionGroups() >= 3)
+			phys:UnregisterCollisionGroup("Players")
+			phys:UnregisterCollisionGroup("Lasers")
+		end
+	)
+
+	test(
+		"env:input() evaluates InputContexts in Priority/Sink order for KeyCode, directional composites, and UIButton",
+		function()
+			local e = sert.env.new({ isClient = true, isServer = false })
+			local starterGui = e:getService("StarterGui")
+			local pg = e.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+			local sg = e.Instance.new("ScreenGui", pg)
+			local btn = e.Instance.new("TextButton", sg)
+			btn.Position = e.UDim2.fromOffset(10, 10)
+			btn.Size = e.UDim2.fromOffset(100, 40)
+
+			local menuCtx = e.Instance.new("InputContext", starterGui)
+			menuCtx.Name = "Menu"
+			menuCtx.Priority = 2000
+			menuCtx.Sink = true
+			menuCtx.Enabled = true
+
+			local closeAct = e.Instance.new("InputAction", menuCtx)
+			closeAct.Type = e.Enum.InputActionType.Bool
+			local closeBind = e.Instance.new("InputBinding", closeAct)
+			closeBind.KeyCode = e.Enum.KeyCode.Escape
+
+			local gameCtx = e.Instance.new("InputContext", starterGui)
+			gameCtx.Name = "Gameplay"
+			gameCtx.Priority = 1000
+			gameCtx.Sink = false
+			gameCtx.Enabled = true
+
+			local pauseAct = e.Instance.new("InputAction", gameCtx)
+			pauseAct.Type = e.Enum.InputActionType.Bool
+			local pauseBind = e.Instance.new("InputBinding", pauseAct)
+			pauseBind.KeyCode = e.Enum.KeyCode.Escape
+
+			local move2Act = e.Instance.new("InputAction", gameCtx)
+			move2Act.Type = e.Enum.InputActionType.Direction2D
+			local wasd = e.Instance.new("InputBinding", move2Act)
+			wasd.Up = e.Enum.KeyCode.W
+			wasd.Down = e.Enum.KeyCode.S
+			wasd.Left = e.Enum.KeyCode.A
+			wasd.Right = e.Enum.KeyCode.D
+			wasd.Scale = 2
+
+			local move3Act = e.Instance.new("InputAction", gameCtx)
+			move3Act.Type = e.Enum.InputActionType.Direction3D
+			local bind3 = e.Instance.new("InputBinding", move3Act)
+			bind3.Forward = e.Enum.KeyCode.I
+			bind3.Right = e.Enum.KeyCode.L
+			bind3.Up = e.Enum.KeyCode.U
+
+			local btnAct = e.Instance.new("InputAction", gameCtx)
+			btnAct.Type = e.Enum.InputActionType.Bool
+			local btnBind = e.Instance.new("InputBinding", btnAct)
+			btnBind.UIButton = btn
+
+			local fired: { string } = {}
+			closeAct.Pressed:Connect(function() table.insert(fired, "close:down") end)
+			pauseAct.Pressed:Connect(function() table.insert(fired, "pause:down") end)
+			btnAct.Pressed:Connect(function() table.insert(fired, "btn:down") end)
+			btnAct.Released:Connect(function() table.insert(fired, "btn:up") end)
+
+			local inp = e:input()
+			-- Menu context has higher priority + Sink = true: Escape hits Close, sinks Pause
+			inp:press(e.Enum.KeyCode.Escape)
+			e:flush()
+			sert.eq(fired, { "close:down" })
+			sert.eq(closeAct:GetState(), true)
+			sert.eq(pauseAct:GetState(), false)
+			inp:release(e.Enum.KeyCode.Escape)
+			e:flush()
+
+			-- Disable Menu context -> Escape flows to Gameplay Pause
+			menuCtx.Enabled = false
+			inp:press(e.Enum.KeyCode.Escape)
+			e:flush()
+			sert.eq(pauseAct:GetState(), true)
+			sert.eq(fired, { "close:down", "pause:down" })
+			inp:release(e.Enum.KeyCode.Escape)
+			e:flush()
+
+			-- 2D & 3D directional composite bindings normalize before multiplying Scale
+			inp:press(e.Enum.KeyCode.W)
+			inp:press(e.Enum.KeyCode.D)
+			inp:press(e.Enum.KeyCode.I)
+			inp:press(e.Enum.KeyCode.L)
+			inp:press(e.Enum.KeyCode.U)
+			e:flush()
+			sert.near(move2Act:GetState(), e.Vector2.new(1, 1).Unit * 2, 1e-4)
+			sert.near(move3Act:GetState(), e.Vector3.new(1, 1, -1).Unit, 1e-4)
+			inp:release(e.Enum.KeyCode.W)
+			inp:release(e.Enum.KeyCode.D)
+			e:flush()
+			sert.eq(move2Act:GetState(), e.Vector2.zero)
+
+			-- UIButton binding via env:input():click(btn)
+			inp:click(btn)
+			e:flush()
+			sert.eq(fired, { "close:down", "pause:down", "btn:down", "btn:up" })
+		end
+	)
+
+	test(
+		"SharedTableRegistry, Actor:GetActor(), and task.desynchronize/synchronize enforce strict parallel mutation safety",
+		function()
+			local e = sert.env.new()
+			local reg = e:getService("SharedTableRegistry")
+			local st = e.SharedTable.new({ count = 1 })
+			reg:SetSharedTable("CombatStats", st)
+			sert.eq(reg:GetSharedTable("CombatStats"), st)
+			-- Calling GetSharedTable for an unregistered name auto-creates an empty SharedTable
+			local autoCreated = reg:GetSharedTable("FreshTable")
+			sert.eq(e.SharedTable.size(autoCreated), 0)
+
+			local actor = e.Instance.new("Actor", e.workspace)
+			local mod = e.Instance.new("ModuleScript", actor)
+			local part = e.Instance.new("Part", actor)
+			part.Name = "SafePart"
+			sert.eq(mod:GetActor(), actor)
+			sert.eq(part:GetActor(), actor)
+			sert.eq(e.workspace:GetActor(), nil)
+
+			-- Require a module whose script global has :GetActor() and exercises desynchronize()/synchronize()
+			local parallelErr: any = nil
+			rawset(mod :: any, "_factory", function(modEnv: any): boolean
+				sert.eq(modEnv.script:GetActor(), actor)
+				modEnv.task.desynchronize()
+				-- Safe read + SharedTable mutations succeed while desynchronized
+				sert.eq(part.Name, "SafePart")
+				e.SharedTable.increment(st, "count", 4)
+				-- Serial DOM mutation under strict = true raises parallel safety error
+				local ok, err = pcall(function() part.Name = "MutatedInParallel" end)
+				sert.eq(ok, false)
+				parallelErr = err
+				local okNew = pcall(function() e.Instance.new("Part") end)
+				sert.eq(okNew, false)
+				local okDestroy = pcall(function() part:Destroy() end)
+				sert.eq(okDestroy, false)
+
+				modEnv.task.synchronize()
+				part.Name = "SynchronizedWrite"
+				return true
+			end)
+			local modResult = e:require(mod)
+			sert.eq(modResult, true)
+			sert.matches(tostring(parallelErr), "not safe to write or call in parallel")
+			sert.eq(st.count, 5)
+			sert.eq(part.Name, "SynchronizedWrite")
+
+			-- Non-strict env skips parallel write error
+			local lenient = sert.env.new({ strict = false })
+			local lp = lenient.Instance.new("Part", lenient.workspace)
+			lenient.task.desynchronize()
+			lp.Name = "LenientParallel"
+			lenient.task.synchronize()
+			sert.eq(lp.Name, "LenientParallel")
+		end
+	)
+
+	test(
+		"AudioPlayer advances on virtual clock with PlaybackRegion/Looped/Ended and feeds Fader/Analyzer/Emitter/Listener",
+		function()
+			local e = sert.env.new()
+			local emitterHost = e.Instance.new("Part", e.workspace)
+			emitterHost.CFrame = e.CFrame.new(0, 0, 0)
+			local listenerHost = e.Instance.new("Part", e.workspace)
+			listenerHost.CFrame = e.CFrame.new(0, 0, 10)
+
+			local player = e.Instance.new("AudioPlayer", e.workspace)
+			sert.eq(player.TimeLength, 1)
+			sert.throws(function() (player :: any).TimeLength = 2 end, "read only")
+			player.PlaybackRegion = e.NumberRange.new(0, 1.0)
+			player.Volume = 0.8
+
+			local fader = e.Instance.new("AudioFader", e.workspace)
+			fader.Volume = 0.5
+
+			local analyzer = e.Instance.new("AudioAnalyzer", e.workspace)
+			local emitter = e.Instance.new("AudioEmitter", emitterHost)
+			emitter.DistanceAttenuationBounds = e.NumberRange.new(0, 20)
+			local listener = e.Instance.new("AudioListener", listenerHost)
+			local outDev = e.Instance.new("AudioDeviceOutput", e.workspace)
+
+			local w1 = e.Instance.new("Wire", e.workspace)
+			w1.SourceInstance, w1.TargetInstance = player, fader
+			local w2 = e.Instance.new("Wire", e.workspace)
+			w2.SourceInstance, w2.TargetInstance = fader, analyzer
+			local w3 = e.Instance.new("Wire", e.workspace)
+			w3.SourceInstance, w3.TargetInstance = fader, emitter
+			local w4 = e.Instance.new("Wire", e.workspace)
+			w4.SourceInstance, w4.TargetInstance = listener, outDev
+			sert.ok(w1.Connected and w2.Connected and w3.Connected and w4.Connected)
+
+			local events: { string } = {}
+			player.Looped:Connect(function() table.insert(events, "looped") end)
+			player.Ended:Connect(function() table.insert(events, "ended") end)
+
+			-- Play for 0.4s and sample AudioAnalyzer Peak/Rms/Spectrum + Emitter/Listener attenuation
+			player:Play()
+			sert.eq(player.IsPlaying, true)
+			sert.near(analyzer.PeakLevel, 0.4, 1e-4)
+			sert.near(analyzer.RmsLevel, 0.4 * 0.70710678, 1e-4)
+			sert.near(analyzer:GetSpectrum()[1], 0.4, 1e-4)
+			sert.near(emitter:GetAudibilityFor(listener), 0.5, 1e-4)
+			sert.eq(emitter:GetInteractingListeners(), { listener })
+			sert.eq(listener:GetInteractingEmitters(), { emitter })
+
+			emitter:SetDistanceAttenuation({ [0] = 1, [20] = 0 })
+			sert.eq(emitter:GetDistanceAttenuation()[20], 0)
+			emitter:SetAngleAttenuation({ [0] = 1, [90] = 0.25 })
+			sert.eq(emitter:GetAngleAttenuation()[90], 0.25)
+
+			e:step(0.4)
+			sert.near(player.TimePosition, 0.4, 1e-4)
+			sert.eq(player.IsPlaying, true)
+
+			-- Advance past TimeLength -> stops, sets TimePosition = 1.0, fires Ended
+			e:step(0.7)
+			e:flush()
+			sert.eq(player.IsPlaying, false)
+			sert.near(player.TimePosition, 1.0, 1e-4)
+			sert.eq(events, { "ended" })
+			sert.eq(analyzer.PeakLevel, 0)
+
+			-- Looping playback fires Looped and wraps within LoopRegion
+			player.Looping = true
+			player.LoopRegion = e.NumberRange.new(0.2, 0.6)
+			player:Play(0.3)
+			e:step(0.5) -- 0.3 + 0.5 = 0.8 >= 0.6 -> wraps once to 0.4
+			e:flush()
+			sert.eq(player.IsPlaying, true)
+			sert.near(player.TimePosition, 0.4, 1e-4)
+			sert.eq(events, { "ended", "looped" })
+			player:Stop()
+			sert.eq(player.IsPlaying, false)
+
+			-- Destroying target disconnects Wire automatically
+			fader:Destroy()
+			sert.eq(w1.Connected, false)
+		end
+	)
+end)
+
+describe("InputAction, Audio.hasPlaying, _immediateSignal, and mutant waitGuard", function()
+	test("InputAction.PreferredBinding resolves dynamically from live child InputBindings", function()
+		local e = sert.env.new({ isClient = true, isServer = false, signalBehavior = "Immediate" })
+		local ctx = e.Instance.new("InputContext", e.workspace)
+		local action = e.Instance.new("InputAction", ctx)
+		action.Type = e.Enum.InputActionType.Bool
+		local nonBinding = e.Instance.new("Folder", action)
+		sert.eq(nonBinding.Parent, action)
+		sert.eq(action.PreferredBinding, nil)
+
+		local b1 = e.Instance.new("InputBinding", action)
+		b1.KeyCode = e.Enum.KeyCode.E
+		sert.eq(action.PreferredBinding, b1)
+
+		local b2 = e.Instance.new("InputBinding", action)
+		b2.KeyCode = e.Enum.KeyCode.F
+		sert.eq(action.PreferredBinding, b1)
+
+		b1:Destroy()
+		sert.eq(action.PreferredBinding, b2)
+
+		b2.Parent = nil
+		sert.eq(action.PreferredBinding, nil)
+	end)
+
+	test("Audio.hasPlaying tracks active AudioPlayer state in env", function()
+		local Audio = require("../src/engine/audio")
+		local e = sert.env.new({ signalBehavior = "Immediate" })
+		sert.eq(Audio.hasPlaying(e), false)
+
+		local player = e.Instance.new("AudioPlayer", e.workspace)
+		sert.eq(Audio.hasPlaying(e), false)
+
+		player:Play()
+		sert.eq(Audio.hasPlaying(e), true)
+
+		player:Stop()
+		sert.eq(Audio.hasPlaying(e), false)
+	end)
+
+	test("_immediateSignal delivers synchronously even when env signalBehavior is Deferred", function()
+		local e = sert.env.new()
+		sert.eq(e.signalBehavior, "Deferred")
+		local sig = (e :: any):_immediateSignal()
+		local seen: { string } = {}
+		sig:Connect(function(tag: string) table.insert(seen, tag) end)
+		sig:Fire("immediate")
+		sert.eq(seen, { "immediate" })
+	end)
+
+	test("registry.mutant.waitGuard enforces wait limit only while mutant id is active", function()
+		local registry = require("../src/core/registry")
+		sert.defer(function() registry.mutant.set(nil) end)
+
+		registry.mutant.set(nil)
+		for _ = 1, 10 do
+			registry.mutant.waitGuard()
+		end
+
+		registry.mutant.set(42)
+		for _ = 1, 25000 do
+			registry.mutant.waitGuard()
+		end
+		sert.throws(function() registry.mutant.waitGuard() end, "task.wait loop limit exceeded")
+
+		registry.mutant.set(nil)
+		registry.mutant.waitGuard()
 	end)
 end)

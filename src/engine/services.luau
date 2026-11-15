@@ -6,7 +6,9 @@ local DataStoreDouble = require("./datastore")
 local EncodingDouble = require("./encoding_service")
 local InstanceDouble = require("./instance")
 local MemoryStoreDouble = require("./memorystore")
+local Parallel = require("./parallel")
 local Serialize = require("./serialize")
+local Spatial = require("./spatial")
 
 local HttpDouble = EncodingDouble.HttpService
 
@@ -518,11 +520,29 @@ function lazy.MessagingService(env: any, ctx: any): any
 	return proxyService(ctx, "MessagingService", double)
 end
 
+function lazy.SharedTableRegistry(_env: any, ctx: any): any
+	ctx.sharedTableRegistry = ctx.sharedTableRegistry or {}
+	return defService(ctx, "SharedTableRegistry", Parallel.sharedTableRegistryMethods(ctx.sharedTableRegistry) :: any)
+end
+
 function lazy.PhysicsService(_env: any, ctx: any): any
 	local groups: { [string]: { [string]: boolean } } = { Default = { Default = true } }
 	return defService(ctx, "PhysicsService", {
 		RegisterCollisionGroup = function(_self: any, name: string) groups[name] = groups[name] or { [name] = true } end,
-		UnregisterCollisionGroup = function(_self: any, name: string) groups[name] = nil end,
+		UnregisterCollisionGroup = function(_self: any, name: string)
+			groups[name] = nil
+			for _, row in groups do
+				row[name] = nil
+			end
+		end,
+		RenameCollisionGroup = function(_self: any, from: string, to: string)
+			if from == "Default" or groups[from] == nil then return end
+			groups[to] = groups[from]
+			groups[from] = nil
+			for _, row in groups do
+				row[to], row[from] = row[from], nil
+			end
+		end,
 		IsCollisionGroupRegistered = function(_self: any, name: string): boolean return groups[name] ~= nil end,
 		CollisionGroupSetCollidable = function(_self: any, g1: string, g2: string, collidable: boolean)
 			groups[g1], groups[g2] = groups[g1] or {}, groups[g2] or {}
@@ -1083,133 +1103,71 @@ do
 	lazy[name] = genericService
 end
 
-type Bounds = { minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number }
-
-local function boundsOf(cframe: any, size: any): Bounds
-	local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cframe:GetComponents()
-	local sx, sy, sz = size.X / 2, size.Y / 2, size.Z / 2
-	local ex = math.abs(r00) * sx + math.abs(r01) * sy + math.abs(r02) * sz
-	local ey = math.abs(r10) * sx + math.abs(r11) * sy + math.abs(r12) * sz
-	local ez = math.abs(r20) * sx + math.abs(r21) * sy + math.abs(r22) * sz
-	return { minX = x - ex, minY = y - ey, minZ = z - ez, maxX = x + ex, maxY = y + ey, maxZ = z + ez }
-end
-
-local function overlaps(a: Bounds, b: Bounds): boolean
-	return a.minX <= b.maxX
-		and a.maxX >= b.minX
-		and a.minY <= b.maxY
-		and a.maxY >= b.minY
-		and a.minZ <= b.maxZ
-		and a.maxZ >= b.minZ
-end
-
-local function isWithin(inst: any, list: { any }): boolean
-	for _, root in list do
-		if inst == root or inst:IsDescendantOf(root) then return true end
-	end
-	return false
-end
-
 local eager: { [string]: (env: any, ctx: any) -> any } = {}
 
 function eager.Workspace(_env: any, ctx: any): any
-	local createInstance, dt, Enum = ctx.createInstance, ctx.dt, ctx.Enum
+	local createInstance = ctx.createInstance
 	local workspaceInst = createInstance("Workspace", ctx.gameInst, true)
 	rawset(workspaceInst, "_isService", true)
 	workspaceInst._props.CurrentCamera = createInstance("Camera", workspaceInst, true)
 	local terrainInst = createInstance("Terrain", workspaceInst, true)
 	workspaceInst._props.Terrain = terrainInst
 
-	local function candidates(params: any?): { any }
-		local filterList: { any } = if params ~= nil then params.FilterDescendantsInstances or {} else {}
-		local include = params ~= nil and params.FilterType == Enum.RaycastFilterType.Include
-		local respectCollide = params ~= nil and params.RespectCanCollide == true
-		local out = {}
-		for _, inst in workspaceInst:GetDescendants() do
-			if inst == terrainInst or not inst:IsA("BasePart") then continue end
-			if inst.CanQuery == false or (respectCollide and inst.CanCollide == false) then continue end
-			local listed = #filterList > 0 and isWithin(inst, filterList)
-			if if include then listed else not listed then table.insert(out, inst) end
-		end
-		return out
-	end
-
-	local function limit(list: { any }, params: any?): { any }
-		local maxParts = if params ~= nil then params.MaxParts or 0 else 0
-		return if maxParts > 0 and #list > maxParts then table.move(list, 1, maxParts, 1, {}) else list
-	end
+	local function phys(): any return ctx.services.PhysicsService or ctx.getService("PhysicsService") end
 
 	rawset(workspaceInst, "_methods", {
 		GetServerTimeNow = function(): number return ctx.getUnixTime() end,
 		Raycast = function(_self: any, origin: any, direction: any, params: any?): any
-			if origin == nil or direction == nil then return nil end
-			local o, d = { origin.X, origin.Y, origin.Z }, { direction.X, direction.Y, direction.Z }
-			local bestT, bestPart, bestAxis = math.huge, nil :: any, 0
-			for _, part in candidates(params) do
-				local b = boundsOf(part.CFrame, part.Size)
-				local lo, hi = { b.minX, b.minY, b.minZ }, { b.maxX, b.maxY, b.maxZ }
-				local tEnter, tExit, axis, miss = -math.huge, math.huge, 0, false
-				for i = 1, 3 do
-					if math.abs(d[i]) < 1e-12 then
-						if o[i] < lo[i] or o[i] > hi[i] then
-							miss = true
-							break
-						end
-					else
-						local t1, t2 = (lo[i] - o[i]) / d[i], (hi[i] - o[i]) / d[i]
-						if t1 > t2 then
-							t1, t2 = t2, t1
-						end
-						if t1 > tEnter then
-							tEnter, axis = t1, i
-						end
-						tExit = math.min(tExit, t2)
-					end
-				end
-				if not miss and tEnter <= tExit and tEnter >= 0 and tEnter <= 1 and tEnter < bestT then
-					bestT, bestPart, bestAxis = tEnter, part, axis
-				end
-			end
-			if bestPart == nil then return nil end
-			local n = { 0, 0, 0 }
-			n[bestAxis] = if d[bestAxis] > 0 then -1 else 1
-			return dt.newRaycastResult(
-				bestPart,
-				origin + direction * bestT,
-				dt.Vector3.new(n[1], n[2], n[3]),
-				direction.Magnitude * bestT,
-				bestPart.Material or Enum.Material.Plastic
+			return Spatial.raycast(workspaceInst, terrainInst, origin, direction, params, ctx)
+		end,
+		Blockcast = function(_self: any, cframe: any, size: any, direction: any, params: any?): any
+			return Spatial.blockcast(workspaceInst, terrainInst, cframe, size, direction, params, ctx)
+		end,
+		Spherecast = function(_self: any, position: any, radius: number, direction: any, params: any?): any
+			return Spatial.spherecast(workspaceInst, terrainInst, position, radius, direction, params, ctx)
+		end,
+		Shapecast = function(
+			_self: any,
+			part: any,
+			direction: any,
+			params: any?,
+			cframeOverride: any?,
+			sizeOverride: any?
+		): any
+			return Spatial.shapecast(
+				workspaceInst,
+				terrainInst,
+				part,
+				direction,
+				params,
+				cframeOverride,
+				sizeOverride,
+				ctx
 			)
 		end,
 		GetPartBoundsInBox = function(_self: any, cframe: any?, size: any?, params: any?): { any }
-			if cframe == nil or size == nil then return {} end
-			local query, out = boundsOf(cframe, size), {}
-			for _, part in candidates(params) do
-				if overlaps(boundsOf(part.CFrame, part.Size), query) then table.insert(out, part) end
-			end
-			return limit(out, params)
+			return Spatial.getPartBoundsInBox(workspaceInst, terrainInst, cframe, size, params, ctx)
 		end,
 		GetPartBoundsInRadius = function(_self: any, position: any?, radius: number?, params: any?): { any }
-			if position == nil or radius == nil then return {} end
-			local out = {}
-			for _, part in candidates(params) do
-				local b = boundsOf(part.CFrame, part.Size)
-				local dx = position.X - math.clamp(position.X, b.minX, b.maxX)
-				local dy = position.Y - math.clamp(position.Y, b.minY, b.maxY)
-				local dz = position.Z - math.clamp(position.Z, b.minZ, b.maxZ)
-				if dx * dx + dy * dy + dz * dz <= radius * radius then table.insert(out, part) end
-			end
-			return limit(out, params)
+			return Spatial.getPartBoundsInRadius(workspaceInst, terrainInst, position, radius, params, ctx)
 		end,
 		GetPartsInPart = function(_self: any, part: any?, params: any?): { any }
-			if part == nil then return {} end
-			local query, out = boundsOf(part.CFrame, part.Size), {}
-			for _, other in candidates(params) do
-				if other ~= part and overlaps(boundsOf(other.CFrame, other.Size), query) then
-					table.insert(out, other)
-				end
-			end
-			return limit(out, params)
+			return Spatial.getPartsInPart(workspaceInst, terrainInst, part, params, ctx)
+		end,
+		RegisterCollisionGroup = function(_self: any, name: string) phys():RegisterCollisionGroup(name) end,
+		UnregisterCollisionGroup = function(_self: any, name: string) phys():UnregisterCollisionGroup(name) end,
+		RenameCollisionGroup = function(_self: any, from: string, to: string) phys():RenameCollisionGroup(from, to) end,
+		IsCollisionGroupRegistered = function(_self: any, name: string): boolean
+			return phys():IsCollisionGroupRegistered(name)
+		end,
+		CollisionGroupSetCollidable = function(_self: any, g1: string, g2: string, collidable: boolean)
+			phys():CollisionGroupSetCollidable(g1, g2, collidable)
+		end,
+		CollisionGroupsAreCollidable = function(_self: any, g1: string, g2: string): boolean
+			return phys():CollisionGroupsAreCollidable(g1, g2)
+		end,
+		GetRegisteredCollisionGroups = function(_self: any): { { name: string } }
+			return phys():GetRegisteredCollisionGroups()
 		end,
 	})
 	return workspaceInst
