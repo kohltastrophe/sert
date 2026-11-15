@@ -2,6 +2,7 @@
 -- Test runner (`core/runner`): target selection, LIFO hooks, error preservation, CI focus gate, yield pumping, sharding, and CLI parsing.
 
 local format = require("./format")
+local perf = require("./perf")
 local registry = require("./registry")
 
 local mutant = registry.mutant
@@ -10,6 +11,8 @@ local output = registry.output
 export type Shard = registry.Shard
 export type RunOptions = registry.RunOptions
 export type Target = registry.Target
+export type SkippedByReason = registry.SkippedByReason
+export type TautologyRecord = registry.TautologyRecord
 
 local IS_ROBLOX = (game :: any) ~= nil
 local DEFAULT_TIMEOUT = 30
@@ -17,6 +20,9 @@ local DEFAULT_SEED_BASE = 0x5EED
 local YIELDED = "test yielded and was never resumed"
 
 type Test = registry.Test
+type BenchEntry = registry.BenchEntry
+type BenchContext = registry.BenchContext
+type AssertionTracker = registry.AssertionTracker
 type Hooks = registry.Hooks
 type HookFn = registry.HookFn
 type TestContext = registry.TestContext
@@ -29,6 +35,9 @@ export type Results = {
 	skipped: number,
 	skippedRoblox: number,
 	skippedRtest: number,
+	skippedByReason: SkippedByReason,
+	zeroAssertionTests: { string },
+	tautologies: { TautologyRecord },
 	todo: number,
 	total: number,
 	clock: number,
@@ -194,11 +203,13 @@ local function drain(list: { HookFn }, timeout: number): string?
 	return failure
 end
 
+local EMPTY_TAUTOLOGIES: { TautologyRecord } = {}
+
 local function runTest(
 	test: Test,
 	chain: { Hooks },
 	opts: RunOptions
-): (string?, string?, number?, { [string]: number })
+): (string?, string?, number?, { [string]: number }, boolean, { TautologyRecord })
 	local state = registry.state
 	local timeout = test.timeout or resolveTimeout(opts)
 	local outerDeferred, outerSeeds = state.deferred, state.inlineSeeds
@@ -233,7 +244,10 @@ local function runTest(
 		enteredScopes = scopeIdx
 	end
 
+	local tracker: AssertionTracker? = nil
+	local zeroAssertion = false
 	if failure == nil then
+		registry.beginTestAssertions()
 		local property = test.prop
 		if property ~= nil then
 			local result: registry.PropExecResult? = nil
@@ -244,6 +258,7 @@ local function runTest(
 				function() result = property.exec(runOptions, registry.isolateDepth == 0) end,
 				timeout
 			)
+			tracker = registry.endTestAssertions()
 			if not ok then
 				failure = errorText(err)
 			elseif result ~= nil and not result.ok then
@@ -255,7 +270,15 @@ local function runTest(
 			end
 		else
 			local ok, err = invoke(function() test.fn(ctx) end, timeout)
+			tracker = registry.endTestAssertions()
 			if not ok then failure = errorText(err) end
+		end
+
+		if failure == nil and tracker ~= nil and tracker.count == 0 and test.smoke ~= true and test.prop == nil then
+			zeroAssertion = true
+			if opts.strictAssertions == true then
+				failure = "test executed 0 assertions (add an assertion or mark { smoke = true })"
+			end
 		end
 
 		local postHook = registry.getPostTestHook()
@@ -281,7 +304,8 @@ local function runTest(
 
 	state.deferred, state.inlineSeeds = outerDeferred, outerSeeds
 	endEnvScope()
-	return failure, detail, seed, inlineSeeds
+	local tautologies = if tracker ~= nil and #tracker.tautologies > 0 then tracker.tautologies else EMPTY_TAUTOLOGIES
+	return failure, detail, seed, inlineSeeds, zeroAssertion, tautologies
 end
 
 type Outcome = {
@@ -291,6 +315,8 @@ type Outcome = {
 	detail: string?,
 	seed: number?,
 	inlineSeeds: { [string]: number },
+	zeroAssertion: boolean,
+	tautologies: { TautologyRecord },
 	ms: number,
 }
 
@@ -379,6 +405,8 @@ local function execute(
 		end
 		local clock = os.clock()
 		local detail: string?, seed: number?, inlineSeeds: { [string]: number } = nil, nil, {}
+		local zeroAssertion = false
+		local tautologies: { TautologyRecord } = EMPTY_TAUTOLOGIES
 		if failure == nil then
 			state.running = {
 				name = test.name,
@@ -386,7 +414,7 @@ local function execute(
 				target = test.target,
 				last = withLast and lastOfFile[test.file] == position,
 			}
-			failure, detail, seed, inlineSeeds = runTest(test, chain, opts)
+			failure, detail, seed, inlineSeeds, zeroAssertion, tautologies = runTest(test, chain, opts)
 			state.running = nil
 		end
 		for c = #chain, 1, -1 do
@@ -404,6 +432,8 @@ local function execute(
 				detail = detail,
 				seed = seed,
 				inlineSeeds = inlineSeeds,
+				zeroAssertion = zeroAssertion,
+				tautologies = tautologies,
 				ms = math.round((os.clock() - clock) * 1000),
 			})
 		then
@@ -501,7 +531,7 @@ local function fileMatches(testFile: string, wantedFiles: { string }): boolean
 	return false
 end
 
-local function selector(opts: RunOptions): (Shard?, (Test) -> boolean)
+local function selector(opts: RunOptions): (Shard?, (Test) -> boolean, (name: string, file: string) -> boolean)
 	local filters = if opts.filters ~= nil and #opts.filters > 0 then opts.filters else nil
 	local lowerFilter = if opts.filter ~= nil then string.lower(opts.filter) else nil
 	local grep = opts.grep
@@ -534,15 +564,11 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean)
 		elseif opts.shard == true or (opts.shard == nil and not explicit) then shardInfo.get()
 		else nil
 
-	local function selected(test: Test): boolean
-		if shard ~= nil and not shardInfo.selects(test.name, shard) then return false end
-		local lowerName = string.lower(test.name)
+	local function matchesEntry(name: string, file: string): boolean
+		if shard ~= nil and not shardInfo.selects(name, shard) then return false end
+		local lowerName = string.lower(name)
 		if lowerFilter ~= nil and string.find(lowerName, lowerFilter, 1, true) == nil then return false end
-		if
-			grep ~= nil
-			and lowerGrep ~= nil
-			and not matchesPatternOrSubstring(test.name, lowerName, grep, lowerGrep)
-		then
+		if grep ~= nil and lowerGrep ~= nil and not matchesPatternOrSubstring(name, lowerName, grep, lowerGrep) then
 			return false
 		end
 		if lowerFilters ~= nil then
@@ -555,9 +581,9 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean)
 			end
 			if not any then return false end
 		end
-		if named ~= nil and not named[test.name] then return false end
+		if named ~= nil and not named[name] then return false end
 		if excludeExact ~= nil then
-			if excludeExact[test.name] then return false end
+			if excludeExact[name] then return false end
 			local exactMap: { [any]: boolean } = excludeExact :: any
 			for ex in next, exactMap do
 				if type(ex) == "string" and string.find(lowerName, string.lower(ex), 1, true) ~= nil then
@@ -568,13 +594,15 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean)
 		if
 			excludeQuery ~= nil
 			and lowerExclude ~= nil
-			and matchesPatternOrSubstring(test.name, lowerName, excludeQuery, lowerExclude)
+			and matchesPatternOrSubstring(name, lowerName, excludeQuery, lowerExclude)
 		then
 			return false
 		end
-		return wantedFiles == nil or fileMatches(test.file, wantedFiles)
+		return wantedFiles == nil or fileMatches(file, wantedFiles)
 	end
-	return shard, selected
+
+	local function selected(test: Test): boolean return matchesEntry(test.name, test.file) end
+	return shard, selected, matchesEntry
 end
 
 local function selectionText(opts: RunOptions, shard: Shard?): string
@@ -678,17 +706,17 @@ local function runOrder(opts: RunOptions, mutantRun: boolean): { number }
 	return order
 end
 
-local function listTests(plan: { string }, results: Results, out: (...any) -> ())
+local function listTests(plan: { string }, results: Results, emit: (string) -> ())
 	local listed = 0
 	for index, test in registry.state.tests do
 		if plan[index] ~= "out" and plan[index] ~= "ignore" then
-			out(`[sert-list] {test.file}|{test.name}|{test.target}`)
+			emit(`[sert-list] {test.file}|{test.name}|{test.target}`)
 			listed += 1
 		end
 	end
-	out(`[sert-list] end {listed}`)
+	emit(`[sert-list] end {listed}`)
 	results.skipped, results.total = listed, listed
-	out(`[sert-done] {format.json(results)}`)
+	emit(`[sert-done] {format.json(results)}`)
 end
 
 local function runBatch(batch: { number }, order: { number }, plan: { string }, opts: RunOptions, results: Results)
@@ -751,11 +779,12 @@ local function runSelection(
 	results: Results,
 	timings: { { name: string, file: string, ms: number } },
 	out: (...any) -> (),
-	shout: (...any) -> ()
+	shout: (...any) -> (),
+	emitMarker: (string) -> ()
 )
 	local function marker(test: Test, status: string, ms: number, failure: string?)
 		if opts.markers then
-			out(`[sert-test] {format.json({
+			emitMarker(`[sert-test] {format.json({
 				name = test.name,
 				file = test.file,
 				target = test.target,
@@ -767,6 +796,7 @@ local function runSelection(
 		end
 	end
 
+	local seenZeroAssertion: { [string]: boolean } = {}
 	local repeats = math.max(1, opts.repeatCount or 1)
 	for iteration = 1, repeats do
 		local iterSuffix = if repeats > 1 then ` (iter {iteration}/{repeats})` else ""
@@ -779,10 +809,19 @@ local function runSelection(
 			function(outcome: Outcome): boolean
 				local test, failure = outcome.test, outcome.failure
 				table.insert(timings, { name = test.name .. iterSuffix, file = test.file, ms = outcome.ms })
+				if outcome.zeroAssertion and not seenZeroAssertion[test.name] then
+					seenZeroAssertion[test.name] = true
+					table.insert(results.zeroAssertionTests, test.name)
+				end
+				if iteration == 1 and #outcome.tautologies > 0 then
+					for _, taut in outcome.tautologies do
+						table.insert(results.tautologies, taut)
+					end
+				end
 				if failure ~= nil then
 					for key, seed in next, outcome.inlineSeeds do
 						results.seeds[key] = seed
-						out(`[sert-seed] {key}|{seed}`)
+						emitMarker(`[sert-seed] {key}|{seed}`)
 					end
 				end
 				if failure == nil then
@@ -806,7 +845,7 @@ local function runSelection(
 				end
 				if outcome.seed ~= nil then
 					results.seeds[test.name] = outcome.seed
-					out(`[sert-seed] {test.name}|{outcome.seed}`)
+					emitMarker(`[sert-seed] {test.name}|{outcome.seed}`)
 				end
 				marker(test, "fail", outcome.ms, failure)
 				if opts.failFast == true then
@@ -824,6 +863,16 @@ local function runSelection(
 							results.skippedRoblox += 1
 							results.skippedRtest += 1
 						end
+						local reason = registry.skipReason(test)
+						if reason == "explicit" then
+							results.skippedByReason.explicit += 1
+						elseif reason == "server" then
+							results.skippedByReason.server += 1
+						elseif reason == "client" then
+							results.skippedByReason.client += 1
+						else
+							results.skippedByReason.roblox += 1
+						end
 						if test.mode == "skip" and not opts.exhaustive then out(`🟡 {test.name}`) end
 						marker(test, "skip", 0)
 					end
@@ -837,6 +886,196 @@ local function runSelection(
 			shout(`❌ {afterErr}`)
 		end
 		if stoppedEarly then break end
+	end
+end
+
+local function percentile(sorted: { number }, p: number): number
+	local n = #sorted
+	if n == 0 then return 0 end
+	if n == 1 then return sorted[1] end
+	local pos = 1 + (n - 1) * p
+	local lo = math.floor(pos)
+	local hi = math.ceil(pos)
+	local frac = pos - lo
+	return sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+end
+
+local function runBenchmarks(
+	opts: RunOptions,
+	matchesEntry: (name: string, file: string) -> boolean,
+	results: Results,
+	out: (...any) -> (),
+	shout: (...any) -> ()
+)
+	local state = registry.state
+	local activeSide = state.side
+	local explicitTargets, hasExplicitTargets = targetSetOf(opts)
+	local timeout = resolveTimeout(opts)
+
+	for _, entry in state.benchmarks do
+		local unfocused = state.benchFocusing and not entry.focused
+		if
+			(activeSide ~= nil and entry.side ~= nil and entry.side ~= activeSide)
+			or (hasExplicitTargets and explicitTargets ~= nil and not explicitTargets[entry.target])
+			or unfocused
+			or not matchesEntry(entry.name, entry.file)
+		then
+			continue
+		end
+		local headlessSkip = not hasExplicitTargets
+			and not IS_ROBLOX
+			and opts.allTargets ~= true
+			and entry.target ~= "portable"
+		if entry.mode == "skip" or headlessSkip then
+			if entry.mode == "skip" then out(`🟡 bench · {entry.name}`) end
+			continue
+		end
+
+		local bOpts = entry.options
+		local warmupCount = if bOpts ~= nil and bOpts.warmup ~= nil then bOpts.warmup else 2
+		local sampleCount = if bOpts ~= nil and bOpts.samples ~= nil then bOpts.samples else 11
+		local fixedIters: number? = if bOpts ~= nil then bOpts.iterations else nil
+		local bytesPerIter = if bOpts ~= nil and bOpts.bytes ~= nil then bOpts.bytes else 0
+
+		local runningTimer = false
+		local timerStart = 0
+		local elapsedSec = 0
+		local iterSamples: { number }? = nil
+		local iterChosen = 1
+		local iterAllocKb = 0
+		local iterCalled = false
+
+		local benchCtx: BenchContext = {
+			bytes = function(_self: BenchContext, n: number)
+				if type(n) == "number" and n >= 0 and n == n then bytesPerIter = n end
+			end,
+			stopTimer = function(_self: BenchContext)
+				if runningTimer then
+					elapsedSec += os.clock() - timerStart
+					runningTimer = false
+				end
+			end,
+			startTimer = function(_self: BenchContext)
+				if not runningTimer then
+					timerStart = os.clock()
+					runningTimer = true
+				end
+			end,
+			iter = function(_self: BenchContext, loopBody: () -> ())
+				if type(loopBody) ~= "function" then error(`bench("{entry.name}"): b:iter expects a function`, 2) end
+				if iterCalled then error(`bench("{entry.name}"): b:iter can only be called once`, 2) end
+				iterCalled = true
+				for _ = 1, warmupCount do
+					loopBody()
+				end
+				local chosen = fixedIters
+				if chosen == nil then
+					local probe = 1
+					while probe < 100000 do
+						local t0 = os.clock()
+						for _ = 1, probe do
+							loopBody()
+						end
+						if os.clock() - t0 >= 0.002 then break end
+						probe *= 2
+					end
+					chosen = probe
+				end
+				local iters = math.max(1, math.floor(chosen :: number))
+				local samples = table.create(sampleCount, 0)
+				for s = 1, sampleCount do
+					elapsedSec = 0
+					runningTimer = true
+					timerStart = os.clock()
+					for _ = 1, iters do
+						loopBody()
+					end
+					if runningTimer then
+						elapsedSec += os.clock() - timerStart
+						runningTimer = false
+					end
+					samples[s] = math.max(0, (elapsedSec / iters) * 1e9)
+				end
+				iterAllocKb = perf.allocs(loopBody, 0, math.min(iters, 64))
+				iterChosen = iters
+				iterSamples = samples
+			end,
+		}
+
+		local outerDeferred = state.deferred
+		local pendingDefer: { HookFn } = {}
+		state.deferred = pendingDefer
+		state.running = {
+			name = entry.name,
+			file = entry.file,
+			target = entry.target,
+			last = false,
+		}
+		local ok, err = invoke(function() entry.fn(benchCtx) end, entry.options and entry.options.timeout or timeout)
+		if ok and not iterCalled then
+			local samples = table.create(sampleCount, 0)
+			for s = 1, sampleCount do
+				elapsedSec = 0
+				runningTimer = true
+				timerStart = os.clock()
+				local sOk, sErr = invoke(
+					function() entry.fn(benchCtx) end,
+					entry.options and entry.options.timeout or timeout
+				)
+				if runningTimer then
+					elapsedSec += os.clock() - timerStart
+					runningTimer = false
+				end
+				if not sOk then
+					ok, err = false, sErr
+					break
+				end
+				samples[s] = math.max(0, elapsedSec * 1e9)
+			end
+			if ok then
+				iterAllocKb = perf.allocs(function() entry.fn(benchCtx) end, 0, math.min(sampleCount, 16))
+				iterSamples = samples
+			end
+		end
+		state.running = nil
+		local deferErr = drain(pendingDefer, timeout)
+		state.deferred = outerDeferred
+
+		if not ok or deferErr ~= nil then
+			local errMsg = appendError(if not ok then errorText(err) else nil, deferErr) or "benchmark failed"
+			results.failed += 1
+			table.insert(results.failures, `bench {entry.name}: {errMsg}`)
+			shout(`❌ bench · {entry.name}\n   ⚠️ {errMsg}`)
+			continue
+		end
+
+		local samples = iterSamples :: { number }
+		table.sort(samples)
+		local medianNs = percentile(samples, 0.5)
+		local iqrNs = math.max(0, percentile(samples, 0.75) - percentile(samples, 0.25))
+		local opsPerSec = if medianNs > 0 then 1e9 / medianNs else 0
+		local payload: { [string]: any } = {
+			name = entry.name,
+			file = entry.file,
+			iterations = iterChosen,
+			samples = #samples,
+			medianNs = medianNs,
+			iqrNs = iqrNs,
+			opsPerSec = opsPerSec,
+			allocKb = iterAllocKb,
+		}
+		if bytesPerIter > 0 then payload.bytes = bytesPerIter end
+		output.marker(`[sert-x:bench] {format.json(payload)}`)
+		out(
+			string.format(
+				"⚡ bench · %s · %d iters · %.1f ns/op · %.0f ops/s · %.3f KB/op",
+				entry.name,
+				iterChosen,
+				medianNs,
+				opsPerSec,
+				iterAllocKb
+			)
+		)
 	end
 end
 
@@ -876,6 +1115,11 @@ function runner.run(options: RunOptions?): Results
 	local isQuiet = opts.quiet == true or opts.silent == true
 	local out: (...any) -> () = if isQuiet then function() end else output.print
 	local shout: (...any) -> () = if isQuiet then function() end else output.warn
+	local emitMarker: (string) -> () = if opts.silent == true
+		then function(_line: string) end
+		elseif opts.markers == true then output.marker
+		elseif not isQuiet then function(line: string) out(line) end
+		else function(_line: string) end
 
 	local results: Results = {
 		passed = 0,
@@ -883,6 +1127,9 @@ function runner.run(options: RunOptions?): Results
 		skipped = 0,
 		skippedRoblox = 0,
 		skippedRtest = 0,
+		skippedByReason = registry.emptySkippedByReason(),
+		zeroAssertionTests = format.array({}),
+		tautologies = format.array({}),
 		todo = 0,
 		total = #tests,
 		clock = 0,
@@ -905,23 +1152,24 @@ function runner.run(options: RunOptions?): Results
 		table.insert(results.failures, message)
 		shout(`❌ {message}`)
 		settle()
-		if opts.markers or not isQuiet then out(`[sert-done] {format.json(results)}`) end
+		emitMarker(`[sert-done] {format.json(results)}`)
 		if opts.raise ~= false then error(message, 0) end
 		return results
 	end
 
-	local shard, selected = selector(opts)
+	local shard, selected, matchesEntry = selector(opts)
 	local plan, properties, focusedRan = planTests(opts, selected, shard)
 	if opts.list then
-		listTests(plan, results, out)
+		listTests(plan, results, emitMarker)
 		finish()
 		return results
 	end
 
 	local isSharded = (shard ~= nil and (shard.count or 1) > 1) or (opts :: any)._specSharded == true
-	if #tests == 0 then
+	local onlyBenchmarks = #tests == 0 and opts.bench == true and #state.benchmarks > 0
+	if #tests == 0 and not onlyBenchmarks then
 		if isSharded then
-			out(`[sert-done] {format.json(results)}`)
+			emitMarker(`[sert-done] {format.json(results)}`)
 			finish()
 			return results
 		end
@@ -930,13 +1178,14 @@ function runner.run(options: RunOptions?): Results
 
 	local selection = selectionText(opts, shard)
 	local runtime = if IS_ROBLOX then "Roblox" else "Luau CLI"
-	local focusTag = if state.focusing then " · FOCUS" else ""
+	local focusTag = if state.focusing or (opts.bench == true and state.benchFocusing) then " · FOCUS" else ""
 	out(`sert · {#tests} {if #tests == 1 then "test" else "tests"} · {runtime}{focusTag}{selection}`)
 
 	results.total -= countStep(plan, "ignore")
-	if properties and not opts.exhaustive then out(`[sert-seed] run {opts.seed or DEFAULT_SEED_BASE}`) end
+	if properties and not opts.exhaustive then emitMarker(`[sert-seed] run {opts.seed or DEFAULT_SEED_BASE}`) end
 	if
-		opts.requireTests
+		not onlyBenchmarks
+		and opts.requireTests
 		and not isSharded
 		and results.total > 0
 		and not table.find(plan, "run")
@@ -958,10 +1207,15 @@ function runner.run(options: RunOptions?): Results
 	end
 
 	local timings: { { name: string, file: string, ms: number } } = {}
-	runSelection(order, plan, opts, results, timings, out, shout)
+	if not onlyBenchmarks then runSelection(order, plan, opts, results, timings, out, shout, emitMarker) end
+	if opts.bench == true and #state.benchmarks > 0 then runBenchmarks(opts, matchesEntry, results, out, shout) end
 
 	-- Enforce CI `.focus` gate when any focused test ran under CI without `allowFocused`.
-	if (focusedRan or state.focusing) and detectCi(opts) and opts.allowFocused ~= true then
+	if
+		(focusedRan or state.focusing or (opts.bench == true and state.benchFocusing))
+		and detectCi(opts)
+		and opts.allowFocused ~= true
+	then
 		local ciMsg = "focused test (.focus) ran while CI is enabled (pass --allow-focused to override)"
 		results.failed += 1
 		table.insert(results.failures, ciMsg)
@@ -998,7 +1252,7 @@ function runner.run(options: RunOptions?): Results
 		`\n{results.passed} passed · {results.failed} failed · {results.skipped - unselected} skipped{robloxNote}{notSelected}`
 			.. ` · {math.round(results.clock * 1000)} ms`
 	)
-	out(`[sert-done] {format.json(results)}`)
+	emitMarker(`[sert-done] {format.json(results)}`)
 
 	if results.failed > 0 and opts.raise ~= false then error(`{results.failed} of {results.total} tests failed`, 0) end
 	return results
@@ -1014,7 +1268,8 @@ end
 
 local KNOWN_FLAGS = "--filter, --grep/-g, --exclude, --file, --seed, --replay, --runs, --budget, --test-timeout, "
 	.. "--repeat, --slowest, --exhaustive, --list, --markers, --quiet, --silent, --compact, --ci, --allow-focused, "
-	.. "--all, --no-sweep, -x/--fail-fast, --mutant, --mutants, --shard"
+	.. "--all, --no-sweep, -x/--fail-fast, --mutant, --mutants, --shard, --update-snapshots/-u, "
+	.. "--strict-assertions, --bench"
 
 local NUMERIC_FLAGS: { [string]: string } = {
 	seed = "seed",
@@ -1035,6 +1290,9 @@ local SWITCH_FLAGS: { [string]: string } = {
 	ci = "ci",
 	["allow-focused"] = "allowFocused",
 	all = "allTargets",
+	["update-snapshots"] = "updateSnapshots",
+	["strict-assertions"] = "strictAssertions",
+	bench = "bench",
 }
 
 local function failCli(message: string): never error(`sert.parseCliArgs: {message}`, 0) end
@@ -1062,6 +1320,9 @@ function runner.parseCliArgs(...: any): RunOptions
 			continue
 		elseif arg == "-x" then
 			opts.failFast = true
+			continue
+		elseif arg == "-u" then
+			opts.updateSnapshots = true
 			continue
 		elseif arg == "-g" then
 			local nextArg = raw[i]
@@ -1111,6 +1372,7 @@ function runner.parseCliArgs(...: any): RunOptions
 		elseif SWITCH_FLAGS[flag] ~= nil then
 			if value ~= nil then failCli(`--{flag} takes no value, got "{value}"`) end
 			opts[SWITCH_FLAGS[flag]] = true
+			if flag == "silent" then opts.silent = true end
 		elseif flag == "filter" then
 			setFilter(takeValue())
 		elseif flag == "grep" then

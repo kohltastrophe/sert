@@ -37,6 +37,12 @@ local EXPECTED_PUBLIC_KEYS: { string } = {
 	"doesNotThrow",
 	"fail",
 	"waitFor",
+	"inlineSnapshot",
+	"snapshot",
+	"allocs",
+	"maxAllocs",
+	"noAllocs",
+	"bench",
 	"any",
 	"subset",
 	"within",
@@ -109,7 +115,7 @@ sert.describe("sert public surface", function()
 		sert.eq(sert("ok"), "ok")
 		sert.eq(sert(0), 0)
 		local tbl = { x = 1 }
-		sert.eq(sert(tbl), tbl)
+		sert.ok(rawequal(sert(tbl), tbl))
 
 		local errFalse = sert.throws(function() sert(false, "custom false message") end, "custom false message")
 		sert.contains(errFalse, "custom false message")

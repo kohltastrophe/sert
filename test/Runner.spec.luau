@@ -400,6 +400,14 @@ sert.describe("CI focus gate, filtering, sharding, and parseCliArgs", function()
 				shard = { name = "prefix", index = 1, count = 1, only = { "alpha:" }, except = { "alpha: fast_2" } },
 			})
 			sert.eq(prefixShard.passed, 1)
+
+			runner.shard.set({ name = "override", index = 1, count = 2, only = { "alpha:" } })
+			sert.eq((runner.shard.get() :: any).name, "override")
+			sert.eq(runner.shard.selects("alpha: fast_1"), true)
+			sert.eq(runner.shard.selects("beta: 1"), false)
+			runner.shard.set(nil, true)
+			sert.eq(runner.shard.get(), nil)
+			runner.shard.set(nil)
 		end
 	)
 
@@ -547,6 +555,32 @@ sert.describe("CLI flag edges, output modes, selection arrays, and chained modif
 		sert.contains(listText, "|item two|roblox")
 		sert.contains(listText, "[sert-list] end 3")
 		sert.contains(listText, "[sert-done]")
+
+		-- `quiet = true, markers = true` suppresses human output while keeping machine markers; `silent = true` suppresses all.
+		local quietMarkerLines = sert.capture(function()
+			local qRes = runIsolated(function()
+				sert.test("quiet marked", function()
+					local okVal = 1
+					sert.eq(okVal, 1)
+				end)
+			end, { quiet = true, markers = true })
+			sert.eq(qRes.passed, 1)
+		end)
+		local quietMarkerText = table.concat(quietMarkerLines, "\n")
+		sert.eq(string.find(quietMarkerText, "✅ quiet marked", 1, true), nil)
+		sert.contains(quietMarkerText, "[sert-test]")
+		sert.contains(quietMarkerText, "[sert-done]")
+
+		local silentMarkerLines = sert.capture(function()
+			local sRes = runIsolated(function()
+				sert.test("silent marked", function()
+					local okVal = 1
+					sert.eq(okVal, 1)
+				end)
+			end, { silent = true, markers = true })
+			sert.eq(sRes.passed, 1)
+		end)
+		sert.eq(#silentMarkerLines, 0)
 
 		-- `--compact` suppresses `✅` pass lines while keeping failures, `--slowest 3`, and `--markers`.
 		local compactOut = sert.capture(function()

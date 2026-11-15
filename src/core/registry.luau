@@ -55,6 +55,65 @@ export type RunOptions = {
 	requireTests: boolean?,
 	mutant: number?,
 	mutants: { number }?,
+	updateSnapshots: boolean?,
+	strictAssertions: boolean?,
+	regressions: { [string]: { string } }?,
+	snapshots: { [string]: { [string]: string } }?,
+	bench: boolean?,
+}
+
+export type SkipReason = "explicit" | "roblox" | "server" | "client"
+export type SkippedByReason = {
+	explicit: number,
+	roblox: number,
+	server: number,
+	client: number,
+}
+
+export type TautologyRecord = {
+	test: string,
+	kind: string,
+	reason: string,
+	file: string?,
+}
+
+export type AssertionTracker = {
+	count: number,
+	kinds: { [string]: number },
+	tautologies: { TautologyRecord },
+	inlineOrdinals: { [string]: number },
+	fileOrdinal: number,
+}
+
+export type BenchContext = {
+	iter: (self: BenchContext, fn: () -> ()) -> (),
+	stopTimer: (self: BenchContext) -> (),
+	startTimer: (self: BenchContext) -> (),
+	bytes: (self: BenchContext, n: number) -> (),
+}
+
+export type BenchOptions = typeof(table.freeze({} :: {
+	target: Target?,
+	skip: boolean?,
+	focus: boolean?,
+	file: string?,
+	timeout: number?,
+	warmup: number?,
+	samples: number?,
+	iterations: number?,
+	bytes: number?,
+}))
+
+export type BenchEntry = {
+	name: string,
+	fn: (b: BenchContext) -> (),
+	mode: Mode,
+	target: Target,
+	focused: boolean,
+	file: string,
+	side: string?,
+	options: BenchOptions?,
+	scopes: { Scope },
 }
 
 export type TestContext = typeof(table.freeze({} :: {
@@ -73,6 +132,8 @@ export type TestOptions = typeof(table.freeze({} :: {
 	focus: boolean?,
 	file: string?,
 	target: Target?,
+	smoke: boolean?,
+	tags: { string }?,
 }))
 
 export type DescribeOptions = typeof(table.freeze({} :: {
@@ -126,6 +187,8 @@ export type Test = {
 	file: string,
 	side: string?,
 	timeout: number?,
+	smoke: boolean?,
+	tags: { string }?,
 	prop: PropAttachment?,
 	scopes: { Scope },
 }
@@ -216,6 +279,9 @@ export type State = {
 	loaded: { HookFn },
 	options: RunOptions?,
 	inlineSeeds: { [string]: number }?,
+	assertions: AssertionTracker?,
+	benchmarks: { BenchEntry },
+	benchFocusing: boolean,
 }
 
 -- selene: allow(global_usage)
@@ -282,6 +348,9 @@ local function freshState(): State
 		loaded = {},
 		options = nil,
 		inlineSeeds = nil,
+		assertions = nil,
+		benchmarks = {},
+		benchFocusing = false,
 	}
 end
 
@@ -356,6 +425,18 @@ function output.capture<T...>(fn: (T...) -> ...any, ...: T...): { string }
 	return lines
 end
 
+--- Emits a structured marker line, bypassing `output.quiet` while honoring active `output.capture` sinks.
+function output.marker(line: string)
+	for index = #sinks, 1, -1 do
+		local sink = sinks[index]
+		if sink ~= NOOP_SINK then
+			sink("print", line)
+			return
+		end
+	end
+	print(line)
+end
+
 function output.depth(): number return #sinks end
 
 function output.trim(depth: number)
@@ -376,16 +457,20 @@ local registry = {
 	isolateDepth = 0,
 }
 
+local stateStack: { State } = {}
+
 --- Creates a fresh, isolated registry `State`.
 function registry.newState(): State return freshState() end
 
 --- Executes `fn` against `nextState` and restores the previous registry `State` afterward.
 function registry.withState<T...>(nextState: State, fn: () -> T...): T...
 	local prev = activeState
+	table.insert(stateStack, prev)
 	activeState = nextState
 	registry.state = nextState
 	local callable: () -> ...any = fn :: any
 	local results = table.pack(pcall(callable))
+	table.remove(stateStack)
 	activeState = prev
 	registry.state = prev
 	if not results[1] then error(results[2], 0) end
@@ -434,13 +519,58 @@ local function specFile(): string
 	return "?"
 end
 
-local TEST_OPTIONS = { "file", "focus", "skip", "target", "timeout" }
+local TEST_OPTIONS = { "file", "focus", "skip", "smoke", "tags", "target", "timeout" }
 local DESCRIBE_OPTIONS = { "file", "focus", "separator", "skip", "target" }
+local BENCH_OPTIONS = { "bytes", "file", "focus", "iterations", "samples", "skip", "target", "timeout", "warmup" }
+local RUN_OPTIONS = {
+	"allTargets",
+	"allowFocused",
+	"bench",
+	"budget",
+	"ci",
+	"command",
+	"compact",
+	"exclude",
+	"excludes",
+	"exhaustive",
+	"failFast",
+	"file",
+	"files",
+	"filter",
+	"filters",
+	"grep",
+	"list",
+	"markers",
+	"mutant",
+	"mutants",
+	"names",
+	"quiet",
+	"raise",
+	"regressions",
+	"repeatCount",
+	"replay",
+	"requireTests",
+	"runs",
+	"seed",
+	"seeds",
+	"shard",
+	"silent",
+	"slowest",
+	"snapshots",
+	"strictAssertions",
+	"sweep",
+	"targets",
+	"testTimeout",
+	"timeout",
+	"updateSnapshots",
+}
 local VALID_TARGETS: { [string]: boolean } = { portable = true, roblox = true, server = true, client = true }
 local SETUP_HOOKS = { "afterAll", "afterEach", "beforeAll", "beforeEach" }
 
 registry.TEST_OPTIONS = TEST_OPTIONS
 registry.DESCRIBE_OPTIONS = DESCRIBE_OPTIONS
+registry.BENCH_OPTIONS = BENCH_OPTIONS
+registry.RUN_OPTIONS = RUN_OPTIONS
 
 local function label(apiName: string, name: any): string
 	return if type(name) == "string" then `sert.{apiName}("{name}")` else `sert.{apiName}`
@@ -491,19 +621,18 @@ local NOOP_DESCRIBE = function() end
 
 local function fileKey(file: string, side: string?): string return if side ~= nil then `{side}/{file}` else file end
 
-function registry.registerEntry(
-	name: string,
-	fn: TestFn,
+local function resolveRegistration(
 	mode: Mode,
 	explicitTarget: Target?,
 	explicitFocus: boolean,
-	options: TestOptions?,
-	propInfo: PropAttachment?
-): Test
-	if activeState.running ~= nil then error("cannot register a new test inside a running test", util.outside()) end
+	skipOpt: boolean?,
+	focusOpt: boolean?,
+	targetOpt: Target?,
+	fileOpt: string?
+): (Mode, Target, boolean, string)
 	local effectiveMode: Mode = mode
-	local focused = explicitFocus or (options ~= nil and options.focus == true)
-	if options ~= nil and options.skip == true then effectiveMode = "skip" end
+	local focused = explicitFocus or (focusOpt == true)
+	if skipOpt == true then effectiveMode = "skip" end
 
 	local inheritedTarget: Target? = nil
 	local scopeFile: string? = nil
@@ -517,14 +646,50 @@ function registry.registerEntry(
 		if scope.file ~= nil then scopeFile = scope.file end
 	end
 
-	local optTarget: Target? = if options ~= nil then options.target else nil
-	local finalTarget: Target = explicitTarget or optTarget or inheritedTarget or "portable"
-	if focused and effectiveMode ~= "skip" then activeState.focusing = true end
-
-	local namedFile: string? = if options ~= nil and options.file ~= nil then options.file else scopeFile
+	local finalTarget: Target = explicitTarget or targetOpt or inheritedTarget or "portable"
+	local namedFile: string? = if fileOpt ~= nil then fileOpt else scopeFile
 	local file: string = if type(namedFile) == "string" then registry.normalizeSpecFile(namedFile) else specFile()
 	maybeInstallCallerGlobals()
 	activeState.testFiles[fileKey(file, activeState.side)] = true
+	return effectiveMode, finalTarget, focused, file
+end
+
+local function cloneTags(rawTags: any, testName: string): { string }?
+	if rawTags == nil then return nil end
+	if type(rawTags) ~= "table" then
+		error(`{label("test", testName)}: tags must be a table of strings, got {util.typeof(rawTags)}`, util.outside())
+	end
+	local copy: { string } = {}
+	for index, tag in rawTags :: { [any]: any } do
+		if type(index) ~= "number" or type(tag) ~= "string" then
+			error(`{label("test", testName)}: tags[{tostring(index)}] must be a string`, util.outside())
+		end
+		copy[index] = tag
+	end
+	return copy
+end
+
+function registry.registerEntry(
+	name: string,
+	fn: TestFn,
+	mode: Mode,
+	explicitTarget: Target?,
+	explicitFocus: boolean,
+	options: TestOptions?,
+	propInfo: PropAttachment?
+): Test
+	if activeState.running ~= nil then error("cannot register a new test inside a running test", util.outside()) end
+	local skipOpt: boolean? = if options ~= nil then options.skip else nil
+	local focusOpt: boolean? = if options ~= nil then options.focus else nil
+	local targetOpt: Target? = if options ~= nil then options.target else nil
+	local fileOpt: string? = if options ~= nil then options.file else nil
+	if options ~= nil and options.smoke ~= nil and type(options.smoke) ~= "boolean" then
+		error(`{label("test", name)}: smoke must be a boolean, got {util.typeof(options.smoke)}`, util.outside())
+	end
+	local tagsCopy: { string }? = if options ~= nil then cloneTags(options.tags, name) else nil
+	local effectiveMode: Mode, finalTarget: Target, focused: boolean, file: string =
+		resolveRegistration(mode, explicitTarget, explicitFocus, skipOpt, focusOpt, targetOpt, fileOpt)
+	if focused and effectiveMode ~= "skip" then activeState.focusing = true end
 
 	local entry: Test = {
 		name = qualify(name),
@@ -535,12 +700,129 @@ function registry.registerEntry(
 		file = file,
 		side = activeState.side,
 		timeout = if options ~= nil then options.timeout else nil,
+		smoke = if options ~= nil and options.smoke == true then true else nil,
+		tags = tagsCopy,
 		prop = propInfo,
 		scopes = table.clone(activeState.scopes),
 	}
 	if propInfo ~= nil then propInfo.name = entry.name end
 	table.insert(activeState.tests, entry)
 	return entry
+end
+
+--- Registers a benchmark separately from tests so standard `sert run` does not execute it unless `RunOptions.bench == true`.
+function registry.registerBench(name: string, fn: (b: BenchContext) -> (), opts: BenchOptions?): BenchEntry
+	if activeState.running ~= nil then
+		error("cannot register a new benchmark inside a running test", util.outside())
+	end
+	registry.checkName("bench", name)
+	registry.checkFn("bench", name, fn, opts, "(name, fn, opts?)")
+	registry.checkKeys(label("bench", name), "option", opts, BENCH_OPTIONS)
+	if opts ~= nil then checkTargetOption(label("bench", name), opts.target) end
+
+	local skipOpt: boolean? = if opts ~= nil then opts.skip else nil
+	local focusOpt: boolean? = if opts ~= nil then opts.focus else nil
+	local targetOpt: Target? = if opts ~= nil then opts.target else nil
+	local fileOpt: string? = if opts ~= nil then opts.file else nil
+	local effectiveMode: Mode, finalTarget: Target, focused: boolean, file: string =
+		resolveRegistration("run", nil, false, skipOpt, focusOpt, targetOpt, fileOpt)
+	if focused and effectiveMode ~= "skip" then activeState.benchFocusing = true end
+
+	local entry: BenchEntry = {
+		name = qualify(name),
+		fn = fn,
+		mode = effectiveMode,
+		target = finalTarget,
+		focused = focused,
+		file = file,
+		side = activeState.side,
+		options = if opts ~= nil then table.clone(opts) :: any else nil,
+		scopes = table.clone(activeState.scopes),
+	}
+	table.insert(activeState.benchmarks, entry)
+	return entry
+end
+
+--- Begins per-test assertion tracking for the currently executing test.
+function registry.beginTestAssertions(): AssertionTracker
+	local tracker: AssertionTracker = {
+		count = 0,
+		kinds = {},
+		tautologies = {},
+		inlineOrdinals = {},
+		fileOrdinal = 0,
+	}
+	activeState.assertions = tracker
+	return tracker
+end
+
+--- Ends per-test assertion tracking and returns the collected tracker, if any.
+function registry.endTestAssertions(): AssertionTracker?
+	local current = activeState.assertions
+	activeState.assertions = nil
+	return current
+end
+
+--- Returns the active test's assertion tracker (`nil` when no test body is being tracked).
+function registry.activeTestAssertions(): AssertionTracker? return activeState.assertions end
+
+--- Records an assertion invocation (and optional tautology note) against the active test.
+function registry.recordAssertion(kind: string, tautology: string?)
+	local owner: State = activeState
+	local tracker = owner.assertions
+	if tracker == nil then
+		for index = #stateStack, 1, -1 do
+			local stacked = stateStack[index]
+			if stacked.assertions ~= nil then
+				owner = stacked
+				tracker = stacked.assertions
+				break
+			end
+		end
+	end
+	if tracker == nil then return end
+	tracker.count += 1
+	tracker.kinds[kind] = (tracker.kinds[kind] or 0) + 1
+	if tautology ~= nil and tautology ~= "" then
+		local current = owner.running
+		table.insert(tracker.tautologies, {
+			test = if current ~= nil then current.name else "?",
+			kind = kind,
+			reason = tautology,
+			file = if current ~= nil then current.file else nil,
+		})
+	end
+end
+
+--- Returns and increments the 1-indexed call ordinal at `(file, line)` within the active test.
+function registry.nextInlineSnapshotOrdinal(file: string, line: number): number
+	local tracker = activeState.assertions
+	if tracker == nil then return 1 end
+	local key = `{file}:{line}`
+	local nextOrd = (tracker.inlineOrdinals[key] or 0) + 1
+	tracker.inlineOrdinals[key] = nextOrd
+	return nextOrd
+end
+
+--- Returns and increments the 1-indexed file snapshot ordinal within the active test.
+function registry.nextFileSnapshotOrdinal(): number
+	local tracker = activeState.assertions
+	if tracker == nil then return 1 end
+	local nextOrd = tracker.fileOrdinal + 1
+	tracker.fileOrdinal = nextOrd
+	return nextOrd
+end
+
+--- Creates a zeroed `SkippedByReason` counter table.
+function registry.emptySkippedByReason(): SkippedByReason return { explicit = 0, roblox = 0, server = 0, client = 0 } end
+
+--- Maps a skipped `Test` entry to its normalized skip reason key.
+function registry.skipReason(test: Test): SkipReason
+	if test.mode == "skip" then return "explicit" end
+	if test.target == "server" then return "server" end
+	if test.target == "client" then return "client" end
+	if test.target == "roblox" then return "roblox" end
+	return "explicit"
 end
 
 function registry.qualifyName(name: string): string return qualify(name) end

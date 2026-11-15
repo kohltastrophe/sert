@@ -24,12 +24,12 @@ sert.describe("procedural assertions", function()
 		sert.throws(function() sert.fail() end, "explicit assertion failure")
 
 		local nested = { a = { 1, 2, 3 }, buf = sert.bytes.fromHex("0a0b") }
-		sert.eq(sert.eq(nested, { a = { 1, 2, 3 }, buf = sert.bytes.fromHex("0a0b") }), nested)
+		sert.ok(rawequal(sert.eq(nested, { a = { 1, 2, 3 }, buf = sert.bytes.fromHex("0a0b") }), nested))
 		sert.eq(sert.ne({ a = 1 }, { a = 2 }), { a = 1 })
 
 		local eqErr = sert.throws(function() sert.eq({ count = 1 }, { count = 2 }, "mismatch label") end)
 		sert.contains(eqErr, "mismatch label")
-		sert.contains(eqErr, "at .count: expected 2, got 1")
+		sert.contains(eqErr, "actual.count: expected 2, got 1")
 
 		sert.throws(function() sert.ne({ x = 5 }, { x = 5 }, "unexpected match") end, "unexpected match")
 
@@ -92,11 +92,11 @@ sert.describe("procedural assertions", function()
 		sert.throws(function() sert.contains("hello", "missing") end, "missing substring")
 
 		local items = { { id = 1, tag = "a" }, { id = 2, tag = "b" } }
-		sert.eq(sert.contains(items, { id = 2, tag = "b" }), items)
-		sert.eq(sert.contains(items, sert.subset({ tag = "b" })), items)
+		sert.ok(rawequal(sert.contains(items, { id = 2, tag = "b" }), items))
+		sert.ok(rawequal(sert.contains(items, sert.subset({ tag = "b" })), items))
 
 		local map = { owner = "Ada", role = "admin" }
-		sert.eq(sert.contains(map, "admin"), map)
+		sert.ok(rawequal(sert.contains(map, "admin"), map))
 		sert.throws(function() sert.contains(items, { id = 99 }) end, "missing element")
 	end)
 
@@ -425,5 +425,131 @@ sert.describe("spies and spy assertions", function()
 			wait = function() end,
 		})
 		sert.throws(function() timeoutSig:Wait() end, "did not fire within")
+	end)
+end)
+
+sert.describe("assertion tracking, strict assertions, tautologies, and skip reasons", function()
+	sert.test("records assertions per active test across assertion helpers", function()
+		local trackerBefore = registry.activeTestAssertions()
+		sert.ok(trackerBefore ~= nil)
+		local startCount = (trackerBefore :: registry.AssertionTracker).count
+		local s = sert.spy(function(x: number): number return x + 1 end)
+		sert.eq(s(1), 2)
+		sert.called(s)
+		sert.calledTimes(s, 1)
+		sert.calledWith(s, 1)
+		sert.ne(1, 2)
+		sert.lt(1, 2)
+		sert.le(2, 2)
+		sert.gt(3, 2)
+		sert.ge(3, 3)
+		sert.near(1.0, 1.0000001)
+		sert.matches("abc", "^a")
+		sert.contains("abc", "b")
+		sert.doesNotThrow(function() return 1 end)
+		sert.throws(function() sert.fail("expected") end, "expected")
+		local env = sert.env.new()
+		sert.waitFor(function() return true end, 0.1)
+		local _ = env
+		local expectedOne = tonumber("1") :: number
+		sert.equals(1, expectedOne)
+		local trackerAfter = registry.activeTestAssertions() :: registry.AssertionTracker
+		local countAfter = trackerAfter.count
+		local kindsAfter = table.clone(trackerAfter.kinds)
+		sert.eq(startCount, 1)
+		sert.eq(countAfter, startCount + 16)
+		sert.eq(kindsAfter, {
+			ok = 1,
+			eq = 1,
+			called = 1,
+			calledTimes = 1,
+			calledWith = 1,
+			ne = 1,
+			lt = 1,
+			le = 1,
+			gt = 1,
+			ge = 1,
+			near = 1,
+			matches = 1,
+			contains = 1,
+			doesNotThrow = 1,
+			throws = 1,
+			fail = 1,
+			waitFor = 1,
+		})
+	end)
+
+	sert.test("tracks zero-assertion tests, smoke opt-outs, tags, tautologies, and skipByReason", function()
+		local format = require("../src/core/format")
+		local sub = registry.newState()
+		registry.isolateDepth += 1
+		local ok, err = pcall(function()
+			registry.withState(sub, function()
+				local tbl = { x = 1 }
+				local sameTbl = tbl
+				local linearA = sert.env.Enum.EasingStyle.Linear
+				local linearB = sert.env.Enum.EasingStyle.Linear
+				sert.test("zero normal", function() local _v = 1 + 1 end, { tags = { "unit" } })
+				sert.test("smoke test", function() end, { smoke = true })
+				sert.test("tautology test", function()
+					sert.eq(tbl, sameTbl)
+					sert.eq(tbl, sameTbl, "returns same reference intentionally")
+					sert.eq(linearA, linearB)
+				end)
+				sert.test.skip("explicit skip")
+				sert.test.roblox("roblox skip", function() end)
+				sert.test.server("server skip", function() end)
+				sert.test.client("client skip", function() end)
+
+				local badSmoke: any = { smoke = "yes" }
+				local badTags: any = { tags = { 123 } }
+				sert.throws(function()
+					sert.test("bad smoke", function() end, badSmoke)
+				end, "smoke")
+				sert.throws(function()
+					sert.test("bad tags", function() end, badTags)
+				end, "tags")
+
+				local captured: { string } = sert.capture(function()
+					local res = sert.run({ quiet = false, markers = true, raise = false })
+					sert.eq(res.passed, 3)
+					sert.eq(res.failed, 0)
+					sert.eq(res.skipped, 4)
+					sert.eq(res.skippedRoblox, 3)
+					sert.eq(res.skippedByReason, { explicit = 1, roblox = 1, server = 1, client = 1 })
+					sert.eq(res.zeroAssertionTests, { "zero normal" })
+					sert.eq(#res.tautologies, 1)
+					sert.eq(res.tautologies[1].test, "tautology test")
+					sert.eq(res.tautologies[1].kind, "eq")
+				end)
+
+				local doneLine: string? = nil
+				for _, line in captured do
+					local payload = string.match(line, "^%[sert%-done%] (.+)$")
+					if payload ~= nil then doneLine = payload end
+				end
+				sert.ok(doneLine ~= nil)
+				local decoded = format.jsonDecode(doneLine :: string)
+				sert.eq(decoded.skippedByReason, { explicit = 1, roblox = 1, server = 1, client = 1 })
+				sert.eq(decoded.zeroAssertionTests, { "zero normal" })
+				sert.eq(#decoded.tautologies, 1)
+
+				local strictRes = sert.run({ strictAssertions = true, quiet = true, raise = false })
+				sert.eq(strictRes.passed, 2)
+				sert.eq(strictRes.failed, 1)
+				sert.contains(strictRes.failures[1], "zero normal")
+				sert.contains(strictRes.failures[1], "0 assertions")
+			end)
+		end)
+		registry.isolateDepth -= 1
+		if not ok then error(err, 0) end
+
+		local parsed = sert.parseCliArgs("-u", "--strict-assertions", "--bench", "--filter", "alpha")
+		sert.eq(parsed.updateSnapshots, true)
+		sert.eq(parsed.strictAssertions, true)
+		sert.eq(parsed.bench, true)
+		sert.eq(parsed.filter, "alpha")
+		local parsedLong = sert.parseCliArgs("--update-snapshots")
+		sert.eq(parsedLong.updateSnapshots, true)
 	end)
 end)

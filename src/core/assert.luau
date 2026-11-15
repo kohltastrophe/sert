@@ -15,6 +15,28 @@ export type Spy = spy.Spy
 
 local assertions = {}
 
+local function hasIntentionalIdentityNote(msg: string?): boolean
+	if msg == nil then return false end
+	local lower = string.lower(msg)
+	return string.find(lower, "same", 1, true) ~= nil
+		or string.find(lower, "identity", 1, true) ~= nil
+		or string.find(lower, "intentional", 1, true) ~= nil
+		or string.find(lower, "reference", 1, true) ~= nil
+end
+
+local function eqTautologyNote(actual: any, expected: any, msg: string?): string?
+	if
+		type(actual) == "table"
+		and rawequal(actual, expected)
+		and util.doubleTag(actual) == nil
+		and util.typeof(actual) == "table"
+		and not hasIntentionalIdentityNote(msg)
+	then
+		return "sert.eq compared identical table reference (rawequal)"
+	end
+	return nil
+end
+
 local function mismatch(head: string, actual: any, expected: any, raw: boolean?): string
 	local ok, text = pcall(format.diff, actual, expected, raw)
 	if ok and type(text) == "string" and text ~= "" then
@@ -36,12 +58,14 @@ end
 
 --- Asserts that `val` is truthy (`not nil` and `not false`) and returns `val`.
 function assertions.ok<T>(val: T, msg: string?): T
+	registry.recordAssertion("ok")
 	if not val then error(msg or `expected truthy value, got {repr(val)}`, util.outside()) end
 	return (val :: any) :: T
 end
 
 --- Asserts deep equality between `actual` and `expected` (with asymmetric `Matcher` support) and returns `actual`.
 function assertions.eq<T>(actual: T, expected: any, msg: string?): T
+	registry.recordAssertion("eq", eqTautologyNote(actual, expected, msg))
 	if not match.equal(actual, expected) then
 		error(mismatch(msg or "values differ", actual, expected, false), util.outside())
 	end
@@ -50,6 +74,7 @@ end
 
 --- Asserts that `actual` does not match `unexpected` and returns `actual`.
 function assertions.ne<T>(actual: T, unexpected: any, msg: string?): T
+	registry.recordAssertion("ne")
 	if match.equal(actual, unexpected) then
 		error(`{msg or "values equal"}: expected not {repr(unexpected)}, got {repr(actual)}`, util.outside())
 	end
@@ -76,6 +101,7 @@ end
 
 --- Asserts `a < b` and returns `a`.
 function assertions.lt<T>(a: T, b: T, msg: string?): T
+	registry.recordAssertion("lt")
 	checkComparable("lt", a, b)
 	if not ((a :: any) < (b :: any)) then failOrder("<", a, b, msg) end
 	return a
@@ -83,6 +109,7 @@ end
 
 --- Asserts `a <= b` and returns `a`.
 function assertions.le<T>(a: T, b: T, msg: string?): T
+	registry.recordAssertion("le")
 	checkComparable("le", a, b)
 	if not ((a :: any) <= (b :: any)) then failOrder("<=", a, b, msg) end
 	return a
@@ -90,6 +117,7 @@ end
 
 --- Asserts `a > b` and returns `a`.
 function assertions.gt<T>(a: T, b: T, msg: string?): T
+	registry.recordAssertion("gt")
 	checkComparable("gt", a, b)
 	if not ((a :: any) > (b :: any)) then failOrder(">", a, b, msg) end
 	return a
@@ -97,6 +125,7 @@ end
 
 --- Asserts `a >= b` and returns `a`.
 function assertions.ge<T>(a: T, b: T, msg: string?): T
+	registry.recordAssertion("ge")
 	checkComparable("ge", a, b)
 	if not ((a :: any) >= (b :: any)) then failOrder(">=", a, b, msg) end
 	return a
@@ -104,6 +133,7 @@ end
 
 --- Asserts component-wise proximity within `eps` (default `1e-6`) across numbers and Roblox datatypes, returning `actual`.
 function assertions.near<T>(actual: T, expected: T, eps: number?, msg: string?): T
+	registry.recordAssertion("near")
 	local tol = if eps ~= nil then eps else 1e-6
 	local pass, misuse = match.nearCheck(actual, expected, tol)
 	if misuse ~= nil then
@@ -119,6 +149,7 @@ end
 
 --- Asserts that `str` matches Luau pattern `pattern` and returns `str`.
 function assertions.matches(str: string, pattern: string, msg: string?): string
+	registry.recordAssertion("matches")
 	if type(str) ~= "string" then
 		error(`sert.matches: expected string as 1st argument, got {util.typeof(str)}`, util.outside())
 	elseif type(pattern) ~= "string" then
@@ -135,6 +166,7 @@ end
 
 --- Asserts that `haystack` (string, array, or map) contains `needle` (substring, value, or `Matcher`), returning `haystack`.
 function assertions.contains<T>(haystack: T, needle: any, msg: string?): T
+	registry.recordAssertion("contains")
 	local kind = type(haystack)
 	if kind == "string" then
 		local s = (haystack :: any) :: string
@@ -183,6 +215,7 @@ function assertions.throws(
 	patternOrMatcher: (string | Matcher | ((err: any) -> boolean))?,
 	msg: string?
 ): string
+	registry.recordAssertion("throws")
 	if not isCallable(fn) then error(`sert.throws: expected a function, got {util.typeof(fn)}`, util.outside()) end
 	local ok, err = pcall(fn)
 	if ok then error(msg or "expected function to throw, but it succeeded", util.outside()) end
@@ -196,6 +229,7 @@ end
 
 --- Asserts that calling `fn` succeeds without throwing and returns its return values.
 function assertions.doesNotThrow<T...>(fn: () -> T..., msg: string?): T...
+	registry.recordAssertion("doesNotThrow")
 	if not isCallable(fn) then
 		error(`sert.doesNotThrow: expected a function, got {util.typeof(fn)}`, util.outside())
 	end
@@ -209,7 +243,10 @@ function assertions.doesNotThrow<T...>(fn: () -> T..., msg: string?): T...
 end
 
 --- Fails the current test unconditionally with `msg`.
-function assertions.fail(msg: string?): never error(msg or "explicit assertion failure", util.outside()) end
+function assertions.fail(msg: string?): never
+	registry.recordAssertion("fail")
+	error(msg or "explicit assertion failure", util.outside())
+end
 
 local function requireSpy(apiName: string, s: any): Spy
 	if not spy.isSpy(s) then error(`sert.{apiName}: expected a sert.spy, got {util.typeof(s)}`, util.outside()) end
@@ -240,6 +277,7 @@ end
 
 --- Asserts that spy `s` was called at least once.
 function assertions.called(s: Spy, msg: string?)
+	registry.recordAssertion("called")
 	local target = requireSpy("called", s)
 	if target.callCount == 0 then
 		error(`{msg or "spy not called"}: expected spy to have been called at least once`, util.outside())
@@ -248,6 +286,7 @@ end
 
 --- Asserts that spy `s` was called `count` times.
 function assertions.calledTimes(s: Spy, count: number, msg: string?)
+	registry.recordAssertion("calledTimes")
 	local target = requireSpy("calledTimes", s)
 	if type(count) ~= "number" or count ~= math.floor(count) or count < 0 then
 		error(`sert.calledTimes: expected non-negative integer count, got {repr(count)}`, util.outside())
@@ -262,6 +301,7 @@ end
 
 --- Asserts that spy `s` was called at least once with arguments matching `...` (including asymmetric matchers).
 function assertions.calledWith(s: Spy, ...: any)
+	registry.recordAssertion("calledWith")
 	local target = requireSpy("calledWith", s)
 	local wanted = table.pack(...)
 	for i = 1, #target.calls do
@@ -285,6 +325,7 @@ end
 
 --- Polls `pred()` until it returns truthy or `timeout` seconds elapse (default `1`), stepping `sert.env` or `task.wait(interval)`.
 function assertions.waitFor<T>(pred: () -> T?, timeout: number?, interval: number?, msg: string?): T
+	registry.recordAssertion("waitFor")
 	if not isCallable(pred) then
 		error(`sert.waitFor: expected predicate function, got {util.typeof(pred)}`, util.outside())
 	end

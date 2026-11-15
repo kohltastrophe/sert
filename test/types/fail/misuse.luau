@@ -73,3 +73,29 @@ sert.sim.configure({}) -- expect-error
 gen.element({ 1 }) -- expect-error
 gen.listOf(gen.int(1, 2)) -- expect-error
 gen.buffer() -- expect-error
+
+-- Wave 1 & Wave 2: Snapshots & Performance
+sert.inlineSnapshot("a", 123) -- expect-error
+sert.inlineSnapshot("a", "b", 123) -- expect-error
+sert.snapshot("a", 123) -- expect-error
+sert.snapshot("a", "b", 123) -- expect-error
+
+sert.allocs(123) -- expect-error
+sert.allocs(function() end, "bad") -- expect-error
+sert.maxAllocs("ten", function() end) -- expect-error
+sert.maxAllocs(10, "notfn") -- expect-error
+sert.noAllocs(123) -- expect-error
+sert.noAllocs(function() end, 123) -- expect-error
+sert.bench(123, function() end) -- expect-error
+sert.bench("b", "notfn") -- expect-error
+sert.bench("b", function(b: sert.BenchContext) b:iter(123) end) -- expect-error
+sert.bench("b", function(b: sert.BenchContext) b:bytes("many") end) -- expect-error
+sert.bench("b", function() end, { warmup = "fast" }) -- expect-error
+sert.bench("b", function() end, { iterations = "ten" }) -- expect-error
+
+-- Wave 1 & Wave 2: TestOptions, RunOptions, PropOptions & GenContext target/cover/classify
+sert.test("bad smoke", function() end, { smoke = "yes" }) -- expect-error
+sert.test("bad tags", function() end, { tags = { 123 } }) -- expect-error
+sert.run({ updateSnapshots = "yes" }) -- expect-error
+sert.run({ bench = "yes" }) -- expect-error
+sert.run({ regressions = 123 }) -- expect-error

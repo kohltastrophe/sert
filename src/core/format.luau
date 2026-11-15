@@ -199,64 +199,100 @@ local function safeReadField(container: any, key: any, raw: boolean): (boolean, 
 	return false, nil
 end
 
--- Finds the path and note for the first difference between `a` and `b`.
-local function firstDifference(
-	a: any,
-	b: any,
+local MAX_DIFF_LINES = 8
+local MAX_DIFF_SCAN = 1000
+
+type DiffLeaf = {
 	path: { any },
-	seen: { [any]: { [any]: boolean } },
-	raw: boolean
-): ({ any }?, string?)
+	note: string?,
+}
+
+type DiffCollectState = {
+	diffs: { DiffLeaf },
+	total: number,
+	visiting: { [any]: { [any]: boolean } },
+	equalCache: { [any]: { [any]: boolean } },
+}
+
+local function recordDiff(state: DiffCollectState, path: { any }, note: string?)
+	state.total += 1
+	if #state.diffs < MAX_DIFF_LINES then table.insert(state.diffs, { path = table.clone(path), note = note }) end
+end
+
+-- Collects up to `MAX_DIFF_LINES` leaf differences between `a` and `b`, counting additional differences up to `MAX_DIFF_SCAN`.
+local function collectDifferences(a: any, b: any, path: { any }, state: DiffCollectState, raw: boolean)
+	if state.total >= MAX_DIFF_SCAN then return end
+
 	if not raw and isMatcherTable(b) then
 		local checkFn = rawget(b, "check")
 		if type(checkFn) == "function" then
 			local fn = checkFn :: (any, { any }) -> (boolean, { any }?, string?)
 			local pass, subPath, reason = fn(a, path)
-			if pass then return nil, nil end
-			return subPath or table.clone(path), reason
+			if not pass then recordDiff(state, subPath or path, reason) end
+			return
 		end
 	end
 
 	local typeA, typeB = type(a), type(b)
-	if typeA ~= typeB then return table.clone(path), nil end
+	if typeA ~= typeB then
+		recordDiff(state, path, nil)
+		return
+	end
 	if typeA == "number" then
-		if a ~= a and b ~= b then return nil, nil end
-		if a ~= b then return table.clone(path), nil end
-		if raw and a == 0 and 1 / a ~= 1 / b then return table.clone(path), "signed zero mismatch (-0.0 vs +0.0)" end
-		return nil, nil
+		if a ~= a and b ~= b then return end
+		if a ~= b then
+			recordDiff(state, path, nil)
+			return
+		end
+		if raw and a == 0 and 1 / a ~= 1 / b then recordDiff(state, path, "signed zero mismatch (-0.0 vs +0.0)") end
+		return
 	elseif typeA == "vector" then
 		if raw then
 			local va: any, vb: any = a, b
 			local eqX = (va.x == vb.x and (va.x ~= 0 or 1 / va.x == 1 / vb.x)) or (va.x ~= va.x and vb.x ~= vb.x)
 			local eqY = (va.y == vb.y and (va.y ~= 0 or 1 / va.y == 1 / vb.y)) or (va.y ~= va.y and vb.y ~= vb.y)
 			local eqZ = (va.z == vb.z and (va.z ~= 0 or 1 / va.z == 1 / vb.z)) or (va.z ~= va.z and vb.z ~= vb.z)
-			return if eqX and eqY and eqZ then nil else table.clone(path), nil
+			if not (eqX and eqY and eqZ) then recordDiff(state, path, nil) end
+			return
 		end
-		return if a == b then nil else table.clone(path), nil
+		if a ~= b then recordDiff(state, path, nil) end
+		return
 	end
 
-	if if raw then rawequal(a, b) else a == b then return nil, nil end
+	if if raw then rawequal(a, b) else a == b then return end
 
 	if typeA == "buffer" then
-		if bytes.equal(a, b) then return nil, nil end
-		return table.clone(path), bytes.diff(a, b)
+		if not bytes.equal(a, b) then recordDiff(state, path, bytes.diff(a, b)) end
+		return
 	elseif typeA ~= "table" then
-		return if raw and a == b then nil else table.clone(path), nil
+		if not (raw and a == b) then recordDiff(state, path, nil) end
+		return
 	end
 
 	if not raw and (getmetatable(a) ~= nil or getmetatable(b) ~= nil) then
-		if util.doubleTag(a) ~= nil or util.doubleTag(b) ~= nil then return table.clone(path), nil end
-		return table.clone(path),
-			"tables with metatables compare by identity or __eq; use sert.exact(expected) to compare raw fields"
+		if util.doubleTag(a) ~= nil or util.doubleTag(b) ~= nil then
+			recordDiff(state, path, nil)
+		else
+			recordDiff(
+				state,
+				path,
+				"tables with metatables compare by identity or __eq; use sert.exact(expected) to compare raw fields"
+			)
+		end
+		return
 	end
 
-	local seenA = seen[a]
-	if seenA ~= nil then
-		if seenA[b] then return nil, nil end
-		seenA[b] = true
-	else
-		seen[a] = { [b] = true }
+	local visitingA = state.visiting[a]
+	if visitingA ~= nil and visitingA[b] then return end
+	local cachedA = state.equalCache[a]
+	if cachedA ~= nil and cachedA[b] then return end
+
+	if visitingA == nil then
+		visitingA = {}
+		state.visiting[a] = visitingA
 	end
+	visitingA[b] = true
+	local beforeTotal = state.total
 
 	local keys, present: { [any]: boolean } = sortedKeys(b), {}
 	for _, key in keys do
@@ -267,24 +303,27 @@ local function firstDifference(
 	end
 	table.sort(keys, keyBefore)
 	for _, key in keys do
+		if state.total >= MAX_DIFF_SCAN then break end
 		table.insert(path, key)
 		local _, valA = safeReadField(a, key, raw)
 		local _, valB = safeReadField(b, key, raw)
-		local where, note = firstDifference(valA, valB, path, seen, raw)
-		if where ~= nil then return where, note end
+		collectDifferences(valA, valB, path, state, raw)
 		table.remove(path)
 	end
-	return nil, nil
+
+	visitingA[b] = nil
+	if state.total == beforeTotal then
+		local eqA = state.equalCache[a]
+		if eqA == nil then
+			eqA = {}
+			state.equalCache[a] = eqA
+		end
+		eqA[b] = true
+	end
 end
 
---- Returns the path and values of the first difference between `actual` and `expected`, or `nil` when equal.
-function format.diff(actual: any, expected: any, raw: boolean?): string?
-	local isRaw = raw == true
-	local path, note = firstDifference(actual, expected, {}, {}, isRaw)
-	if path == nil then return nil end
-
+local function resolveLeafValues(actual: any, expected: any, path: { any }, isRaw: boolean): (any, any)
 	local here, there = actual, expected
-	local resolvedDepth = 0
 	for _, key in path do
 		local okHere, nextHere = safeReadField(here, key, isRaw)
 		local okThere, nextThere = safeReadField(there, key, isRaw)
@@ -300,17 +339,41 @@ function format.diff(actual: any, expected: any, raw: boolean?): string?
 		if not okHere and not okThere then break end
 		if okHere then here = nextHere end
 		if okThere then there = nextThere end
-		resolvedDepth += 1
 	end
+	return here, there
+end
 
-	local shownPath = if resolvedDepth < #path then path else path
-	local where = if #shownPath > 0 then `at {pathText(shownPath)}: ` else ""
-	local lines = {
-		`{where}expected {format.repr(there)}, got {format.repr(here)}{if note and note ~= "" then ` ({note})` else ""}`,
+--- Returns up to 8 leaf path differences between `actual` and `expected`, or `nil` when equal.
+function format.diff(actual: any, expected: any, raw: boolean?): string?
+	local isRaw = raw == true
+	local state: DiffCollectState = {
+		diffs = {},
+		total = 0,
+		visiting = {},
+		equalCache = {},
 	}
-	if #shownPath > 0 then
-		table.insert(lines, `  expected: {render(expected, 1, DIFF_LIMITS, shownPath, 1, {})}`)
-		table.insert(lines, `  actual:   {render(actual, 1, DIFF_LIMITS, shownPath, 1, {})}`)
+	collectDifferences(actual, expected, {}, state, isRaw)
+	if #state.diffs == 0 then return nil end
+
+	local lines: { string } = {}
+	for _, diff in state.diffs do
+		local here, there = resolveLeafValues(actual, expected, diff.path, isRaw)
+		local where = if #diff.path > 0 then `actual{pathText(diff.path)}: ` else ""
+		local note = diff.note
+		table.insert(
+			lines,
+			`{where}expected {format.repr(there)}, got {format.repr(here)}{if note and note ~= ""
+				then ` ({note})`
+				else ""}`
+		)
+	end
+	if state.total > MAX_DIFF_LINES then
+		table.insert(lines, `… and {state.total - MAX_DIFF_LINES} more differences`)
+	end
+	local firstPath = state.diffs[1].path
+	if #firstPath > 0 then
+		table.insert(lines, `  expected: {render(expected, 1, DIFF_LIMITS, firstPath, 1, {})}`)
+		table.insert(lines, `  actual:   {render(actual, 1, DIFF_LIMITS, firstPath, 1, {})}`)
 	end
 	return table.concat(lines, "\n")
 end
@@ -555,5 +618,240 @@ function format.jsonDecode(text: string, options: JsonOptions?): any
 	if at <= #text then fail("trailing characters after JSON value") end
 	return value
 end
+
+local function snapNum(n: number): string
+	if n ~= n then return "nan" end
+	if n == math.huge then
+		return "inf"
+	elseif n == -math.huge then
+		return "-inf"
+	end
+	if n == 0 then return "0" end
+	if n % 1 == 0 and math.abs(n) < 1e15 then return tostring(n) end
+	return string.format("%.6g", n)
+end
+
+local DATATYPE_FORMATTERS: { [string]: (v: any) -> string } = {
+	Vector2 = function(v: any): string return `Vector2.new({snapNum(v.X)}, {snapNum(v.Y)})` end,
+	Vector3 = function(v: any): string return `Vector3.new({snapNum(v.X)}, {snapNum(v.Y)}, {snapNum(v.Z)})` end,
+	Vector2int16 = function(v: any): string return `Vector2int16.new({snapNum(v.X)}, {snapNum(v.Y)})` end,
+	Vector3int16 = function(v: any): string return `Vector3int16.new({snapNum(v.X)}, {snapNum(v.Y)}, {snapNum(v.Z)})` end,
+	UDim = function(v: any): string return `UDim.new({snapNum(v.Scale)}, {snapNum(v.Offset)})` end,
+	UDim2 = function(v: any): string
+		return `UDim2.new({snapNum(v.X.Scale)}, {snapNum(v.X.Offset)}, {snapNum(v.Y.Scale)}, {snapNum(v.Y.Offset)})`
+	end,
+	Color3 = function(v: any): string return `Color3.new({snapNum(v.R)}, {snapNum(v.G)}, {snapNum(v.B)})` end,
+	BrickColor = function(v: any): string return `BrickColor.new({quote(v.Name)})` end,
+	CFrame = function(v: any): string
+		local comps = table.pack(v:GetComponents())
+		local parts = table.create(comps.n)
+		for i = 1, comps.n do
+			parts[i] = snapNum(comps[i])
+		end
+		return `CFrame.new({table.concat(parts, ", ")})`
+	end,
+	Rect = function(v: any): string
+		return `Rect.new({snapNum(v.Min.X)}, {snapNum(v.Min.Y)}, {snapNum(v.Max.X)}, {snapNum(v.Max.Y)})`
+	end,
+	Region3 = function(v: any): string
+		local center = v.CFrame.Position
+		local half = v.Size * 0.5
+		local minP, maxP = center - half, center + half
+		return `Region3.new(Vector3.new({snapNum(minP.X)}, {snapNum(minP.Y)}, {snapNum(minP.Z)}), Vector3.new({snapNum(
+			maxP.X
+		)}, {snapNum(maxP.Y)}, {snapNum(maxP.Z)}))`
+	end,
+	Region3int16 = function(v: any): string
+		return `Region3int16.new(Vector3int16.new({snapNum(v.Min.X)}, {snapNum(v.Min.Y)}, {snapNum(v.Min.Z)}), Vector3int16.new({snapNum(
+			v.Max.X
+		)}, {snapNum(v.Max.Y)}, {snapNum(v.Max.Z)}))`
+	end,
+	NumberRange = function(v: any): string return `NumberRange.new({snapNum(v.Min)}, {snapNum(v.Max)})` end,
+	Ray = function(v: any): string
+		local o, d = v.Origin, v.Direction
+		return `Ray.new(Vector3.new({snapNum(o.X)}, {snapNum(o.Y)}, {snapNum(o.Z)}), Vector3.new({snapNum(d.X)}, {snapNum(
+			d.Y
+		)}, {snapNum(d.Z)}))`
+	end,
+	ColorSequence = function(v: any): string
+		local parts: { string } = {}
+		for _, kp in v.Keypoints do
+			local c = kp.Value
+			table.insert(
+				parts,
+				`ColorSequenceKeypoint.new({snapNum(kp.Time)}, Color3.new({snapNum(c.R)}, {snapNum(c.G)}, {snapNum(c.B)}))`
+			)
+		end
+		return "ColorSequence.new({" .. table.concat(parts, ", ") .. "})"
+	end,
+	NumberSequence = function(v: any): string
+		local parts: { string } = {}
+		for _, kp in v.Keypoints do
+			table.insert(
+				parts,
+				`NumberSequenceKeypoint.new({snapNum(kp.Time)}, {snapNum(kp.Value)}, {snapNum(kp.Envelope)})`
+			)
+		end
+		return "NumberSequence.new({" .. table.concat(parts, ", ") .. "})"
+	end,
+	TweenInfo = function(v: any): string
+		return `TweenInfo.new({snapNum(v.Time)}, {tostring(v.EasingStyle)}, {tostring(v.EasingDirection)}, {snapNum(
+			v.RepeatCount
+		)}, {tostring(v.Reverses)}, {snapNum(v.DelayTime)})`
+	end,
+	Font = function(v: any): string return `Font.new({quote(v.Family)}, {tostring(v.Weight)}, {tostring(v.Style)})` end,
+	DateTime = function(v: any): string return `DateTime.fromUnixTimestampMillis({snapNum(v.UnixTimestampMillis)})` end,
+	EnumItem = function(v: any): string return tostring(v) end,
+	Enum = function(v: any): string return tostring(v) end,
+}
+
+local function formatDatatype(kind: string, value: any): string
+	local formatter = DATATYPE_FORMATTERS[kind]
+	if formatter ~= nil then
+		local ok, rendered = pcall(formatter, value)
+		if ok and type(rendered) == "string" then return rendered end
+	end
+	local _, text = safeTostring(value)
+	return if kind == "userdata" then text else `{kind}({text})`
+end
+
+local function appendInstanceSnapshot(
+	inst: any,
+	depth: number,
+	firstPrefix: string,
+	lines: { string },
+	ancestors: { [any]: boolean }
+)
+	local indent = if depth == 0 and firstPrefix == "" then "" else string.rep("  ", depth)
+	local prefix = if #lines == 0 and firstPrefix ~= "" then firstPrefix else indent
+	if ancestors[inst] then
+		table.insert(lines, `{prefix}<cycle Instance>`)
+		return
+	end
+	ancestors[inst] = true
+
+	local okCls, cls = pcall(function() return (inst :: any).ClassName end)
+	local className = if okCls and type(cls) == "string" then cls else "Instance"
+	local okName, nm = pcall(function() return (inst :: any).Name end)
+	local instName = if okName and type(nm) == "string" then nm else ""
+
+	local attrs: { string } = {}
+	local okGui, isGui2d = pcall(function() return (inst :: any):IsA("GuiBase2d") end)
+	if okGui and isGui2d then
+		local okPos, pos = pcall(function() return (inst :: any).AbsolutePosition end)
+		if okPos and pos ~= nil then
+			local okXY, px, py = pcall(function() return pos.X, pos.Y end)
+			if okXY and type(px) == "number" and type(py) == "number" then
+				table.insert(attrs, `pos=({snapNum(px)}, {snapNum(py)})`)
+			end
+		end
+		local okSize, sz = pcall(function() return (inst :: any).AbsoluteSize end)
+		if okSize and sz ~= nil then
+			local okXY, sx, sy = pcall(function() return sz.X, sz.Y end)
+			if okXY and type(sx) == "number" and type(sy) == "number" then
+				table.insert(attrs, `size=({snapNum(sx)}, {snapNum(sy)})`)
+			end
+		end
+		local okVis, vis = pcall(function() return (inst :: any).Visible end)
+		if okVis and type(vis) == "boolean" then table.insert(attrs, `visible={if vis then "true" else "false"}`) end
+		local okTxt, txt = pcall(function() return (inst :: any).Text end)
+		if okTxt and type(txt) == "string" then table.insert(attrs, `text={quote(txt)}`) end
+	end
+
+	local suffix = if #attrs > 0 then ` [{table.concat(attrs, " ")}]` else ""
+	table.insert(lines, `{prefix}{className} {quote(instName)}{suffix}`)
+
+	local okCh, children = pcall(function() return (inst :: any):GetChildren() end)
+	if okCh and type(children) == "table" then
+		for _, child in children do
+			appendInstanceSnapshot(child, depth + 1, "", lines, ancestors)
+		end
+	end
+	ancestors[inst] = nil
+end
+
+local function snapshotRender(value: any, depth: number, ancestors: { [any]: boolean }): string
+	local valueType = type(value)
+	if valueType == "nil" then
+		return "nil"
+	elseif valueType == "boolean" then
+		return if value then "true" else "false"
+	elseif valueType == "number" then
+		if value ~= value then return "nan" end
+		if value == 0 and 1 / value < 0 then return "-0" end
+		return tostring(value)
+	elseif valueType == "string" then
+		return quote(value)
+	elseif valueType == "buffer" then
+		local length = buffer.len(value)
+		return if length == 0 then "buffer(0)" else `buffer({length}) {bytes.hex(value)}`
+	elseif valueType == "vector" or valueType == "userdata" then
+		local kind = util.typeof(value)
+		if kind == "Instance" then
+			local lines: { string } = {}
+			appendInstanceSnapshot(value, depth, "", lines, ancestors)
+			return table.concat(lines, "\n")
+		end
+		return formatDatatype(kind, value)
+	elseif valueType ~= "table" then
+		return `<{valueType}>`
+	end
+
+	if isMatcherTable(value) then
+		local desc = rawget(value, "description")
+		if type(desc) == "string" then return desc end
+		return "<matcher>"
+	end
+
+	local double = util.doubleTag(value)
+	if double == "Instance" then
+		local lines: { string } = {}
+		appendInstanceSnapshot(value, depth, "", lines, ancestors)
+		return table.concat(lines, "\n")
+	elseif double ~= nil then
+		return formatDatatype(double, value)
+	end
+
+	if ancestors[value] then return "<cycle>" end
+	local keys = sortedKeys(value)
+	if #keys == 0 then return "{}" end
+
+	ancestors[value] = true
+	local childIndent = string.rep("  ", depth + 1)
+	local closeIndent = string.rep("  ", depth)
+	local lines = { "{" }
+	local arrayIndex = 1
+	for _, key in keys do
+		local val = rawget(value, key)
+		local isInst = (type(val) == "userdata" and util.typeof(val) == "Instance")
+			or (type(val) == "table" and util.doubleTag(val) == "Instance")
+		local keyPrefix: string
+		if key == arrayIndex then
+			arrayIndex += 1
+			keyPrefix = ""
+		elseif type(key) == "string" and string.match(key, "^[_%a][_%w]*$") ~= nil then
+			keyPrefix = `{key} = `
+		else
+			keyPrefix = `[{snapshotRender(key, depth + 1, ancestors)}] = `
+		end
+		if isInst then
+			local instLines: { string } = {}
+			appendInstanceSnapshot(val, depth + 1, `{childIndent}{keyPrefix}`, instLines, ancestors)
+			instLines[#instLines] ..= ","
+			for _, l in instLines do
+				table.insert(lines, l)
+			end
+		else
+			local renderedVal = snapshotRender(val, depth + 1, ancestors)
+			table.insert(lines, `{childIndent}{keyPrefix}{renderedVal},`)
+		end
+	end
+	ancestors[value] = nil
+	table.insert(lines, closeIndent .. "}")
+	return table.concat(lines, "\n")
+end
+
+--- Serializes `value` into a deterministic, canonical multi-line snapshot string.
+function format.snapshot(value: any): string return snapshotRender(value, 0, {}) end
 
 return table.freeze(format)

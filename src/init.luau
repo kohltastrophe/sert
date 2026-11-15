@@ -11,11 +11,13 @@ local gen = require("@self/prop/gen")
 local laws = require("@self/prop/laws")
 local match = require("@self/core/match")
 local model = require("@self/prop/model")
+local perf = require("@self/core/perf")
 local prop = require("@self/prop")
 local registry = require("@self/core/registry")
 local roblox = require("@self/roblox")
 local runner = require("@self/core/runner")
 local sim = require("@self/sim")
+local snapshot = require("@self/core/snapshot")
 local spy = require("@self/core/spy")
 
 -- cast: Roblox's definitions type `game` as a DataModel, which the old solver will not compare with nil
@@ -44,6 +46,13 @@ export type HookFn = registry.HookFn
 export type TestOptions = registry.TestOptions
 export type DescribeOptions = registry.DescribeOptions
 export type Setup = registry.Setup
+export type SkipReason = registry.SkipReason
+export type SkippedByReason = registry.SkippedByReason
+export type TautologyRecord = registry.TautologyRecord
+export type ExhaustiveOption = registry.ExhaustiveOption
+export type EachFormat<T> = registry.EachFormat<T>
+export type BenchContext = perf.BenchContext
+export type BenchOptions = perf.BenchOptions
 export type Results = runner.Results
 export type Failure = runner.Failure
 
@@ -145,6 +154,14 @@ local sert = {
 	doesNotThrow = assertions.doesNotThrow,
 	fail = assertions.fail,
 	waitFor = assertions.waitFor,
+
+	-- Snapshots & Performance
+	inlineSnapshot = snapshot.inlineSnapshot,
+	snapshot = snapshot.snapshot,
+	allocs = perf.allocs,
+	maxAllocs = perf.maxAllocs,
+	noAllocs = perf.noAllocs,
+	bench = perf.bench,
 
 	-- Asymmetric Matchers
 	any = match.any,

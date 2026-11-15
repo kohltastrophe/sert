@@ -296,3 +296,45 @@ local _flOpts: sert.FlickerOptions = { maxFrames = 20, stableFrames = 3, toleran
 local _flRes: sert.FlickerResult? = nil
 local _fuzzSpec: sert.RemoteFuzzSpec = { handler = function(_player: any) end, runs = 5 }
 local _sweepOpts: sert.SweepOptions = {}
+
+-- Wave 1 & Wave 2: Snapshots, Performance & Benchmarks, Registry Audit Types
+local _testOpts: sert.TestOptions = { smoke = true, tags = { "unit", "fast" } }
+local _exhaustive: sert.ExhaustiveOption = { size = 16 }
+sert.test("typed test options", function() end, _testOpts)
+
+local _runOpts: sert.RunOptions = {
+	updateSnapshots = true,
+	strictAssertions = true,
+	regressions = { ["prop/foo"] = { "r1" } },
+	snapshots = { ["suite/a"] = { snap1 = '"hello"' } },
+	bench = true,
+}
+
+local function _checkResults(res: sert.Results)
+	local _skipReason: sert.SkipReason = "explicit"
+	local _byReason: sert.SkippedByReason = res.skippedByReason
+	local _zero: { string } = res.zeroAssertionTests
+	local _tauts: { sert.TautologyRecord } = res.tautologies
+	local _ = _byReason.explicit
+	local _2 = _zero[1]
+	local _3 = _tauts[1]
+end
+
+local _eachFmt: sert.EachFormat<number> = function(v: number): string return tostring(v) end
+
+local _inlineStr: string = sert.inlineSnapshot("hello", '"hello"', "inline probe")
+local _inlineTbl: { count: number } = sert.inlineSnapshot({ count = 1 })
+local _fileStr: string = sert.snapshot("world", "greeting", "snapshot probe")
+local _fileNum: number = sert.snapshot(42)
+
+local _allocKb: number = sert.allocs(function() end, 1, 2)
+local _maxKb: number = sert.maxAllocs(32, function() end, "within alloc budget")
+sert.noAllocs(function() end, "zero allocations")
+
+local _benchOpts: sert.BenchOptions = { warmup = 1, samples = 3, iterations = 10, bytes = 64 }
+sert.bench("bench probe", function(b: sert.BenchContext)
+	b:stopTimer()
+	b:startTimer()
+	b:bytes(16)
+	b:iter(function() end)
+end, _benchOpts)

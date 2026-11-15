@@ -12,6 +12,8 @@ local SPECS: { string } = {
 	"Assert.spec",
 	"Format.spec",
 	"Runner.spec",
+	"Perf.spec",
+	"Snapshot.spec",
 	"Gen.spec",
 	"Model.spec",
 	"Laws.spec",
