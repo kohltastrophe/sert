@@ -5,6 +5,7 @@ local World = require("./world")
 local assert = require("../core/assert")
 local bytes = require("../core/bytes")
 local format = require("../core/format")
+local registry = require("../core/registry")
 local util = require("../core/util")
 
 export type Command<State, Sut = any, Arg = any, Res = any> = {
@@ -130,6 +131,7 @@ function SpecModule.commandNames<State, Sut>(spec: Spec<State, Sut>): { string }
 --- Replays a recorded `trace` against `spec`'s pure model transitions (`pre`, `next`, `invariants`),
 --- deep-cloning `initialState` and every step state so mutating transitions never alias caller tables.
 function SpecModule.verifyTrace<State, Sut>(spec: Spec<State, Sut>, trace: { TraceStep }, initialState: State?): State
+	registry.recordAssertion("sim.verifyTrace")
 	local state: State = if initialState ~= nil then util.copy(initialState) else util.copy(spec.init())
 	SpecModule.checkInvariants(spec, state, nil :: any, nil)
 
@@ -170,6 +172,7 @@ end
 
 --- Bounded breadth-first state-space exploration over `spec.init()` and `commands` (`args`, `pre`, `next`, `invariants`).
 function SpecModule.bfsCheck<State, Sut>(spec: Spec<State, Sut>, options: BfsOptions?): BfsResult
+	registry.recordAssertion("sim.bfs")
 	local o: BfsOptions = options or {}
 	local maxStates = o.maxStates or 2000
 	local maxDepth = o.maxDepth or 20

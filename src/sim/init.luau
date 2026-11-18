@@ -661,6 +661,7 @@ function Sim.explore(optsOrName: any, maybeFn: any?, maybeOpts: ExploreOptions?)
 	if hashOpt ~= nil and hashOpt ~= false and hashOpt ~= "backing" and type(hashOpt) ~= "function" then
 		error('Sim.explore: stateHash must be false, "backing", or a function', util.outside())
 	end
+	registry.recordAssertion("sim.explore")
 
 	local exploreStateHash: (() -> (string | number)?)? = nil
 	local activeWorld: World? = nil

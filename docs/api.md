@@ -91,7 +91,7 @@ All assertions report the caller's stack frame and (unless noted) return their f
 | Assertion | Description |
 | --- | --- |
 | `sert.ok(val, msg?)` / `sert(val, msg?)` | Asserts `val` is truthy (`val ~= nil and val ~= false`) and returns `val`. |
-| `sert.eq(actual, expected, msg?)` | Deep structural equality with cycle handling, `NaN == NaN`, hex diffs on `buffer`, nested `Matcher` support, and up to `8` leaf path diffs per mismatch. (`sert audit` flags `rawequal` table calls unless `msg` includes `"same"`, `"identity"`, `"intentional"`, or `"reference"`.) |
+| `sert.eq(actual, expected, msg?)` | Deep structural equality with cycle handling, `NaN == NaN`, hex diffs on `buffer`, nested `Matcher` support, and up to `8` leaf path diffs per mismatch. |
 | `sert.ne(actual, unexpected, msg?)` | Asserts `not sert.equals(actual, unexpected)`. |
 | `sert.equals(a, b) -> boolean` | Boolean predicate using the same deep comparison and matcher rules as `sert.eq`. |
 | `sert.lt(a, b, msg?)` / `sert.le(a, b, msg?)` | Asserts `a < b` or `a <= b`. |

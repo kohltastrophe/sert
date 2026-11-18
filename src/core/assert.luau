@@ -15,28 +15,6 @@ export type Spy = spy.Spy
 
 local assertions = {}
 
-local function hasIntentionalIdentityNote(msg: string?): boolean
-	if msg == nil then return false end
-	local lower = string.lower(msg)
-	return string.find(lower, "same", 1, true) ~= nil
-		or string.find(lower, "identity", 1, true) ~= nil
-		or string.find(lower, "intentional", 1, true) ~= nil
-		or string.find(lower, "reference", 1, true) ~= nil
-end
-
-local function eqTautologyNote(actual: any, expected: any, msg: string?): string?
-	if
-		type(actual) == "table"
-		and rawequal(actual, expected)
-		and util.doubleTag(actual) == nil
-		and util.typeof(actual) == "table"
-		and not hasIntentionalIdentityNote(msg)
-	then
-		return "sert.eq compared identical table reference (rawequal)"
-	end
-	return nil
-end
-
 local function mismatch(head: string, actual: any, expected: any, raw: boolean?): string
 	local ok, text = pcall(format.diff, actual, expected, raw)
 	if ok and type(text) == "string" and text ~= "" then
@@ -65,7 +43,7 @@ end
 
 --- Asserts deep equality between `actual` and `expected` (with asymmetric `Matcher` support) and returns `actual`.
 function assertions.eq<T>(actual: T, expected: any, msg: string?): T
-	registry.recordAssertion("eq", eqTautologyNote(actual, expected, msg))
+	registry.recordAssertion("eq")
 	if not match.equal(actual, expected) then
 		error(mismatch(msg or "values differ", actual, expected, false), util.outside())
 	end

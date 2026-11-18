@@ -63,6 +63,9 @@ jobs:
       - name: sert coverage
         run: python3 -m sert coverage --badge
 
+      - name: sert audit
+        run: python3 -m sert audit --strict --no-run
+
       - name: sert mutate
         if: "!startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release')"
         run: python3 -m sert mutate --no-coverage-run

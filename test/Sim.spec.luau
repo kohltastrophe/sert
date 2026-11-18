@@ -2021,4 +2021,43 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 			Sim.explore({ stateHash = "not-a-function" :: any }, function() end)
 		end, "stateHash must be false")
 	end)
+
+	test("BFS Sim.check, verifyTrace, and Sim.explore record assertions under strictAssertions", function()
+		local spec = Sim.spec({
+			init = function() return { n = 0 } end,
+			commands = {
+				inc = {
+					args = { 1 },
+					pre = function(s: { n: number }) return s.n < 2 end,
+					next = function(s: { n: number })
+						s.n += 1
+						return nil
+					end,
+				},
+			},
+			invariants = {
+				bounded = function(s: { n: number }, _sut: any, _w: any?): any return s.n >= 0 and s.n <= 2 end,
+			},
+		})
+		local strictRes = runSimIsolated(function()
+			sert.test("bfs check only", function()
+				local r = Sim.check(spec, { bfs = true, vopr = false })
+				if r.states ~= 3 then error("unexpected bfs state count") end
+			end)
+			sert.test(
+				"verifyTrace only",
+				function() Sim.verifyTrace(spec, { { command = "inc", state = { n = 1 } } }) end
+			)
+			sert.test("explore only", function()
+				Sim.explore({ maxRuns = 4 }, function(w: sert.SimWorld)
+					local pick = w.scheduler:choose(2, "coin")
+					if pick ~= 1 and pick ~= 2 then error("bad pick") end
+				end)
+			end)
+		end, { strictAssertions = true })
+		sert.eq(strictRes.failures, {})
+		sert.eq(strictRes.zeroAssertionTests, {})
+		sert.eq(strictRes.passed, 3)
+		sert.eq(strictRes.failed, 0)
+	end)
 end)

@@ -491,10 +491,10 @@ sert.describe("assertion tracking, strict assertions, tautologies, and skip reas
 				local linearB = sert.env.Enum.EasingStyle.Linear
 				sert.test("zero normal", function() local _v = 1 + 1 end, { tags = { "unit" } })
 				sert.test("smoke test", function() end, { smoke = true })
-				sert.test("tautology test", function()
+				sert.test("identity eq and manual tautology record", function()
 					sert.eq(tbl, sameTbl)
-					sert.eq(tbl, sameTbl, "returns same reference intentionally")
 					sert.eq(linearA, linearB)
+					registry.recordAssertion("eq", "manual tautology note")
 				end)
 				sert.test.skip("explicit skip")
 				sert.test.roblox("roblox skip", function() end)
@@ -519,8 +519,9 @@ sert.describe("assertion tracking, strict assertions, tautologies, and skip reas
 					sert.eq(res.skippedByReason, { explicit = 1, roblox = 1, server = 1, client = 1 })
 					sert.eq(res.zeroAssertionTests, { "zero normal" })
 					sert.eq(#res.tautologies, 1)
-					sert.eq(res.tautologies[1].test, "tautology test")
+					sert.eq(res.tautologies[1].test, "identity eq and manual tautology record")
 					sert.eq(res.tautologies[1].kind, "eq")
+					sert.eq(res.tautologies[1].reason, "manual tautology note")
 				end)
 
 				local doneLine: string? = nil

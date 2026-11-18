@@ -85,8 +85,8 @@ Passing `sert run` alone does not prove tests verify behavior. Enable `--strict-
 
 | Check | What triggers a failure or warning | Approved fix |
 | --- | --- | --- |
-| `zeroAssertionTests` | A test completes with `0` assertions recorded (`sert.*`, `Layout.*`, `Flicker.expect`, `sert.sim.linearizable`) | Add real behavioral assertions, or mark genuine crash-only smoke tests `{ smoke = true }` |
-| Static and runtime tautologies | `sert.eq(a, a)`, `sert.ok(true)`, `sert.ne(literal, nil)` outside `throws`, or `sert.eq` comparing `rawequal` tables | Compare against independently expected values; if testing table identity, include `"same"`, `"identity"`, `"intentional"`, or `"reference"` in `msg` |
+| `zeroAssertionTests` | A test completes with `0` assertions recorded (`sert.*`, `Layout.*`, `Flicker.expect`, `sert.sim.linearizable`, `sert.sim.check`, `sert.sim.explore`, `sert.sim.verifyTrace`) | Add real behavioral assertions, or mark genuine crash-only smoke tests `{ smoke = true }` |
+| Static tautologies | `sert.eq(a, a)`, `sert.ok(true)`, `sert.ne(literal, nil)` outside `throws`, or identical subexpressions | Compare against independently expected values computed from inputs or a reference oracle |
 | Vacuous or covered-out properties | Every property run discarded via `g:assume` / `prop.vacuous`, or `g:cover` misses its 99% Wilson upper bound | Broaden generators or fix unreachable branch weights instead of loosening conditions |
 | Unfuzzed remotes and dead exports | Changed `.OnServerEvent:Connect`/`:Once` or `.OnServerInvoke` without `sert.roblox.fuzzRemote` / `sert.gen.remotePayload` coverage, or uncovered `M.foo` exports (`--strict`) | Add adversarial payload fuzz specs (use `--allow-unfuzzed-remotes` only when a handler is proven unreachable or audited separately) |
 
