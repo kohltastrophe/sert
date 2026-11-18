@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-11-18
 
 ### Added
 
@@ -34,5 +34,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-boilerplate Roblox Studio (`sert studio`) and Open Cloud (`sert cloud`) runners with `.roblox`/`.server`/`.client` target tags, `--device` viewport emulation, `--clients` multi-player sessions, `--warm` live Studio reloads, `Layout` audits, `Flicker` stability checks, `fuzzRemote`, and LIFO `sweep` cleanup.
 - Stdlib Python 3.11+ CLI (`init`, `fetch`, `lint`, `run`, `coverage`, `mutate`, `check`, `studio`, `cloud`), SHA-256 `sert.lock` verification, dual-solver positive and `-- expect-error` negative type probes, pure-Python `luau_lex` token-stream mutation testing, reproducible `pack.py` archives, and `kohltastrophe/sert/actions/setup@v0.1.0`.
 
-[Unreleased]: https://github.com/kohltastrophe/sert/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/kohltastrophe/sert/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kohltastrophe/sert/releases/tag/v0.1.0
