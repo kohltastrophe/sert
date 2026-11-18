@@ -9,11 +9,10 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
-import helpers  # noqa: F401
+import helpers
 from sert import audit, check, cli, fetch, graph, luau_lex, markers, run, studio, util
 
 
@@ -57,13 +56,11 @@ def _init_project(root: Path, *, with_real_src: bool = False, extra_toml: str = 
         shutil.copytree(repo_src, root / "src", dirs_exist_ok=True)
 
 
-class AuditTest(unittest.TestCase):
+class AuditTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def test_static_tautology_detection_and_ignore_valid_assertions(self) -> None:
         spec = self.root / "test/bad.spec.luau"
@@ -210,7 +207,7 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(code_diff, 0, rep_diff)
 
     def test_real_luau_audit_zero_assertion_and_smoke(self) -> None:
-        if util.which("luau") is None:
+        if util.which("luau", helpers.REPO) is None:
             self.skipTest("luau binary not available on PATH")
 
         _init_project(self.root, with_real_src=True)
@@ -248,13 +245,11 @@ class AuditTest(unittest.TestCase):
         self.assertEqual([(e.name, e.start_line, e.end_line) for e in exports], [("M.public", 2, 11)])
 
 
-class RunAndStudioIntegrationTest(unittest.TestCase):
+class RunAndStudioIntegrationTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def test_run_affected_noop_and_diff_narrowing(self) -> None:
         _init_project(self.root)
@@ -337,7 +332,16 @@ class RunAndStudioIntegrationTest(unittest.TestCase):
         ):
             with mock.patch.object(run, "which", return_value="luau"):
                 code = cli.main(["run", "--root", str(self.root), "--save-regressions"])
+                ann_out = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}),
+                    contextlib.redirect_stdout(ann_out),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    code_gha = cli.main(["run", "--root", str(self.root)])
         self.assertEqual(code, 1)
+        self.assertEqual(code_gha, 1)
+        self.assertIn("::error file=test/Prop.spec.luau,title=sert run::assoc: failed", ann_out.getvalue())
         self.assertEqual(run.load_regressions_by_test(self.root).get("assoc"), ["v1:deadbeef"])
         last_failed = json.loads((self.root / ".sert/last-failed.json").read_text(encoding="utf-8"))
         self.assertEqual(last_failed["tapes"], {"assoc": "v1:deadbeef"})
@@ -556,13 +560,11 @@ class RunAndStudioIntegrationTest(unittest.TestCase):
         )
 
 
-class CheckChangedTest(unittest.TestCase):
+class CheckChangedTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def _run_stage1_helper(self, skipped_by_reason: dict[str, int] | None = None, *, test_fail: bool = False):
         skips = skipped_by_reason or {"explicit": 0, "roblox": 0, "server": 0, "client": 0}
@@ -688,13 +690,11 @@ class CheckChangedTest(unittest.TestCase):
         self.assertIn("studio", out3.getvalue())
 
 
-class InitSkillAndFormattingTest(unittest.TestCase):
+class InitSkillAndFormattingTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def test_init_skill_schema_stdout_install_and_agents(self) -> None:
         out_md = io.StringIO()

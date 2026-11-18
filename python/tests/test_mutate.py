@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from helpers import REPO, Case, copy_sert_src, have
-from sert import cli, mutate
+from sert import cli, graph, mutate
 from sert.util import SertError
 
 
@@ -692,6 +692,194 @@ class MutateSchemaTest(Case):
             )
         self.assertEqual((code_trans, out_trans.strip()), (0, "0.0"), err_trans)
         self.assertGreater(trans_eval_calls, 0)
+
+    def test_prioritize_route_specs_fronts_stem_and_bounds_tail_stages(self):
+        root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n',
+            name="barrel_route",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src/core").mkdir(parents=True)
+        (root / "src/init.luau").write_text('return { assert = require("@self/core/assert") }\n')
+        (root / "src/core/assert.luau").write_text(
+            "\n".join(
+                [
+                    "local A = {}",
+                    "function A.add(x: number, y: number): number",
+                    "\treturn x + y",
+                    "end",
+                    "function A.untested(x: number): number",
+                    "\treturn x + 1",
+                    "end",
+                    "return A",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test").mkdir()
+        cov_specs = {}
+        # Give barrel specs fast timings (5ms..25ms) and Assert.spec.luau slowest timing (200ms).
+        for idx, stem in enumerate(("a", "b", "c", "d", "e"), start=1):
+            (root / f"test/{stem}.spec.luau").write_text(
+                "\n".join(
+                    [
+                        'local sert = require("@sert")',
+                        'local lib = require("@lib")',
+                        f'sert.test("barrel {stem}", function()',
+                        "\tsert.ne(lib.assert, nil)",
+                        "\tlib.assert.untested(1)",
+                        "end)",
+                        "return {}",
+                    ]
+                )
+                + "\n"
+            )
+            cov_specs[f"test/{stem}.spec.luau"] = {"ms": idx * 5, "files": {"src/core/assert.luau": [3, 6]}}
+        (root / "test/Assert.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local lib = require("@lib")',
+                    'sert.test("add exact", function()',
+                    "\tsert.eq(lib.assert.add(2, 3), 5)",
+                    "\tlib.assert.untested(1)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        cov_specs["test/Assert.spec.luau"] = {"ms": 200, "files": {"src/core/assert.luau": [3, 6]}}
+        (root / ".sert/coverage-map.json").write_text(json.dumps({"version": 1, "specs": cov_specs}))
+        (root / "coverage.out").write_text("SF:src/core/assert.luau\nDA:3,1\nDA:6,1\nend_of_record\n")
+
+        dep_graph = graph.build_graph(root)
+        raw_order = tuple(
+            f"test/{stem}.spec.luau" for stem in ("a", "b", "c", "d", "e", "Assert")
+        )
+        prioritized = mutate._prioritize_route_specs("src/core/assert.luau", raw_order, dep_graph, root)
+        self.assertEqual(
+            prioritized,
+            (
+                "test/Assert.spec.luau",
+                "test/a.spec.luau",
+                "test/b.spec.luau",
+                "test/c.spec.luau",
+                "test/d.spec.luau",
+                "test/e.spec.luau",
+            ),
+        )
+
+        observed_calls: list[tuple[str, str]] = []
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def spy_batch(batch, *args, **kwargs):
+            for m in batch:
+                observed_calls.append((str(m.line), m.spec_filter or ""))
+            return orig_eval_batch(batch, *args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_batch):
+            code, out, err = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1")
+        self.assertEqual((code, out.strip()), (0, "50.0"), err)
+
+        line3_filters = [filt for ln, filt in observed_calls if ln == "3"]
+        self.assertEqual(line3_filters, ["@file=test/Assert.spec.luau"])
+        line6_filters = [filt for ln, filt in observed_calls if ln == "6"]
+        self.assertEqual(
+            line6_filters,
+            [
+                "@file=test/Assert.spec.luau",
+                "@file=test/a.spec.luau",
+                "@file=test/b.spec.luau,test/c.spec.luau,test/d.spec.luau,test/e.spec.luau",
+            ],
+        )
+
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_per_spec_lcov_narrowing_upgrades_aggregate_coverage_map(self):
+        root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n',
+            name="exact_lcov_narrowing",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src/core").mkdir(parents=True)
+        (root / "src/init.luau").write_text('return { assert = require("@self/core/assert") }\n')
+        (root / "src/core/assert.luau").write_text(
+            "\n".join(
+                [
+                    "local A = {}",
+                    "function A.add(x: number, y: number): number",
+                    "\treturn x + y",
+                    "end",
+                    "function A.other(x: number, y: number): number",
+                    "\treturn x + y",
+                    "end",
+                    "return A",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test").mkdir()
+        (root / "test/Assert.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local lib = require("@lib")',
+                    'sert.test("calls add without asserting value", function()',
+                    "\tsert.ne(lib.assert.add(2, 3), nil)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test/Other.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local lib = require("@lib")',
+                    'sert.test("only calls other", function()',
+                    "\tsert.eq(lib.assert.other(10, 5), 15)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+
+        # Multi-spec `sert run --coverage` writes non-exact aggregate entries (`exact: False`).
+        run_code, run_out, run_err = self.sert("run", "--root", root, "--coverage")
+        self.assertEqual(run_code, 0, run_out + run_err)
+        cov_map_before = graph.load_coverage_map(root)
+        self.assertEqual(cov_map_before["specs"]["test/Assert.spec.luau"].get("exact"), False)
+        self.assertEqual(cov_map_before["specs"]["test/Other.spec.luau"].get("exact"), False)
+
+        observed_calls: list[tuple[str, str]] = []
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def spy_batch(batch, *args, **kwargs):
+            for m in batch:
+                observed_calls.append((str(m.line), m.spec_filter or ""))
+            return orig_eval_batch(batch, *args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_batch):
+            code, out, err = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--no-cache", "-j", "2"
+            )
+        self.assertEqual((code, out.strip()), (0, "50.0"), err)
+
+        cov_map_after = graph.load_coverage_map(root)
+        for entry in cov_map_after["specs"].values():
+            self.assertNotIn("exact", entry)
+            self.assertEqual(len(entry.get("sha256", "")), 64)
+        self.assertIn(3, cov_map_after["specs"]["test/Assert.spec.luau"]["files"]["src/core/assert.luau"])
+        self.assertNotIn(3, cov_map_after["specs"]["test/Other.spec.luau"]["files"].get("src/core/assert.luau", []))
+
+        # Surviving mutant on line 3 (`A.add`) only runs `Assert.spec.luau`, never `Other.spec.luau`,
+        # while line 6 (`A.other`) only runs `Other.spec.luau`.
+        self.assertEqual([filt for ln, filt in observed_calls if ln == "3"], ["@file=test/Assert.spec.luau"])
+        self.assertEqual([filt for ln, filt in observed_calls if ln == "6"], ["@file=test/Other.spec.luau"])
 
 
 if __name__ == "__main__":

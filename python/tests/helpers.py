@@ -55,6 +55,8 @@ class Case(unittest.TestCase):
         self.setenv("GITHUB_TOKEN", None)
         self.setenv("GITHUB_ACTIONS", None)
         self.setenv("GITHUB_STEP_SUMMARY", None)
+        self.setenv("SERT_AGENT", None)
+        self.setenv("SERT_FORMAT", None)
         self.setenv("SERT_OFFLINE", None)
         self.setenv("SERT_RETRY_DELAY", "0")
         self.setenv("SERT_GITHUB_URL", (self.tmp / "no-releases").as_uri())  # nothing reaches the network

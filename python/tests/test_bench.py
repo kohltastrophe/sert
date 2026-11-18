@@ -5,15 +5,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 from pathlib import Path
 import shutil
-import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
-import helpers  # noqa: F401
+import helpers
 from sert import bench, cli, markers, run, util
 
 
@@ -29,13 +26,11 @@ def _init_bench_project(root: Path, *, with_real_src: bool = False) -> None:
         shutil.copytree(repo_src, root / "src", dirs_exist_ok=True)
 
 
-class BenchTest(unittest.TestCase):
+class BenchTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def _mock_bench_run(self, benchmarks: list[dict], *, captured_args: list | None = None):
         lines = ['[sert-file] shared|test/math.spec.luau|5']
@@ -185,7 +180,7 @@ class BenchTest(unittest.TestCase):
             bench.load_baseline(self.root, "nonexistent")
 
     def test_bench_real_luau_codegen_execution(self) -> None:
-        if util.which("luau") is None:
+        if util.which("luau", helpers.REPO) is None:
             self.skipTest("luau binary not available on PATH")
 
         _init_bench_project(self.root, with_real_src=True)

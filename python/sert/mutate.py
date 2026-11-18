@@ -2230,6 +2230,7 @@ def summary_markdown(mutants: list[Mutant], score: float, max_survived: int = 20
 DEFAULT_TIMEOUT = 5.0
 MIN_MUTANT_TIMEOUT = 1.0
 BATCH_SIZE = 32
+MAX_INDIVIDUAL_ROUTE_STAGES = 2
 BASELINE_TIMEOUT_FACTOR = 4.0
 BASELINE_TIMEOUT_FLOOR = 30.0
 WORK_DIR = Path(".sert") / "mutate"
@@ -2543,6 +2544,119 @@ def _save_mutant_cache(cache_path: Path, entries: dict[str, str]) -> None:
         pass
 
 
+def _spec_stem(rel_path: str) -> str:
+    name = Path(rel_path).name
+    for suffix in (".spec.luau", ".spec.lua", ".luau", ".lua"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)].lower()
+    return Path(name).stem.lower()
+
+
+def _prioritize_route_specs(
+    rel_file: str,
+    covering_specs: tuple[str, ...],
+    dep_graph: graph.DependencyGraph,
+    root: Path,
+) -> tuple[str, ...]:
+    """Keep fastest-first order when <= 2 specs; otherwise front stem matches and direct 1-hop importers."""
+    if len(covering_specs) <= 2:
+        return covering_specs
+    rel_norm = graph._norm_rel(rel_file, root)
+    path_obj = Path(rel_norm)
+    stem = (graph._classify_script_name(path_obj.name) or path_obj.stem).lower()
+    stems: set[str] = set()
+    if stem and stem != "init":
+        stems.add(stem)
+    parent_name = path_obj.parent.name.lower()
+    if parent_name and parent_name != "src":
+        stems.add(parent_name)
+    direct = dep_graph.reverse.get(rel_norm, set())
+
+    tier1: list[str] = []
+    tier2: list[str] = []
+    tier3: list[str] = []
+    for spec in covering_specs:
+        if _spec_stem(spec) in stems:
+            tier1.append(spec)
+        elif graph._norm_rel(spec, root) in direct:
+            tier2.append(spec)
+        else:
+            tier3.append(spec)
+    return tuple(tier1 + tier2 + tier3)
+
+
+def _collect_per_spec_coverage(
+    root: Path,
+    work_root: Path,
+    luau_bin: str,
+    entries: list[str],
+    specs_to_probe: list[str],
+    pool: ThreadPoolExecutor,
+    timeout_sec: float,
+    codegen: bool,
+    program_args: list[str] | tuple[str, ...],
+) -> dict[str, tuple[int, dict[str, list[int]]]]:
+    """Run exact per-spec LCOV probes in isolated `.sert/mutate/cov-*` dirs and return hit lines per spec."""
+    if not specs_to_probe or not entries:
+        return {}
+    probe_timeout = max(timeout_sec * BASELINE_TIMEOUT_FACTOR, BASELINE_TIMEOUT_FLOOR)
+
+    def probe_one(idx: int, spec: str) -> tuple[str, tuple[int, dict[str, list[int]]] | None]:
+        probe_dir = work_root.parent / f"cov-{idx}"
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            run_targets = [spec] if spec in entries else list(entries)
+            extra = [*program_args, *([] if spec in entries else [f"--filter=@file={spec}"]), "--silent"]
+            merged_hits: dict[str, set[int]] = {}
+            got_cov = False
+            started = time.monotonic()
+            for entry in run_targets:
+                cov_file = probe_dir / "coverage.out"
+                cov_file.unlink(missing_ok=True)
+                cmd = run_mod.entry_command(
+                    "luau",
+                    luau_bin,
+                    str((root / entry).resolve()),
+                    extra,
+                    coverage=True,
+                    codegen=codegen,
+                )
+                try:
+                    _run_process(cmd, cwd=probe_dir, timeout=probe_timeout, capture_output=True)
+                except (subprocess.TimeoutExpired, OSError):
+                    continue
+                if cov_file.is_file():
+                    got_cov = True
+                    try:
+                        parsed = coverage_mod.parse(cov_file)
+                    except OSError:
+                        continue
+                    for src_name, lines_map in parsed.items():
+                        src_rel = coverage_rel_path(src_name, root)
+                        if src_rel is None:
+                            continue
+                        hit_set = merged_hits.setdefault(src_rel, set())
+                        for ln, hit in lines_map.items():
+                            if hit:
+                                hit_set.add(ln)
+            if not got_cov:
+                return spec, None
+            total_ms = max(0, int(round((time.monotonic() - started) * 1000)))
+            files_map = {src_rel: sorted(lines) for src_rel, lines in merged_hits.items() if lines}
+            return spec, (total_ms, files_map)
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+
+    futs = [pool.submit(probe_one, idx, spec) for idx, spec in enumerate(specs_to_probe)]
+    results: dict[str, tuple[int, dict[str, list[int]]]] = {}
+    for fut in futs:
+        spec, res = fut.result()
+        if res is not None:
+            results[spec] = res
+    return results
+
+
 def _dispatch_mutant_batches(
     pool: ThreadPoolExecutor,
     batch_items: list[tuple[list[Mutant], float, list[str]]],
@@ -2806,13 +2920,103 @@ def main(args) -> int:
 
             # Resolve zero-config covering specs per `(rel_path, line)` when `[mutate.specs]` has no manual override.
             all_specs = graph.discover_specs(cfg.root, cfg)
+            dep_graph = graph.build_graph(cfg.root, cfg)
+            cov_map = graph.load_coverage_map(cfg.root)
+            spec_sha_memo: dict[str, str] = {}
+            all_specs_norm = [graph._norm_rel(s, cfg.root) for s in all_specs]
+            raw_specs_cov = cov_map.get("specs") if isinstance(cov_map.get("specs"), dict) else {}
+            specs_cov = {
+                graph._norm_rel(k, cfg.root): v
+                for k, v in raw_specs_cov.items()
+                if isinstance(v, dict)
+            }
+
+            if runner == "luau" and len(all_specs_norm) > 1 and any(m.spec_filter is None for m in all_mutants):
+                stale_specs = [
+                    s
+                    for s in all_specs_norm
+                    if s not in specs_cov
+                    or specs_cov[s].get("exact") is False
+                    or (
+                        "sha256" in specs_cov[s]
+                        and specs_cov[s]["sha256"] != _file_sha256_cached(cfg.root, s, spec_sha_memo)
+                    )
+                ]
+                if stale_specs:
+                    probed = _collect_per_spec_coverage(
+                        cfg.root,
+                        work_root,
+                        luau_bin,
+                        entries,
+                        stale_specs,
+                        pool,
+                        timeout_sec,
+                        codegen,
+                        program_args,
+                    )
+                    if probed:
+                        map_specs = cov_map.setdefault("specs", {})
+                        for s, (ms, files_map) in probed.items():
+                            map_specs[s] = {
+                                "ms": ms,
+                                "sha256": _file_sha256_cached(cfg.root, s, spec_sha_memo),
+                                "files": files_map,
+                            }
+                        specs_cov = {
+                            graph._norm_rel(k, cfg.root): v
+                            for k, v in map_specs.items()
+                            if isinstance(v, dict)
+                        }
+                        graph.save_coverage_map(cfg.root, cov_map)
+
+            has_verified_exact = len(all_specs_norm) > 1 and all(
+                s in specs_cov and specs_cov[s].get("exact") is not False and "sha256" in specs_cov[s]
+                for s in all_specs_norm
+            )
+            exact_index: dict[tuple[str, int], list[str]] = {}
+            if has_verified_exact:
+                ordered_specs = sorted(
+                    all_specs_norm,
+                    key=lambda s: (
+                        int(specs_cov[s]["ms"])
+                        if isinstance(specs_cov[s].get("ms"), (int, float))
+                        and not isinstance(specs_cov[s].get("ms"), bool)
+                        else sys.maxsize,
+                        s,
+                    ),
+                )
+                for s in ordered_specs:
+                    files_map = specs_cov[s].get("files")
+                    if not isinstance(files_map, dict):
+                        continue
+                    for raw_src, hit_lines in files_map.items():
+                        if not isinstance(hit_lines, list):
+                            continue
+                        src_norm = graph._norm_rel(raw_src, cfg.root)
+                        for ln in hit_lines:
+                            exact_index.setdefault((src_norm, ln), []).append(s)
+
             line_cov_cache: dict[tuple[str, int], tuple[str, ...]] = {}
             if all_specs:
                 for m in all_mutants:
                     if m.spec_filter is None:
                         ck = (m.file, m.line)
                         if ck not in line_cov_cache:
-                            line_cov_cache[ck] = tuple(graph.covering_specs_for_line(cfg.root, cfg, m.file, m.line, all_specs))
+                            m_norm = graph._norm_rel(m.file, cfg.root)
+                            if has_verified_exact and (exact_hits := exact_index.get((m_norm, m.line))):
+                                line_cov_cache[ck] = tuple(exact_hits)
+                            else:
+                                line_cov_cache[ck] = tuple(
+                                    graph.covering_specs_for_line(
+                                        cfg.root,
+                                        cfg,
+                                        m.file,
+                                        m.line,
+                                        all_specs,
+                                        cov_map=cov_map,
+                                        dep_graph=dep_graph,
+                                    )
+                                )
                         m.covering_specs = line_cov_cache[ck]
 
             # Check incremental mutant cache (`.sert/mutate/cache.json`)
@@ -2823,8 +3027,6 @@ def main(args) -> int:
                 for _sp, _stp, source_text, _inst, file_muts in staged_tasks
                 if file_muts
             }
-            spec_sha_memo: dict[str, str] = {}
-            dep_graph = graph.build_graph(cfg.root, cfg)
             dep_refs_memo: dict[tuple[str, tuple[str, ...]], list[str]] = {}
             cache_keys: dict[int, str] = {}
             uncached_mutants: list[Mutant] = []
@@ -2898,16 +3100,40 @@ def main(args) -> int:
                     ]
                     _dispatch_mutant_batches(pool, direct_batches, work_root, runner, luau_bin, codegen, program_args)
 
-                # 2. Zero-config routed mutants: run fastest covering spec first, short-circuiting once KILLED
+                # 2. Zero-config routed mutants: run individual prioritized specs first, then sweep tail together
+                route_plan = {
+                    m.id: _prioritize_route_specs(m.file, m.covering_specs, dep_graph, cfg.root)
+                    for m in routed_mutants
+                }
                 stage = 0
                 alive_routed = list(routed_mutants)
                 while alive_routed:
                     by_route: dict[tuple[str, tuple[str, ...]], list[Mutant]] = {}
                     needed_pairs: set[tuple[str, str]] = set()
                     for m in alive_routed:
-                        spec = m.covering_specs[stage]
-                        stage_entries = (spec,) if spec in entries else tuple(entries)
-                        stage_filter = "" if spec in entries else f"@file={spec}"
+                        plan = route_plan[m.id]
+                        if stage < MAX_INDIVIDUAL_ROUTE_STAGES:
+                            spec = plan[stage]
+                            stage_entries = (spec,) if spec in entries else tuple(entries)
+                            stage_filter = "" if spec in entries else f"@file={spec}"
+                        else:
+                            tail = plan[stage:]
+                            if len(tail) == 1:
+                                spec = tail[0]
+                                stage_entries = (spec,) if spec in entries else tuple(entries)
+                                stage_filter = "" if spec in entries else f"@file={spec}"
+                            elif all(s in entries for s in tail):
+                                stage_entries = tuple(tail)
+                                stage_filter = ""
+                            elif not any(s in entries for s in tail):
+                                stage_entries = tuple(entries)
+                                if len(tail) >= 8 and len(tail) * 2 >= len(all_specs):
+                                    stage_filter = ""
+                                else:
+                                    stage_filter = f"@file={','.join(tail)}"
+                            else:
+                                stage_entries = tuple(entries)
+                                stage_filter = ""
                         m.spec_filter = stage_filter or None
                         by_route.setdefault((stage_filter, stage_entries), []).append(m)
                         for e in stage_entries:
@@ -2928,10 +3154,12 @@ def main(args) -> int:
                         for m in alive_routed:
                             m.spec_filter = None
 
+                    if stage >= MAX_INDIVIDUAL_ROUTE_STAGES:
+                        break
                     alive_routed = [
                         m
                         for m in alive_routed
-                        if m.status == "SURVIVED" and stage + 1 < len(m.covering_specs)
+                        if m.status == "SURVIVED" and stage + 1 < len(route_plan[m.id])
                     ]
                     stage += 1
 

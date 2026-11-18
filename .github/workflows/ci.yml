@@ -28,6 +28,7 @@ jobs:
   check:
     name: Lint, Test, Coverage & Mutation
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,6 +66,14 @@ jobs:
 
       - name: sert audit
         run: python3 -m sert audit --strict --no-run
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: "!startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release')"
+        with:
+          path: .sert/mutate
+          key: sert-mutate-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            sert-mutate-${{ runner.os }}-
 
       - name: sert mutate
         if: "!startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release')"

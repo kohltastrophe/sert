@@ -5,22 +5,18 @@ from __future__ import annotations
 import argparse
 import binascii
 import json
-from pathlib import Path
 import subprocess
-import tempfile
 import unittest
 
-import helpers  # noqa: F401
+import helpers
 from sert import agent, markers, mutate, run, snapshots, util
 
 
-class SnapshotsTest(unittest.TestCase):
+class SnapshotsTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def test_format_luau_literal_long_brackets_and_leading_newlines(self) -> None:
         # Single-line strings must NOT use `\n`-prepended brackets or inject leading `\n`.
@@ -50,7 +46,7 @@ class SnapshotsTest(unittest.TestCase):
         self.assertEqual(trailing_eq, "[==[\nx\n]]\n]=]==]")
 
     def test_luau_vm_roundtrip_for_all_snapshot_payloads(self) -> None:
-        luau_bin = util.which("luau")
+        luau_bin = util.which("luau", helpers.REPO)
         if luau_bin is None:
             self.skipTest("luau binary not installed")
 
@@ -79,7 +75,7 @@ class SnapshotsTest(unittest.TestCase):
                 'print(table.concat(hex))\n',
                 encoding="utf-8",
             )
-            proc = subprocess.run([luau_bin, str(script)], capture_output=True, text=True, check=True)
+            proc = subprocess.run([luau_bin, str(script)], cwd=self.root, capture_output=True, text=True, check=True)
             got = binascii.unhexlify(proc.stdout.strip()).decode("utf-8")
             self.assertEqual(got, expected, msg=f"Luau roundtrip failed for literal: {literal!r}")
 
@@ -239,13 +235,11 @@ class SnapshotsTest(unittest.TestCase):
         self.assertEqual((count, names), (2, {"alpha", "beta"}))
 
 
-class AgentFormattingTest(unittest.TestCase):
+class AgentFormattingTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def test_output_format_and_is_agent_mode(self) -> None:
         self.assertEqual(agent.output_format(argparse.Namespace(), env={}), "human")

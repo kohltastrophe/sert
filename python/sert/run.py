@@ -1103,7 +1103,7 @@ class RunResult:
 
     @property
     def crashed(self) -> list[EntryRun]:
-        failing = {test["entry"] for test in self.tests if test.get("status") == "fail"}
+        failing = {test.get("entry") for test in self.tests if test.get("status") == "fail" and test.get("entry")}
         return [run for run in self.entries if (run.timed_out or run.code) and run.entry not in failing]
 
 
@@ -1494,7 +1494,7 @@ def run_entries(
             chunks.append(coverage_out.read_text(encoding="utf-8", errors="replace"))
         if run.timed_out:
             if echo:
-                lost = not any(test["entry"] == entry for test in result.tests)
+                lost = not any(test.get("entry") == entry for test in result.tests)
                 note(
                     f"{entry}: timed out after {timeout:g}s"
                     + (
@@ -1655,7 +1655,7 @@ def xml_text(value) -> str:
 def junit_xml(result: RunResult) -> bytes:
     suites: dict[str, list[dict]] = {}
     for test in result.tests:
-        suites.setdefault(str(test.get("file") or test["entry"]), []).append(test)
+        suites.setdefault(str(test.get("file") or test.get("entry") or "sert"), []).append(test)
     for run in result.crashed:
         why = "timed out" if run.timed_out else f"exited {run.code}"
         tail = run.output.strip().splitlines()[-20:]
@@ -2295,7 +2295,7 @@ def _record_run_coverage(
         sub_cov = {src: lines for src, lines in cov_files.items() if graph_mod._norm_rel(src, root) in deps}
         if not sub_cov:
             sub_cov = cov_files
-        graph_mod.record_spec_coverage(root, norm_spec, sub_cov, ms_by_spec.get(norm_spec, default_ms))
+        graph_mod.record_spec_coverage(root, norm_spec, sub_cov, ms_by_spec.get(norm_spec, default_ms), exact=False)
 
 
 def _collect_telemetry(result: RunResult, parsed_list: list[markers_mod.Parsed]) -> dict:

@@ -6,23 +6,19 @@ import argparse
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
-import helpers  # noqa: F401
+import helpers
 from sert import check, cli, coverage, lint, mutate, run
 
 
-class AgentFeaturesTest(unittest.TestCase):
+class AgentFeaturesTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def test_uncovered_ranges(self) -> None:
         self.assertEqual(coverage._uncovered_ranges({1: 1, 2: 1}), "")

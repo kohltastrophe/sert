@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
-import helpers  # noqa: F401
+import helpers
 from sert import config, graph, markers
 
 
@@ -74,13 +73,11 @@ class MarkersExtensionsTest(unittest.TestCase):
         self.assertEqual(parsed.tautologies, [])
 
 
-class GraphTiaTest(unittest.TestCase):
+class GraphTiaTest(helpers.Case):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
+        super().setUp()
+        self.root = self.tmp / "proj"
+        self.root.mkdir()
 
     def _build_sample_repo(self) -> config.Config:
         _write(

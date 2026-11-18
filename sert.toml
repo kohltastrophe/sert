@@ -10,7 +10,6 @@ min = 90
 
 [mutate]
 include = ["src"]
-timeout = 0.5
 
 # Compile-time probes of the public types (run by `sert lint` or `sert lint --only types`): pass files analyze clean,
 # fail files error on exactly their `-- expect-error` lines, under both solvers.

@@ -800,7 +800,7 @@ def _file_sha256(path: Path) -> str:
         return ""
 
 
-def record_spec_coverage(root: Path, spec_rel: str, cov_files: dict, ms: int) -> dict:
+def record_spec_coverage(root: Path, spec_rel: str, cov_files: dict, ms: int, *, exact: bool = True) -> dict:
     """Update `.sert/coverage-map.json` for `spec_rel` from LCOV coverage (`cov_files`) and duration `ms`."""
     root_path = Path(root)
     norm_spec = _norm_rel(spec_rel, root_path)
@@ -821,11 +821,14 @@ def record_spec_coverage(root: Path, spec_rel: str, cov_files: dict, ms: int) ->
                 norm_files[src_rel] = hits
 
     cov_map = load_coverage_map(root_path)
-    cov_map["specs"][norm_spec] = {
+    spec_entry: dict = {
         "ms": max(0, int(round(ms))),
         "sha256": _file_sha256(root_path / norm_spec),
         "files": norm_files,
     }
+    if not exact:
+        spec_entry["exact"] = False
+    cov_map["specs"][norm_spec] = spec_entry
     save_coverage_map(root_path, cov_map)
     return cov_map
 
@@ -916,6 +919,9 @@ def covering_specs_for_line(
     rel_file: str,
     line: int,
     all_specs: list[str],
+    *,
+    cov_map: dict | None = None,
+    dep_graph: DependencyGraph | None = None,
 ) -> list[str]:
     """Return specs covering `(rel_file, line)` via coverage map + reverse static graph, fastest (`ms`) first."""
     root_path = Path(root)
@@ -929,7 +935,7 @@ def covering_specs_for_line(
             spec_norms.append(ns)
     spec_set = set(spec_norms)
 
-    cov_map = load_coverage_map(root_path)
+    cov_map = load_coverage_map(root_path) if cov_map is None else cov_map
     raw_specs_cov = cov_map.get("specs") if isinstance(cov_map.get("specs"), dict) else {}
     specs_cov = {_norm_rel(k, root_path): v for k, v in raw_specs_cov.items() if isinstance(v, dict)}
     exact_hits: set[str] = set()
@@ -946,7 +952,7 @@ def covering_specs_for_line(
             exact_hits.add(norm_spec)
 
     # 2. Reverse static import edges (transitive dependents)
-    graph = build_graph(root_path, cfg)
+    graph = build_graph(root_path, cfg) if dep_graph is None else dep_graph
     hits: set[str] = set(exact_hits)
     if target_file in spec_set:
         hits.add(target_file)
