@@ -2060,4 +2060,29 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 		sert.eq(strictRes.passed, 3)
 		sert.eq(strictRes.failed, 0)
 	end)
+
+	test("world:fastForward advances server task.wait timers and Heartbeat dt in discrete jumps", function()
+		local w = Sim.new({ seed = 11 })
+		local srv = w:server()
+		local heartbeats = 0
+		local dtSum = 0
+		srv.RunService.Heartbeat:Connect(function(dt: number)
+			heartbeats += 1
+			dtSum += dt
+		end)
+
+		local waitedAt = -1
+		local sEnv = srv:env()
+		srv:spawn(function()
+			local elapsed = sEnv.task.wait(12)
+			waitedAt = elapsed
+		end)
+
+		local advanced = w:fastForward(61)
+		sert.near(advanced, 61, 1e-6)
+		sert.near(w:now(), 61, 1e-6)
+		sert.near(waitedAt, 12, 1e-6)
+		sert.near(dtSum, 61, 1e-6)
+		sert.le(heartbeats, 4)
+	end)
 end)

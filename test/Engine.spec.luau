@@ -1173,6 +1173,57 @@ describe("Scheduler helpers and Signal.fromWorld", function()
 		sert.eq(s1:runUntil(function() return false end, 0.1), false)
 	end)
 
+	test("Scheduler.fastForward skips empty frames while waking timers in exact chronological order", function()
+		local Scheduler = sert.sim.Scheduler
+		local s = Scheduler.new({ seed = 7, frame = 1 / 60 })
+		local hookDtTotal = 0
+		s:onFrame(function(dt: number)
+			hookDtTotal += dt
+		end, "hook")
+
+		-- Jumping with 0 active timers executes 1 frame with full dt
+		local jumped0 = s:fastForward(61)
+		sert.near(jumped0, 61, 1e-6)
+		sert.near(s.now, 61, 1e-6)
+		sert.eq(s.frames, 1)
+		sert.near(hookDtTotal, 61, 1e-6)
+		sert.eq(s:fastForward(0), 0)
+		sert.eq(s.frames, 1)
+
+		-- Cancelled mid-timer is skipped; due timers fire in ascending wake order with accurate timestamps
+		local log: { string } = {}
+		local baseFrames = s.frames
+		s:after(5, "early", function() table.insert(log, `early@{s.now}`) end)
+		local cancelledThread = s:after(15, "mid", function() table.insert(log, "cancelled") end)
+		s:after(30, "late", function() table.insert(log, `late@{s.now}`) end)
+		s:cancel(cancelledThread)
+
+		local jumped1 = s:fastForward(50)
+		sert.near(jumped1, 50, 1e-6)
+		sert.near(s.now, 111, 1e-6)
+		sert.eq(log, { "early@66", "late@91" })
+		-- Only 3 frames executed for a 50s jump (+5s wake, +25s wake, +20s end)
+		sert.eq(s.frames - baseFrames, 3)
+		sert.near(hookDtTotal, 111, 1e-6)
+	end)
+
+	test("Scheduler.cancel skips another timer popped into the same wakeTimers due batch", function()
+		local Scheduler = sert.sim.Scheduler
+		local s = Scheduler.new({ seed = 1 })
+		local ran1, ran2 = false, false
+		local t2: thread
+		s:after(0.1, "a", function()
+			ran1 = true
+			s:cancel(t2)
+		end)
+		t2 = s:after(0.2, "a", function() ran2 = true end)
+
+		s:frame(0.5)
+		sert.eq(ran1, true)
+		sert.eq(ran2, false)
+		sert.eq(#s.errors, 0)
+	end)
+
 	test("Signal.fromWorld supports Immediate vs Deferred dispatch and Wait from world tasks", function()
 		local w = sert.sim.new({ seed = 1 })
 		local srv = w:server({ name = "srv", skew = 0 })

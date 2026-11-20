@@ -679,6 +679,8 @@ function World.run(w: any, seconds: number)
 	end
 end
 
+function World.fastForward(w: any, seconds: number): number return w.scheduler:fastForward(seconds) end
+
 function World.advance(w: any, seconds: number) w:run(seconds) end
 
 function World.runUntil(w: any, target: number | () -> boolean, limit: number?): boolean

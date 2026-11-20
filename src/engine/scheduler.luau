@@ -98,6 +98,7 @@ export type Scheduler = {
 	drain: (self: Scheduler) -> (),
 	frame: (self: Scheduler, dt: number?) -> number,
 	runFor: (self: Scheduler, seconds: number) -> (),
+	fastForward: (self: Scheduler, seconds: number) -> number,
 	runUntil: (self: Scheduler, target: number | () -> boolean, limit: number?) -> boolean,
 	idle: (self: Scheduler) -> boolean,
 	running: (self: Scheduler) -> boolean,
@@ -141,6 +142,7 @@ type State = {
 	onError: ((failure: Failure) -> ())?,
 	seq: number,
 	timers: { Timer },
+	dueBatches: { { Timer } },
 	queue: { [number]: Deferred },
 	head: number,
 	tail: number,
@@ -301,6 +303,7 @@ function Scheduler.new(options: Options?): Scheduler
 		onError = given.onError,
 		seq = 0,
 		timers = {},
+		dueBatches = {},
 		queue = {},
 		head = 1,
 		tail = 0,
@@ -505,6 +508,14 @@ local function maybeCompactTimers(timers: { Timer }, cancelled: number)
 	end
 end
 
+local function cancelBatchedTimers(batches: { { Timer } }, match: (Timer) -> boolean)
+	for _, batch in batches do
+		for _, timer in batch do
+			if match(timer) then timer.cancelled = true end
+		end
+	end
+end
+
 function Scheduler.cancel(s: State, thread: thread)
 	if type(thread) ~= "thread" then error("task.cancel expects a thread", 2) end
 	if thread == s.testThread or thread == coroutine.running() then
@@ -519,6 +530,7 @@ function Scheduler.cancel(s: State, thread: thread)
 			cancelled += 1
 		end
 	end
+	cancelBatchedTimers(s.dueBatches, function(timer: Timer): boolean return timer.thread == thread end)
 	maybeCompactTimers(s.timers, cancelled)
 	for i = s.head, s.tail do
 		if s.queue[i].thread == thread then s.queue[i].cancelled = true end
@@ -537,6 +549,7 @@ function Scheduler.crash(s: State, owner: any)
 			cancelled += 1
 		end
 	end
+	cancelBatchedTimers(s.dueBatches, function(timer: Timer): boolean return timer.owner == owner end)
 	maybeCompactTimers(s.timers, cancelled)
 	for i = s.head, s.tail do
 		if s.queue[i].owner == owner then s.queue[i].cancelled = true end
@@ -612,6 +625,7 @@ local function wakeTimers(s: State)
 			end
 		end
 	end
+	table.insert(s.dueBatches, due)
 	for _, timer in due do
 		if timer.cancelled then continue end
 		local args = timer.args
@@ -621,6 +635,7 @@ local function wakeTimers(s: State)
 			resume(s, timer.thread, timer.owner, timer.seq, table.unpack(args, 1, args.n))
 		end
 	end
+	table.remove(s.dueBatches)
 end
 
 function Scheduler.frame(s: State, dt: number?): number
@@ -680,6 +695,39 @@ function Scheduler.runFor(s: State, seconds: number)
 	while s.now + util.EPSILON < stop do
 		Scheduler.frame(s)
 	end
+end
+
+--- Advances virtual time directly across scheduled timer wakes up to `seconds`, delivering accurate `dt` without spinning empty frames.
+function Scheduler.fastForward(s: State, seconds: number): number
+	local duration = math.max(0, seconds)
+	local start = s.now
+	if duration <= 0 then
+		breathe(s)
+		drain(s)
+		return 0
+	end
+	local stop = start + duration
+	breathe(s)
+	drain(s)
+	while s.now + util.EPSILON < stop do
+		while #s.timers > 0 and s.timers[1].cancelled do
+			pop(s.timers)
+		end
+		local nextWake = if #s.timers > 0 then s.timers[1].wake else nil
+		local dt: number
+		if nextWake ~= nil and nextWake <= stop + util.EPSILON then
+			local delta = nextWake - s.now
+			if delta <= util.EPSILON then
+				dt = math.min(1 / 60, stop - s.now)
+			else
+				dt = math.min(delta, stop - s.now)
+			end
+		else
+			dt = stop - s.now
+		end
+		Scheduler.frame(s, dt)
+	end
+	return s.now - start
 end
 
 function Scheduler.runUntil(s: State, target: number | () -> boolean, limit: number?): boolean
