@@ -353,216 +353,10 @@ def code_lines(text: str, keep_strings: bool = False) -> list[str]:
 # -- Token-stream type annotation & scope analysis -------------------------------------------------------------------
 
 
-def _skip_balanced(tokens: list[luau_lex.Token], idx: int, open_op: str, close_op: str) -> int:
-    n = len(tokens)
-    depth = 0
-    while idx < n:
-        tok = tokens[idx]
-        if tok.kind == "OP":
-            if tok.value == open_op:
-                depth += 1
-            elif tok.value == close_op:
-                depth -= 1
-                if depth <= 0:
-                    return idx + 1
-        idx += 1
-    return n
-
-
-def _skip_type_angles(tokens: list[luau_lex.Token], idx: int) -> int:
-    n = len(tokens)
-    if idx >= n or not (tokens[idx].kind == "OP" and tokens[idx].value == "<" and tokens[idx].is_type_angle):
-        return idx
-    depth = 0
-    while idx < n:
-        tok = tokens[idx]
-        if tok.kind == "OP" and tok.is_type_angle:
-            if tok.value == "<":
-                depth += 1
-            elif tok.value == ">":
-                depth -= 1
-                if depth <= 0:
-                    return idx + 1
-        idx += 1
-    return n
-
-
-def _consume_type_expr(tokens: list[luau_lex.Token], idx: int) -> int:
-    """Consume a Luau type expression starting at `tokens[idx]`, returning the next non-type token index."""
-    n = len(tokens)
-    while idx < n and tokens[idx].kind == "OP" and tokens[idx].value in ("|", "&"):
-        idx += 1
-
-    while idx < n:
-        tok = tokens[idx]
-        # Generic function type `<T>(T) -> T`
-        if tok.kind == "OP" and tok.value == "<" and tok.is_type_angle:
-            idx = _skip_type_angles(tokens, idx)
-            if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "(":
-                idx = _skip_balanced(tokens, idx, "(", ")")
-                if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "->":
-                    idx = _consume_type_expr(tokens, idx + 1)
-        elif tok.kind == "OP" and tok.value == "(":
-            idx = _skip_balanced(tokens, idx, "(", ")")
-            if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "->":
-                idx = _consume_type_expr(tokens, idx + 1)
-        elif tok.kind == "OP" and tok.value == "{":
-            idx = _skip_balanced(tokens, idx, "{", "}")
-        elif tok.kind == "STRING" or (tok.kind == "KEYWORD" and tok.value in ("nil", "true", "false")):
-            idx += 1
-        elif tok.kind == "OP" and tok.value == "...":
-            idx += 1
-            if idx < n and tokens[idx].kind == "IDENT":
-                idx = _consume_type_expr(tokens, idx)
-        elif tok.kind == "IDENT":
-            if tok.value == "typeof" and idx + 1 < n and tokens[idx + 1].kind == "OP" and tokens[idx + 1].value == "(":
-                idx = _skip_balanced(tokens, idx + 1, "(", ")")
-            else:
-                idx += 1
-                while idx + 1 < n and tokens[idx].kind == "OP" and tokens[idx].value == "." and tokens[idx + 1].kind == "IDENT":
-                    idx += 2
-                idx = _skip_type_angles(tokens, idx)
-                if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "...":
-                    idx += 1
-        else:
-            break
-
-        while idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "?":
-            idx += 1
-        if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "->":
-            idx += 1
-            continue
-        if idx < n and tokens[idx].kind == "OP" and tokens[idx].value in ("|", "&"):
-            # Guard against multiline type alias followed on next line by something else? In Luau `|`/`&` always continues type.
-            idx += 1
-            continue
-        break
-    return idx
-
-
-def _mark_type_tokens(tokens: list[luau_lex.Token]) -> list[bool]:
-    """Return a boolean mask marking every token belonging to a Luau type declaration, annotation, cast, or generic."""
-    n = len(tokens)
-    in_type = [False] * n
-
-    def mark(lo: int, hi: int) -> None:
-        for k in range(max(0, lo), min(n, hi)):
-            in_type[k] = True
-
-    i = 0
-    while i < n:
-        tok = tokens[i]
-        # 1. `[export] type ...` or `[export] type function ... end`
-        if tok.kind == "KEYWORD" and tok.value == "export" and i + 1 < n and tokens[i + 1].kind == "KEYWORD" and tokens[i + 1].value == "type":
-            mark(i, i + 1)
-            i += 1
-            tok = tokens[i]
-
-        if tok.kind == "KEYWORD" and tok.value == "type":
-            if i + 1 < n and tokens[i + 1].kind == "KEYWORD" and tokens[i + 1].value == "function":
-                # `type function Name(...) ... end`
-                depth = 0
-                j = i + 1
-                while j < n:
-                    if tokens[j].kind == "KEYWORD":
-                        if tokens[j].value in ("function", "if", "do"):
-                            depth += 1
-                        elif tokens[j].value == "end":
-                            depth -= 1
-                            if depth <= 0:
-                                j += 1
-                                break
-                    j += 1
-                mark(i, j)
-                i = j
-                continue
-            # `type Name[<...>] = TypeExpr`
-            j = i + 1
-            if j < n and tokens[j].kind == "IDENT":
-                j += 1
-            j = _skip_type_angles(tokens, j)
-            if j < n and tokens[j].kind == "OP" and tokens[j].value == "=":
-                end_t = _consume_type_expr(tokens, j + 1)
-                mark(i, end_t)
-                i = end_t
-                continue
-
-        # 2. Generic `<...>` (`f<number>(x)`, `function foo<T>(...)`)
-        if tok.kind == "OP" and tok.value == "<" and tok.is_type_angle and not in_type[i]:
-            end_g = _skip_type_angles(tokens, i)
-            mark(i, end_g)
-            i = end_g
-            continue
-
-        # 3. Cast `:: TypeExpr`
-        if tok.kind == "OP" and tok.value == "::":
-            end_c = _consume_type_expr(tokens, i + 1)
-            mark(i, end_c)
-            i = end_c
-            continue
-
-        # 4. `local` / `const` / `for` binding `: TypeExpr`
-        if tok.kind == "KEYWORD" and tok.value in ("local", "const", "for"):
-            if i + 1 < n and not (tokens[i + 1].kind == "KEYWORD" and tokens[i + 1].value in ("function", "type")):
-                j = i + 1
-                while j < n:
-                    if tokens[j].kind == "ATTR":
-                        j += 1
-                        if tokens[j - 1].value == "@[":
-                            j = _skip_balanced(tokens, j - 1, "@[", "]")
-                        continue
-                    if tokens[j].kind != "IDENT":
-                        break
-                    j += 1
-                    if j < n and tokens[j].kind == "OP" and tokens[j].value == ":":
-                        end_ann = _consume_type_expr(tokens, j + 1)
-                        mark(j, end_ann)
-                        j = end_ann
-                    if j < n and tokens[j].kind == "OP" and tokens[j].value == ",":
-                        j += 1
-                        continue
-                    break
-                i = j
-                continue
-
-        # 5. `function` signature parameter types & `: ReturnType`
-        if tok.kind == "KEYWORD" and tok.value == "function":
-            j = i + 1
-            # Optional name `a.b:c`
-            if j < n and tokens[j].kind == "IDENT":
-                j += 1
-                while j + 1 < n and tokens[j].kind == "OP" and tokens[j].value in (".", ":") and tokens[j + 1].kind == "IDENT":
-                    j += 2
-            # Optional `<T>`
-            if j < n and tokens[j].kind == "OP" and tokens[j].value == "<" and tokens[j].is_type_angle:
-                end_g = _skip_type_angles(tokens, j)
-                mark(j, end_g)
-                j = end_g
-            # Parameter list `(...)`
-            if j < n and tokens[j].kind == "OP" and tokens[j].value == "(":
-                j += 1
-                while j < n and not (tokens[j].kind == "OP" and tokens[j].value == ")"):
-                    if tokens[j].kind == "IDENT" or (tokens[j].kind == "OP" and tokens[j].value == "..."):
-                        j += 1
-                        if j < n and tokens[j].kind == "OP" and tokens[j].value == ":":
-                            end_p = _consume_type_expr(tokens, j + 1)
-                            mark(j, end_p)
-                            j = end_p
-                    if j < n and tokens[j].kind == "OP" and tokens[j].value == ",":
-                        j += 1
-                    elif j < n and not (tokens[j].kind == "OP" and tokens[j].value == ")"):
-                        j += 1
-                if j < n and tokens[j].kind == "OP" and tokens[j].value == ")":
-                    j += 1
-                if j < n and tokens[j].kind == "OP" and tokens[j].value == ":":
-                    end_ret = _consume_type_expr(tokens, j + 1)
-                    mark(j, end_ret)
-                    j = end_ret
-                i = j
-                continue
-
-        i += 1
-    return in_type
+_skip_balanced = luau_lex._skip_balanced
+_skip_type_angles = luau_lex._skip_type_angles
+_consume_type_expr = luau_lex._consume_type_expr
+_mark_type_tokens = luau_lex.mark_type_tokens
 
 
 def _function_body_start(tokens: list[luau_lex.Token], fn_idx: int, in_type: list[bool]) -> int:
@@ -2228,7 +2022,7 @@ def summary_markdown(mutants: list[Mutant], score: float, max_survived: int = 20
 
 
 DEFAULT_TIMEOUT = 5.0
-MIN_MUTANT_TIMEOUT = 1.0
+MIN_MUTANT_TIMEOUT = 2.0
 BATCH_SIZE = 32
 MAX_INDIVIDUAL_ROUTE_STAGES = 2
 BASELINE_TIMEOUT_FACTOR = 4.0
@@ -2239,7 +2033,7 @@ _SKIP_ROOT_DIRS = frozenset({"python", "docs", "dist", "build", "actions", ".git
 _SKIP_IN_SERT = frozenset({"mutate", "fuzz", "bin", "cache"})
 _LUAU_OVERLAY_SUFFIXES = (".luau", ".lua", ".json", ".txt", ".toml")
 _DRIVE_RE = coverage_mod._DRIVE_RE
-BASELINE_FACTOR = 2.0
+BASELINE_FACTOR = 4.5
 
 
 def add_parser(subparsers) -> None:
@@ -2460,6 +2254,8 @@ def baseline_run(
     timeout_sec: float,
     codegen: bool = False,
     program_args: list[str] | tuple[str, ...] = (),
+    *,
+    enforce_limit: bool = True,
 ) -> float:
     cmd = _mutant_command(runner, luau_bin, entry, 0, spec_filter, codegen=codegen, program_args=program_args)
     hint = f"; raise --timeout (or [mutate].timeout, now {timeout_sec:g}s) above the suite's run time"
@@ -2471,7 +2267,7 @@ def baseline_run(
     elapsed = time.monotonic() - started
     if res.returncode != 0:
         raise SertError(f"mutate: baseline check failed on {entry} (filter={spec_filter!r}): {(res.stderr or res.stdout or '').strip()}")
-    if elapsed > timeout_sec:
+    if enforce_limit and elapsed > timeout_sec:
         raise SertError(f"mutate: the unmutated baseline run of {entry} (filter={spec_filter!r}) took {elapsed:.2f}s, longer than the {timeout_sec:g}s per-mutant timeout" + hint)
     return elapsed
 
@@ -2520,6 +2316,18 @@ def _mutant_cache_key(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _parse_cached_timeout(value: str) -> float | None:
+    if not value.startswith("TIMEOUT:"):
+        return None
+    try:
+        parsed = float(value.split(":", 1)[1])
+    except ValueError:
+        return None
+    if parsed != parsed or parsed < 0:
+        return None
+    return parsed
+
+
 def _load_mutant_cache(cache_path: Path) -> dict[str, str]:
     if not cache_path.is_file():
         return {}
@@ -2530,7 +2338,58 @@ def _load_mutant_cache(cache_path: Path) -> dict[str, str]:
     entries = raw.get("entries") if isinstance(raw, dict) else None
     if not isinstance(entries, dict):
         return {}
-    return {str(k): str(v) for k, v in entries.items() if v in ("KILLED", "SURVIVED")}
+    return {
+        str(k): str(v)
+        for k, v in entries.items()
+        if isinstance(v, str) and (v in ("KILLED", "SURVIVED") or _parse_cached_timeout(v) is not None)
+    }
+
+
+def _spec_deps_digest(
+    root: Path,
+    spec_rel: str,
+    files_map: object,
+    dep_graph: graph.DependencyGraph,
+    sha_memo: dict[str, str],
+) -> str:
+    deps: set[str] = set(dep_graph.dependencies(spec_rel, transitive=True))
+    if isinstance(files_map, dict):
+        for raw_src in files_map:
+            src_norm = graph._norm_rel(raw_src, root)
+            if (root / src_norm).is_file():
+                deps.add(src_norm)
+    deps.discard(spec_rel)
+    pairs = [(d, _file_sha256_cached(root, d, sha_memo)) for d in sorted(deps)]
+    return hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _norm_spec_token(path_str: str) -> str:
+    cleaned = path_str.strip().lstrip("@=").replace("\\", "/").lower()
+    if cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    for suffix in (".luau", ".lua"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    if cleaned.endswith(".spec"):
+        cleaned = cleaned[:-5]
+    return cleaned
+
+
+def _specs_for_file_filter(spec_filter: str | None, all_specs_norm: list[str]) -> list[str]:
+    if not isinstance(spec_filter, str) or not spec_filter.startswith("@file="):
+        return []
+    wanted = [_norm_spec_token(part) for part in spec_filter[6:].split(",")]
+    wanted = [part for part in wanted if part]
+    if not wanted:
+        return []
+    matched: list[str] = []
+    for spec in all_specs_norm:
+        norm = _norm_spec_token(spec)
+        base = norm.rsplit("/", 1)[-1]
+        if any(norm == item or base == item or norm.endswith("/" + item) for item in wanted):
+            matched.append(spec)
+    return matched
 
 
 def _save_mutant_cache(cache_path: Path, entries: dict[str, str]) -> None:
@@ -2544,12 +2403,25 @@ def _save_mutant_cache(cache_path: Path, entries: dict[str, str]) -> None:
         pass
 
 
+_SPEC_STEM_STOPWORDS = frozenset({"and", "init", "shared", "src", "client", "server"})
+_SPEC_TOKEN_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|[A-Z]+|\d+")
+
+
+def _spec_stem_tokens(raw_stem: str) -> set[str]:
+    tokens = {raw_stem.lower()}
+    for tok in _SPEC_TOKEN_RE.findall(raw_stem):
+        low = tok.lower()
+        if low and low not in _SPEC_STEM_STOPWORDS:
+            tokens.add(low)
+    return tokens
+
+
 def _spec_stem(rel_path: str) -> str:
     name = Path(rel_path).name
     for suffix in (".spec.luau", ".spec.lua", ".luau", ".lua"):
         if name.endswith(suffix):
-            return name[: -len(suffix)].lower()
-    return Path(name).stem.lower()
+            return name[: -len(suffix)]
+    return Path(name).stem
 
 
 def _prioritize_route_specs(
@@ -2557,9 +2429,10 @@ def _prioritize_route_specs(
     covering_specs: tuple[str, ...],
     dep_graph: graph.DependencyGraph,
     root: Path,
+    specs_cov: dict[str, dict] | None = None,
 ) -> tuple[str, ...]:
-    """Keep fastest-first order when <= 2 specs; otherwise front stem matches and direct 1-hop importers."""
-    if len(covering_specs) <= 2:
+    """Keep single covering spec as-is; otherwise front stem/token matches and direct 1-hop importers."""
+    if len(covering_specs) <= 1:
         return covering_specs
     rel_norm = graph._norm_rel(rel_file, root)
     path_obj = Path(rel_norm)
@@ -2567,22 +2440,42 @@ def _prioritize_route_specs(
     stems: set[str] = set()
     if stem and stem != "init":
         stems.add(stem)
-    parent_name = path_obj.parent.name.lower()
-    if parent_name and parent_name != "src":
-        stems.add(parent_name)
+    for part in path_obj.parts[:-1]:
+        low = part.lower()
+        if low and low not in _SPEC_STEM_STOPWORDS:
+            stems.add(low)
     direct = dep_graph.reverse.get(rel_norm, set())
 
     tier1: list[str] = []
     tier2: list[str] = []
     tier3: list[str] = []
     for spec in covering_specs:
-        if _spec_stem(spec) in stems:
+        spec_tokens = _spec_stem_tokens(_spec_stem(spec))
+        if spec_tokens & stems:
             tier1.append(spec)
         elif graph._norm_rel(spec, root) in direct:
             tier2.append(spec)
         else:
             tier3.append(spec)
-    return tuple(tier1 + tier2 + tier3)
+
+    def _rank_tier(tier: list[str]) -> list[str]:
+        if not specs_cov or len(tier) <= 1:
+            return tier
+        counts: dict[str, int] = {}
+        for spec in tier:
+            entry = specs_cov.get(graph._norm_rel(spec, root))
+            fmap = entry.get("files") if isinstance(entry, dict) else None
+            hits = fmap.get(rel_norm) if isinstance(fmap, dict) else None
+            counts[spec] = len(hits) if isinstance(hits, list) else 0
+        max_hits = max(counts.values(), default=0)
+        if max_hits <= 0:
+            return tier
+        threshold = max_hits * 0.5
+        indexed = list(enumerate(tier))
+        indexed.sort(key=lambda pair: (0 if counts[pair[1]] >= threshold else 1, pair[0]))
+        return [spec for _idx, spec in indexed]
+
+    return tuple(_rank_tier(tier1) + _rank_tier(tier2) + _rank_tier(tier3))
 
 
 def _collect_per_spec_coverage(
@@ -2742,7 +2635,7 @@ def main(args) -> int:
     no_cache = bool(getattr(args, "no_cache", False))
     cfg = config_mod.from_args(args)
     table, cov_table = cfg.table("mutate"), cfg.table("coverage")
-    codegen = bool(cfg.get("test.codegen", True))
+    codegen = bool(table.get("codegen", cfg.get("test.codegen", True)))
     benign_calls = [str(p) for p in as_list(table.get("benign_calls"))]
     cosmetic_props = [str(p) for p in as_list(table.get("cosmetic_props"))]
 
@@ -2931,7 +2824,24 @@ def main(args) -> int:
                 if isinstance(v, dict)
             }
 
-            if runner == "luau" and len(all_specs_norm) > 1 and any(m.spec_filter is None for m in all_mutants):
+            uses_file_override = any(
+                isinstance(m.spec_filter, str) and m.spec_filter.startswith("@file=")
+                for m in all_mutants
+            )
+            if runner == "luau" and len(all_specs_norm) > 1 and (any(m.spec_filter is None for m in all_mutants) or uses_file_override):
+                map_specs = cov_map.setdefault("specs", {})
+                stale_deleted = [
+                    k for k in list(map_specs)
+                    if not (cfg.root / graph._norm_rel(k, cfg.root)).is_file()
+                ]
+                for dead_key in stale_deleted:
+                    del map_specs[dead_key]
+                if stale_deleted:
+                    specs_cov = {
+                        graph._norm_rel(k, cfg.root): v
+                        for k, v in map_specs.items()
+                        if isinstance(v, dict)
+                    }
                 stale_specs = [
                     s
                     for s in all_specs_norm
@@ -2939,9 +2849,14 @@ def main(args) -> int:
                     or specs_cov[s].get("exact") is False
                     or (
                         "sha256" in specs_cov[s]
-                        and specs_cov[s]["sha256"] != _file_sha256_cached(cfg.root, s, spec_sha_memo)
+                        and (
+                            specs_cov[s]["sha256"] != _file_sha256_cached(cfg.root, s, spec_sha_memo)
+                            or specs_cov[s].get("deps_sha256")
+                            != _spec_deps_digest(cfg.root, s, specs_cov[s].get("files"), dep_graph, spec_sha_memo)
+                        )
                     )
                 ]
+                probed: dict[str, tuple[int, dict[str, list[int]]]] = {}
                 if stale_specs:
                     probed = _collect_per_spec_coverage(
                         cfg.root,
@@ -2954,20 +2869,20 @@ def main(args) -> int:
                         codegen,
                         program_args,
                     )
-                    if probed:
-                        map_specs = cov_map.setdefault("specs", {})
-                        for s, (ms, files_map) in probed.items():
-                            map_specs[s] = {
-                                "ms": ms,
-                                "sha256": _file_sha256_cached(cfg.root, s, spec_sha_memo),
-                                "files": files_map,
-                            }
-                        specs_cov = {
-                            graph._norm_rel(k, cfg.root): v
-                            for k, v in map_specs.items()
-                            if isinstance(v, dict)
+                    for s, (ms, files_map) in probed.items():
+                        map_specs[s] = {
+                            "ms": ms,
+                            "sha256": _file_sha256_cached(cfg.root, s, spec_sha_memo),
+                            "deps_sha256": _spec_deps_digest(cfg.root, s, files_map, dep_graph, spec_sha_memo),
+                            "files": files_map,
                         }
-                        graph.save_coverage_map(cfg.root, cov_map)
+                    specs_cov = {
+                        graph._norm_rel(k, cfg.root): v
+                        for k, v in map_specs.items()
+                        if isinstance(v, dict)
+                    }
+                if probed or stale_deleted:
+                    graph.save_coverage_map(cfg.root, cov_map)
 
             has_verified_exact = len(all_specs_norm) > 1 and all(
                 s in specs_cov and specs_cov[s].get("exact") is not False and "sha256" in specs_cov[s]
@@ -2997,6 +2912,7 @@ def main(args) -> int:
                             exact_index.setdefault((src_norm, ln), []).append(s)
 
             line_cov_cache: dict[tuple[str, int], tuple[str, ...]] = {}
+            allowed_specs_cache: dict[str, tuple[list[str], set[str]]] = {}
             if all_specs:
                 for m in all_mutants:
                     if m.spec_filter is None:
@@ -3018,6 +2934,19 @@ def main(args) -> int:
                                     )
                                 )
                         m.covering_specs = line_cov_cache[ck]
+                    elif has_verified_exact and m.spec_filter.startswith("@file="):
+                        allowed_pair = allowed_specs_cache.get(m.spec_filter)
+                        if allowed_pair is None:
+                            allowed_list = _specs_for_file_filter(m.spec_filter, all_specs_norm)
+                            allowed_pair = (allowed_list, set(allowed_list))
+                            allowed_specs_cache[m.spec_filter] = allowed_pair
+                        allowed_list, allowed_set = allowed_pair
+                        if allowed_list:
+                            m_norm = graph._norm_rel(m.file, cfg.root)
+                            exact_hits = exact_index.get((m_norm, m.line)) or []
+                            intersected = [s for s in exact_hits if s in allowed_set]
+                            m.covering_specs = tuple(intersected) if intersected else tuple(allowed_list)
+                            m.spec_filter = None
 
             # Check incremental mutant cache (`.sert/mutate/cache.json`)
             cache_path = cfg.root / CACHE_FILE
@@ -3033,7 +2962,12 @@ def main(args) -> int:
             cached_count = 0
             fallback_specs = sorted(all_specs) if all_specs else list(entries)
             for m in all_mutants:
-                base_refs = list(m.covering_specs) if m.covering_specs else fallback_specs
+                if m.covering_specs:
+                    base_refs = list(m.covering_specs)
+                elif matched := _specs_for_file_filter(m.spec_filter, all_specs_norm):
+                    base_refs = matched
+                else:
+                    base_refs = fallback_specs
                 memo_key = (m.file, tuple(base_refs))
                 spec_refs = dep_refs_memo.get(memo_key)
                 if spec_refs is None:
@@ -3044,6 +2978,13 @@ def main(args) -> int:
                         for dep in dep_graph.dependencies(s_norm, transitive=True):
                             if dep != m_norm and (cfg.root / dep).is_file():
                                 refs_set.add(dep)
+                        spec_entry = specs_cov.get(s_norm)
+                        files_map = spec_entry.get("files") if isinstance(spec_entry, dict) else None
+                        if isinstance(files_map, dict):
+                            for raw_src in files_map:
+                                src_norm = graph._norm_rel(raw_src, cfg.root)
+                                if src_norm != m_norm and (cfg.root / src_norm).is_file():
+                                    refs_set.add(src_norm)
                     spec_refs = sorted(refs_set)
                     dep_refs_memo[memo_key] = spec_refs
                 spec_hashes = [(s, _file_sha256_cached(cfg.root, s, spec_sha_memo)) for s in spec_refs]
@@ -3052,6 +2993,13 @@ def main(args) -> int:
                 cached_status = None if no_cache else cache_entries.get(ckey)
                 if cached_status in ("KILLED", "SURVIVED"):
                     m.status = cached_status
+                    cached_count += 1
+                elif (
+                    isinstance(cached_status, str)
+                    and (cached_t := _parse_cached_timeout(cached_status)) is not None
+                    and ((not explicit_timeout and cached_t > 0) or cached_t >= timeout_sec - 1e-6)
+                ):
+                    m.status = "TIMEOUT"
                     cached_count += 1
                 else:
                     uncached_mutants.append(m)
@@ -3068,7 +3016,16 @@ def main(args) -> int:
                     if missing:
                         futs = {
                             (filt, entry): pool.submit(
-                                baseline_run, runner, luau_bin, entry, filt or None, work_root, timeout_sec, codegen, program_args
+                                baseline_run,
+                                runner,
+                                luau_bin,
+                                entry,
+                                filt or None,
+                                work_root,
+                                timeout_sec,
+                                codegen,
+                                program_args,
+                                enforce_limit=explicit_timeout,
                             )
                             for filt, entry in missing
                         }
@@ -3102,7 +3059,7 @@ def main(args) -> int:
 
                 # 2. Zero-config routed mutants: run individual prioritized specs first, then sweep tail together
                 route_plan = {
-                    m.id: _prioritize_route_specs(m.file, m.covering_specs, dep_graph, cfg.root)
+                    m.id: _prioritize_route_specs(m.file, m.covering_specs, dep_graph, cfg.root, specs_cov=specs_cov)
                     for m in routed_mutants
                 }
                 stage = 0
@@ -3164,8 +3121,12 @@ def main(args) -> int:
                     stage += 1
 
                 for m in uncached_mutants:
-                    if m.status in ("KILLED", "SURVIVED") and m.id in cache_keys:
+                    if m.id not in cache_keys:
+                        continue
+                    if m.status in ("KILLED", "SURVIVED"):
                         cache_entries[cache_keys[m.id]] = m.status
+                    elif m.status == "TIMEOUT":
+                        cache_entries[cache_keys[m.id]] = f"TIMEOUT:{timeout_sec:.2f}"
                 _save_mutant_cache(cache_path, cache_entries)
         except BaseException:
             _kill_active_procs()

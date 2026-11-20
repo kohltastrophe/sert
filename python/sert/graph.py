@@ -506,6 +506,7 @@ def _statement_end_for_assignment(tokens: list[luau_lex.Token], start: int) -> i
 def extract_requires(source: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
     """Extract `(string_requires, instance_chain_requires)` from Luau `source` via `luau_lex.tokenize`."""
     tokens = luau_lex.tokenize(source, include_comments=False)
+    in_type = luau_lex.mark_type_tokens(tokens)
     n = len(tokens)
     str_reqs: list[str] = []
     chain_reqs: list[tuple[str, list[str]]] = []
@@ -514,6 +515,9 @@ def extract_requires(source: str) -> tuple[list[str], list[tuple[str, list[str]]
     i = 0
     while i < n:
         tok = tokens[i]
+        if in_type[i]:
+            i += 1
+            continue
 
         # Track simple `local X [: Type] = <chain>` bindings for `ReplicatedStorage:WaitForChild(...)` chains.
         if tok.kind == "KEYWORD" and tok.value in ("local", "const") and i + 1 < n and tokens[i + 1].kind == "IDENT":
@@ -821,9 +825,21 @@ def record_spec_coverage(root: Path, spec_rel: str, cov_files: dict, ms: int, *,
                 norm_files[src_rel] = hits
 
     cov_map = load_coverage_map(root_path)
+    cur_sha = _file_sha256(root_path / norm_spec)
+    prev_entry = cov_map["specs"].get(norm_spec)
+    if (
+        not exact
+        and isinstance(prev_entry, dict)
+        and prev_entry.get("exact") is not False
+        and isinstance(prev_entry.get("files"), dict)
+        and prev_entry.get("sha256") == cur_sha
+    ):
+        prev_entry["ms"] = max(0, int(round(ms)))
+        save_coverage_map(root_path, cov_map)
+        return cov_map
     spec_entry: dict = {
         "ms": max(0, int(round(ms))),
-        "sha256": _file_sha256(root_path / norm_spec),
+        "sha256": cur_sha,
         "files": norm_files,
     }
     if not exact:

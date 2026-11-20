@@ -319,6 +319,53 @@ class GraphTiaTest(helpers.Case):
         dep_graph = graph.build_graph(self.root, cfg)
         self.assertIn("src/core/math.luau", dep_graph.dependencies("test/slow.spec.luau", transitive=False))
 
+    def test_extract_requires_skips_type_only_typeof_require_references(self) -> None:
+        cfg = self._build_sample_repo()
+        _write(
+            self.root / "test/Harness.luau",
+            "\n".join(
+                [
+                    "--!strict",
+                    'local RuntimeDep = require("../src/core/base")',
+                    'export type MathMod = typeof(require("../src/core/math"))',
+                    'type EntryMod = typeof(require("../src/nested/entry"))',
+                    'local typedLocal: typeof(require("../src/unrelated"))? = nil',
+                    'local castVal = (nil :: any) :: typeof(require("../src/core/init"))',
+                    'local function useTypes(a: typeof(require("../src/shared/types"))): typeof(require("../src/nested/helpers/helper"))',
+                    "\treturn a :: any",
+                    "end",
+                    "return { dep = RuntimeDep, typedLocal = typedLocal, castVal = castVal, useTypes = useTypes }",
+                ]
+            )
+            + "\n",
+        )
+        dep_graph = graph.build_graph(self.root, cfg)
+        direct = dep_graph.dependencies("test/Harness.luau", transitive=False)
+        self.assertEqual(direct, {"src/core/base.luau"})
+
+    def test_record_spec_coverage_exact_false_preserves_matching_exact_entry(self) -> None:
+        cfg = self._build_sample_repo()
+        spec = "test/fast.spec.luau"
+        graph.record_spec_coverage(self.root, spec, {"src/core/math.luau": {2: True, 3: True}}, ms=45, exact=True)
+        # Preserve extra metadata like `deps_sha256` across aggregate `sert run --coverage` (`exact=False`)
+        cov_map = graph.load_coverage_map(self.root)
+        cov_map["specs"][spec]["deps_sha256"] = "abc123"
+        graph.save_coverage_map(self.root, cov_map)
+
+        updated = graph.record_spec_coverage(
+            self.root,
+            spec,
+            {"src/core/math.luau": {2: True}, "src/unrelated.luau": {1: True}},
+            ms=52,
+            exact=False,
+        )
+        entry = updated["specs"][spec]
+        self.assertNotIn("exact", entry)
+        self.assertEqual(entry["ms"], 52)
+        self.assertEqual(entry["deps_sha256"], "abc123")
+        self.assertEqual(entry["files"], {"src/core/math.luau": [2, 3]})
+        self.assertEqual(cfg.root, self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

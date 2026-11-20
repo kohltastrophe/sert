@@ -881,6 +881,293 @@ class MutateSchemaTest(Case):
         self.assertEqual([filt for ln, filt in observed_calls if ln == "3"], ["@file=test/Assert.spec.luau"])
         self.assertEqual([filt for ln, filt in observed_calls if ln == "6"], ["@file=test/Other.spec.luau"])
 
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_coverage_scoped_cache_deps_sha256_timeout_cache_and_file_override_scoping(self):
+        root = self.project(
+            "\n".join(
+                [
+                    "[test]",
+                    'specs = ["test/**/*.spec.luau"]',
+                    "codegen = false",
+                    "[coverage]",
+                    'include = ["src"]',
+                    "[mutate]",
+                    'include = ["src"]',
+                    "codegen = false",
+                    "[mutate.specs]",
+                    '"src/Math.luau" = "@file=test/Math.spec.luau"',
+                ]
+            )
+            + "\n",
+            name="scoped_cache_proj",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src").mkdir()
+        (root / "src/Math.luau").write_text(
+            "local M = {}\nfunction M.add(a: number, b: number): number\n\treturn a + b\nend\nreturn M\n"
+        )
+        (root / "src/Slow.luau").write_text(
+            "local S = {}\nfunction S.mul(a: number, b: number): number\n\treturn a * b\nend\nreturn S\n"
+        )
+        (root / "test").mkdir()
+        (root / "test/Math.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local Math = require("@lib/Math")',
+                    'sert.test("adds", function()',
+                    "\tsert.eq(Math.add(2, 3), 5)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test/Slow.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local Slow = require("@lib/Slow")',
+                    'sert.test("multiplies", function()',
+                    "\tsert.eq(Slow.mul(2, 3), 6)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "coverage.out").write_text(
+            "SF:src/Math.luau\nDA:3,1\nend_of_record\nSF:src/Slow.luau\nDA:3,1\nend_of_record\n"
+        )
+
+        # 1. Cold run populates coverage-map with `deps_sha256` and evaluates both Math and Slow
+        code1, out1, err1 = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1")
+        self.assertEqual((code1, out1.strip()), (0, "100.0"), err1)
+        cov_map = graph.load_coverage_map(root)
+        self.assertEqual(len(cov_map["specs"]["test/Math.spec.luau"].get("deps_sha256", "")), 64)
+        self.assertEqual(len(cov_map["specs"]["test/Slow.spec.luau"].get("deps_sha256", "")), 64)
+
+        # 2. Edit `src/Slow.luau` ONLY: `Math` (`@file=test/Math.spec.luau`) MUST stay cached while `Slow` re-runs
+        (root / "src/Slow.luau").write_text(
+            "local S = {}\nfunction S.mul(a: number, b: number): number\n\tlocal c = a\n\treturn c * b\nend\nreturn S\n"
+        )
+        (root / "coverage.out").write_text(
+            "SF:src/Math.luau\nDA:3,1\nend_of_record\nSF:src/Slow.luau\nDA:3,1\nDA:4,1\nend_of_record\n"
+        )
+        evaluated_files: list[str] = []
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def spy_eval(batch, *args, **kwargs):
+            for m in batch:
+                evaluated_files.append(m.file)
+            return orig_eval_batch(batch, *args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_eval):
+            code2, _, err2 = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--format", "json", "-j", "1"
+            )
+        self.assertEqual(code2, 0, err2)
+        self.assertTrue(all(f == "src/Slow.luau" for f in evaluated_files), evaluated_files)
+
+        # 3. Timeout caching: `TIMEOUT:<timeout>` is cached when timeout stays <= cached, invalidated when raised
+        cache_path = root / ".sert/mutate/cache.json"
+        with mock.patch.object(mutate, "_evaluate_one_mutant", return_value="TIMEOUT"):
+            with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=lambda b, *a, **k: setattr(b[0], "status", "TIMEOUT") or None):
+                pass
+        # Exercise `_load_mutant_cache` and timeout invalidation directly on deterministic fake batch outcome
+        (root / "src/Math.luau").write_text(
+            "local M = {}\nfunction M.add(a: number, b: number): number\n\treturn a + b\nend\nfunction M.z(a: number): number\n\treturn a + 1\nend\nreturn M\n"
+        )
+        (root / "coverage.out").write_text(
+            "SF:src/Math.luau\nDA:3,1\nend_of_record\nSF:src/Slow.luau\nDA:4,1\nend_of_record\n"
+        )
+        fake_calls = 0
+
+        def fake_timeout_batch(batch, *args, **kwargs):
+            nonlocal fake_calls
+            fake_calls += 1
+            for m in batch:
+                m.status = "TIMEOUT" if m.file == "src/Math.luau" else "KILLED"
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=fake_timeout_batch):
+            code3, out3, err3 = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--timeout", "5", "--format", "json", "-j", "1"
+            )
+        self.assertEqual(code3, 0, err3)
+        self.assertGreater(fake_calls, 0)
+        saved_entries = json.loads(cache_path.read_text())["entries"]
+        self.assertTrue(any(v == "TIMEOUT:5.00" for v in saved_entries.values()), saved_entries)
+
+        # Re-running at --timeout 5 must hit the cached TIMEOUT with zero batch evaluations
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=AssertionError("TIMEOUT should be cached")):
+            code4, out4, err4 = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--timeout", "5", "--format", "json", "-j", "1"
+            )
+        self.assertEqual(code4, 0, err4)
+        payload4 = json.loads(out4)
+        self.assertEqual(payload4["summary"]["timeout"], 1)
+        self.assertEqual(payload4["summary"]["cached"], 2)
+
+        # Raising --timeout 10 invalidates cached TIMEOUT:5.00 and re-evaluates only the timed-out mutant
+        re_eval_files: list[str] = []
+
+        def resolve_on_higher_timeout(batch, *args, **kwargs):
+            for m in batch:
+                re_eval_files.append(m.file)
+                m.status = "KILLED"
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=resolve_on_higher_timeout):
+            code5, out5, err5 = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--timeout", "10", "--format", "json", "-j", "1"
+            )
+        self.assertEqual(code5, 0, err5)
+        self.assertEqual(re_eval_files, ["src/Math.luau"])
+        self.assertEqual(json.loads(out5)["summary"]["timeout"], 0)
+
+        # 4. `[mutate].codegen = true` overrides `[test].codegen = false`
+        (root / "sert.toml").write_text(
+            (root / "sert.toml").read_text().replace("[mutate]\ninclude = [\"src\"]\ncodegen = false", "[mutate]\ninclude = [\"src\"]\ncodegen = true")
+        )
+        observed_codegen: list[bool] = []
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=lambda b, wr, r, lb, se, t, cg, *a, **k: (observed_codegen.append(cg), [setattr(m, "status", "KILLED") for m in b]) and None):
+            code6, _, err6 = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--no-cache", "-j", "1")
+        self.assertEqual(code6, 0, err6)
+        self.assertTrue(observed_codegen and all(observed_codegen), observed_codegen)
+
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_adaptive_baseline_enforce_limit_stem_token_density_and_file_allowlist_staging(self):
+        root = self.project(
+            "\n".join(
+                [
+                    "[test]",
+                    'specs = ["test/**/*.spec.luau"]',
+                    "[coverage]",
+                    'include = ["src"]',
+                    "[mutate]",
+                    'include = ["src"]',
+                    "[mutate.specs]",
+                    '"src/Data/init.luau" = "@file=test/DataAndSim.spec.luau,test/Incidental.spec.luau"',
+                ]
+            )
+            + "\n",
+            name="allowlist_routing",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src/Data").mkdir(parents=True)
+        (root / "src/Data/init.luau").write_text(
+            "\n".join(
+                [
+                    "local D = {}",
+                    "function D.add(a: number, b: number): number",
+                    "\treturn a + b",
+                    "end",
+                    "function D.extra(x: number): number",
+                    "\treturn x * 2",
+                    "end",
+                    "return D",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test").mkdir()
+        (root / "test/DataAndSim.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local D = require("@lib/Data")',
+                    'sert.test("data ops", function()',
+                    "\tsert.eq(D.add(2, 3), 5)",
+                    "\tsert.eq(D.extra(4), 8)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test/Incidental.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local D = require("@lib/Data")',
+                    'sert.test("only calls add", function()',
+                    "\tD.add(1, 1)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "coverage.out").write_text("SF:src/Data/init.luau\nDA:3,1\nDA:6,1\nend_of_record\n")
+
+        # 1. baseline_run enforce_limit=False succeeds even when elapsed > timeout_sec, while enforce_limit=True raises
+        fake_res = subprocess.CompletedProcess(args=["luau"], returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(mutate, "_run_process", return_value=fake_res),
+            mock.patch.object(mutate.time, "monotonic", side_effect=[10.0, 17.5, 10.0, 17.5]),
+        ):
+            elapsed = mutate.baseline_run("luau", "luau", ".sert/run.luau", None, root, 5.0, enforce_limit=False)
+            self.assertAlmostEqual(elapsed, 7.5, places=3)
+            with self.assertRaises(SertError):
+                mutate.baseline_run("luau", "luau", ".sert/run.luau", None, root, 5.0, enforce_limit=True)
+
+        # 2. _prioritize_route_specs fronts CamelCase token matches (DataAndSim) and dense-coverage specs ahead of incidental ones
+        dep_graph = graph.build_graph(root)
+        specs_cov_synth = {
+            "test/OtherFast.spec.luau": {"ms": 10, "files": {"src/Data/init.luau": [3]}},
+            "test/Incidental.spec.luau": {"ms": 20, "files": {"src/Data/init.luau": [3]}},
+            "test/OtherDense.spec.luau": {"ms": 100, "files": {"src/Data/init.luau": [3, 4, 5, 6]}},
+            "test/DataAndSim.spec.luau": {"ms": 200, "files": {"src/Data/init.luau": [3, 4, 5, 6]}},
+        }
+        prioritized = mutate._prioritize_route_specs(
+            "src/Data/init.luau",
+            ("test/OtherFast.spec.luau", "test/Incidental.spec.luau", "test/OtherDense.spec.luau", "test/DataAndSim.spec.luau"),
+            dep_graph,
+            root,
+            specs_cov=specs_cov_synth,
+        )
+        self.assertEqual(
+            prioritized,
+            (
+                "test/DataAndSim.spec.luau",
+                "test/Incidental.spec.luau",
+                "test/OtherDense.spec.luau",
+                "test/OtherFast.spec.luau",
+            ),
+        )
+        self.assertEqual(
+            mutate._prioritize_route_specs(
+                "src/Data/init.luau",
+                ("test/Incidental.spec.luau", "test/DataAndSim.spec.luau"),
+                dep_graph,
+                root,
+                specs_cov=specs_cov_synth,
+            ),
+            ("test/DataAndSim.spec.luau", "test/Incidental.spec.luau"),
+        )
+
+        # 3. @file=DataAndSim,Incidental intersects with exact per-line coverage so line 6 only runs DataAndSim (never Incidental)
+        observed: list[tuple[int, str]] = []
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def spy_batch(batch, *args, **kwargs):
+            for m in batch:
+                observed.append((m.line, m.spec_filter or ""))
+            return orig_eval_batch(batch, *args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_batch):
+            code, out, err = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1")
+        self.assertEqual((code, out.strip()), (0, "100.0"), err)
+        self.assertEqual(observed, [(3, "@file=test/DataAndSim.spec.luau"), (6, "@file=test/DataAndSim.spec.luau")])
+        # Stale/deleted spec entries in coverage-map.json are pruned automatically
+        cov_map = graph.load_coverage_map(root)
+        cov_map["specs"]["test/DeletedSpec.spec.luau"] = {"ms": 5, "sha256": "dead", "files": {}}
+        graph.save_coverage_map(root, cov_map)
+        code2, out2, err2 = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1")
+        self.assertEqual((code2, out2.strip()), (0, "100.0"), err2)
+        self.assertNotIn("test/DeletedSpec.spec.luau", graph.load_coverage_map(root)["specs"])
+
 
 if __name__ == "__main__":
     unittest.main()

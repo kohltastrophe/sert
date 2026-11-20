@@ -974,3 +974,215 @@ def is_if_statement(tokens: list[Token], idx: int, in_type: Sequence[bool] | Non
         if prev.value in _IF_EXPR_PREV_KEYWORDS:
             return False
     return True
+
+
+def _skip_balanced(tokens: list[Token], idx: int, open_op: str, close_op: str) -> int:
+    n = len(tokens)
+    depth = 0
+    while idx < n:
+        tok = tokens[idx]
+        if tok.kind == "OP":
+            if tok.value == open_op:
+                depth += 1
+            elif tok.value == close_op:
+                depth -= 1
+                if depth <= 0:
+                    return idx + 1
+        idx += 1
+    return n
+
+
+def _skip_type_angles(tokens: list[Token], idx: int) -> int:
+    n = len(tokens)
+    if idx >= n or not (tokens[idx].kind == "OP" and tokens[idx].value == "<" and tokens[idx].is_type_angle):
+        return idx
+    depth = 0
+    while idx < n:
+        tok = tokens[idx]
+        if tok.kind == "OP" and tok.is_type_angle:
+            if tok.value == "<":
+                depth += 1
+            elif tok.value == ">":
+                depth -= 1
+                if depth <= 0:
+                    return idx + 1
+        idx += 1
+    return n
+
+
+def _consume_type_expr(tokens: list[Token], idx: int) -> int:
+    """Consume a Luau type expression starting at `tokens[idx]`, returning the next non-type token index."""
+    n = len(tokens)
+    while idx < n and tokens[idx].kind == "OP" and tokens[idx].value in ("|", "&"):
+        idx += 1
+
+    while idx < n:
+        tok = tokens[idx]
+        # Generic function type `<T>(T) -> T`
+        if tok.kind == "OP" and tok.value == "<" and tok.is_type_angle:
+            idx = _skip_type_angles(tokens, idx)
+            if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "(":
+                idx = _skip_balanced(tokens, idx, "(", ")")
+                if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "->":
+                    idx = _consume_type_expr(tokens, idx + 1)
+        elif tok.kind == "OP" and tok.value == "(":
+            idx = _skip_balanced(tokens, idx, "(", ")")
+            if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "->":
+                idx = _consume_type_expr(tokens, idx + 1)
+        elif tok.kind == "OP" and tok.value == "{":
+            idx = _skip_balanced(tokens, idx, "{", "}")
+        elif tok.kind == "STRING" or (tok.kind == "KEYWORD" and tok.value in ("nil", "true", "false")):
+            idx += 1
+        elif tok.kind == "OP" and tok.value == "...":
+            idx += 1
+            if idx < n and tokens[idx].kind == "IDENT":
+                idx = _consume_type_expr(tokens, idx)
+        elif tok.kind == "IDENT":
+            if tok.value == "typeof" and idx + 1 < n and tokens[idx + 1].kind == "OP" and tokens[idx + 1].value == "(":
+                idx = _skip_balanced(tokens, idx + 1, "(", ")")
+            else:
+                idx += 1
+                while idx + 1 < n and tokens[idx].kind == "OP" and tokens[idx].value == "." and tokens[idx + 1].kind == "IDENT":
+                    idx += 2
+                idx = _skip_type_angles(tokens, idx)
+                if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "...":
+                    idx += 1
+        else:
+            break
+
+        while idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "?":
+            idx += 1
+        if idx < n and tokens[idx].kind == "OP" and tokens[idx].value == "->":
+            idx += 1
+            continue
+        if idx < n and tokens[idx].kind == "OP" and tokens[idx].value in ("|", "&"):
+            # Guard against multiline type alias followed on next line by something else? In Luau `|`/`&` always continues type.
+            idx += 1
+            continue
+        break
+    return idx
+
+
+def mark_type_tokens(tokens: list[Token]) -> list[bool]:
+    """Return a boolean mask marking every token belonging to a Luau type declaration, annotation, cast, or generic."""
+    n = len(tokens)
+    in_type = [False] * n
+
+    def mark(lo: int, hi: int) -> None:
+        for k in range(max(0, lo), min(n, hi)):
+            in_type[k] = True
+
+    i = 0
+    while i < n:
+        tok = tokens[i]
+        # 1. `[export] type ...` or `[export] type function ... end`
+        if tok.kind == "KEYWORD" and tok.value == "export" and i + 1 < n and tokens[i + 1].kind == "KEYWORD" and tokens[i + 1].value == "type":
+            mark(i, i + 1)
+            i += 1
+            tok = tokens[i]
+
+        if tok.kind == "KEYWORD" and tok.value == "type":
+            if i + 1 < n and tokens[i + 1].kind == "KEYWORD" and tokens[i + 1].value == "function":
+                # `type function Name(...) ... end`
+                depth = 0
+                j = i + 1
+                while j < n:
+                    if tokens[j].kind == "KEYWORD":
+                        if tokens[j].value in ("function", "if", "do"):
+                            depth += 1
+                        elif tokens[j].value == "end":
+                            depth -= 1
+                            if depth <= 0:
+                                j += 1
+                                break
+                    j += 1
+                mark(i, j)
+                i = j
+                continue
+            # `type Name[<...>] = TypeExpr`
+            j = i + 1
+            if j < n and tokens[j].kind == "IDENT":
+                j += 1
+            j = _skip_type_angles(tokens, j)
+            if j < n and tokens[j].kind == "OP" and tokens[j].value == "=":
+                end_t = _consume_type_expr(tokens, j + 1)
+                mark(i, end_t)
+                i = end_t
+                continue
+
+        # 2. Generic `<...>` (`f<number>(x)`, `function foo<T>(...)`)
+        if tok.kind == "OP" and tok.value == "<" and tok.is_type_angle and not in_type[i]:
+            end_g = _skip_type_angles(tokens, i)
+            mark(i, end_g)
+            i = end_g
+            continue
+
+        # 3. Cast `:: TypeExpr`
+        if tok.kind == "OP" and tok.value == "::":
+            end_c = _consume_type_expr(tokens, i + 1)
+            mark(i, end_c)
+            i = end_c
+            continue
+
+        # 4. `local` / `const` / `for` binding `: TypeExpr`
+        if tok.kind == "KEYWORD" and tok.value in ("local", "const", "for"):
+            if i + 1 < n and not (tokens[i + 1].kind == "KEYWORD" and tokens[i + 1].value in ("function", "type")):
+                j = i + 1
+                while j < n:
+                    if tokens[j].kind == "ATTR":
+                        j += 1
+                        if tokens[j - 1].value == "@[":
+                            j = _skip_balanced(tokens, j - 1, "@[", "]")
+                        continue
+                    if tokens[j].kind != "IDENT":
+                        break
+                    j += 1
+                    if j < n and tokens[j].kind == "OP" and tokens[j].value == ":":
+                        end_ann = _consume_type_expr(tokens, j + 1)
+                        mark(j, end_ann)
+                        j = end_ann
+                    if j < n and tokens[j].kind == "OP" and tokens[j].value == ",":
+                        j += 1
+                        continue
+                    break
+                i = j
+                continue
+
+        # 5. `function` signature parameter types & `: ReturnType`
+        if tok.kind == "KEYWORD" and tok.value == "function":
+            j = i + 1
+            # Optional name `a.b:c`
+            if j < n and tokens[j].kind == "IDENT":
+                j += 1
+                while j + 1 < n and tokens[j].kind == "OP" and tokens[j].value in (".", ":") and tokens[j + 1].kind == "IDENT":
+                    j += 2
+            # Optional `<T>`
+            if j < n and tokens[j].kind == "OP" and tokens[j].value == "<" and tokens[j].is_type_angle:
+                end_g = _skip_type_angles(tokens, j)
+                mark(j, end_g)
+                j = end_g
+            # Parameter list `(...)`
+            if j < n and tokens[j].kind == "OP" and tokens[j].value == "(":
+                j += 1
+                while j < n and not (tokens[j].kind == "OP" and tokens[j].value == ")"):
+                    if tokens[j].kind == "IDENT" or (tokens[j].kind == "OP" and tokens[j].value == "..."):
+                        j += 1
+                        if j < n and tokens[j].kind == "OP" and tokens[j].value == ":":
+                            end_p = _consume_type_expr(tokens, j + 1)
+                            mark(j, end_p)
+                            j = end_p
+                    if j < n and tokens[j].kind == "OP" and tokens[j].value == ",":
+                        j += 1
+                    elif j < n and not (tokens[j].kind == "OP" and tokens[j].value == ")"):
+                        j += 1
+                if j < n and tokens[j].kind == "OP" and tokens[j].value == ")":
+                    j += 1
+                if j < n and tokens[j].kind == "OP" and tokens[j].value == ":":
+                    end_ret = _consume_type_expr(tokens, j + 1)
+                    mark(j, end_ret)
+                    j = end_ret
+                i = j
+                continue
+
+        i += 1
+    return in_type

@@ -166,6 +166,7 @@ SCHEMA = {
     "mutate": {
         "include": (list, str),
         "exclude": (list, str),
+        "codegen": bool,
         "timeout": (int, float),
         "min": (int, float),
         "max_mutants": int,
