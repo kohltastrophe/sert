@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import io
+import math
 import os
 from pathlib import Path
 import re
@@ -24,16 +25,10 @@ _NE_METHODS = frozenset({"ne", "notEq", "notEqual"})
 _OK_METHODS = frozenset({"ok", "truthy"})
 _ASSERT_RECEIVERS = frozenset({"sert", "t", "expect", "assert"})
 _THROWS_METHODS = frozenset({"throws", "throwsAsync", "rejects"})
-_REMOTE_COVER_TOKENS = frozenset(
-    {
-        "fuzzRemote",
-        "remotePayload",
-        "FireServer",
-        "InvokeServer",
-        "OnServerEvent",
-        "OnServerInvoke",
-    }
-)
+_DOES_NOT_THROW_METHODS = frozenset({"doesNotThrow", "notThrows"})
+_REMOTE_EVENT_TOKENS = frozenset({"fuzzRemote", "remotePayload", "FireServer", "OnServerEvent"})
+_REMOTE_INVOKE_TOKENS = frozenset({"fuzzRemote", "remotePayload", "InvokeServer", "OnServerInvoke"})
+_REMOTE_COVER_TOKENS = _REMOTE_EVENT_TOKENS | _REMOTE_INVOKE_TOKENS
 _GENERIC_NAMES = frozenset({"remote", "event", "func", "function", "rf", "re", "self", "script", "remotes"})
 _REQ_TAIL_RE = re.compile(r"([A-Za-z0-9_.-]+)$")
 _EXPORT_LINE_RE = re.compile(r"^(.*?)(?::L\d+-L\d+)?$")
@@ -162,6 +157,106 @@ def _to_path(item: Path | str, root: Path) -> Path:
     return p if p.is_absolute() else (root / p)
 
 
+def _has_call_token(expr: list[luau_lex.Token]) -> bool:
+    for idx, tok in enumerate(expr):
+        if tok.kind == "OP" and tok.value == "(" and idx > 0:
+            prev = expr[idx - 1]
+            if prev.kind == "IDENT" or (prev.kind == "OP" and prev.value in (")", "]", "}")):
+                return True
+        if tok.kind == "IDENT" and idx + 1 < len(expr):
+            nxt = expr[idx + 1]
+            if nxt.kind in ("STRING", "INTERP_FULL", "INTERP_BEGIN") or (nxt.kind == "OP" and nxt.value == "{"):
+                return True
+    return False
+
+
+def _parse_luau_number(expr: list[luau_lex.Token]) -> float | None:
+    stripped = _strip_outer_parens(expr)
+    neg = False
+    if len(stripped) == 2 and stripped[0].kind == "OP" and stripped[0].value == "-":
+        neg = True
+        stripped = stripped[1:]
+    if len(stripped) != 1 or stripped[0].kind != "NUMBER":
+        return None
+    num = luau_lex.parse_number(stripped[0].value)
+    if num is None:
+        return None
+    try:
+        val = float(num)
+    except OverflowError:
+        return None
+    if not math.isfinite(val):
+        return None
+    return -val if neg else val
+
+
+_BINOP_OPS = frozenset({"==", "~=", "<", "<=", ">", ">=", "..", "+", "-", "*", "/", "//", "%", "^"})
+
+
+def _has_top_binop(expr: list[luau_lex.Token]) -> bool:
+    depth = 0
+    for i, tok in enumerate(expr):
+        if tok.kind == "INTERP_BEGIN":
+            depth += 1
+        elif tok.kind == "INTERP_END":
+            depth = max(0, depth - 1)
+        elif tok.kind == "OP" and not tok.is_type_angle:
+            if tok.value in ("(", "[", "{"):
+                depth += 1
+            elif tok.value in (")", "]", "}"):
+                depth = max(0, depth - 1)
+            elif depth == 0 and tok.value in _BINOP_OPS:
+                if tok.value == "-" and (i == 0 or (expr[i - 1].kind == "OP" and expr[i - 1].value in ("(", "[", "{", ","))):
+                    continue
+                return True
+        elif depth == 0 and tok.kind == "KEYWORD" and tok.value in ("and", "or"):
+            return True
+    return False
+
+
+def _is_truthy_literal(expr: list[luau_lex.Token]) -> bool:
+    stripped = _strip_outer_parens(expr)
+    if not stripped or _has_top_binop(stripped):
+        return False
+    if len(stripped) == 1:
+        tok = stripped[0]
+        if tok.kind in ("NUMBER", "STRING", "INTERP_FULL"):
+            return True
+        return tok.kind == "KEYWORD" and tok.value == "true"
+    first, last = stripped[0], stripped[-1]
+    if first.kind == "INTERP_BEGIN" and last.kind == "INTERP_END":
+        return True
+    if first.kind == "OP" and first.value == "{" and luau_lex.matching_close(stripped, 0) == len(stripped) - 1:
+        return True
+    if first.kind == "KEYWORD" and first.value == "function" and last.kind == "KEYWORD" and last.value == "end":
+        return True
+    if first.kind == "OP" and first.value == "#" and len(stripped) >= 2:
+        return True
+    if first.kind == "OP" and first.value == "-" and len(stripped) == 2 and stripped[1].kind == "NUMBER":
+        return True
+    return False
+
+
+def _is_empty_fn_callback(expr: list[luau_lex.Token]) -> bool:
+    stripped = _strip_outer_parens(expr)
+    if len(stripped) < 4 or stripped[0].kind != "KEYWORD" or stripped[0].value != "function":
+        return False
+    if stripped[-1].kind != "KEYWORD" or stripped[-1].value != "end":
+        return False
+    p_idx = 1
+    if p_idx < len(stripped) and stripped[p_idx].kind == "OP" and stripped[p_idx].value == "<":
+        close_g = luau_lex.matching_close(stripped, p_idx)
+        if close_g is None:
+            return False
+        p_idx = close_g + 1
+    if p_idx >= len(stripped) or stripped[p_idx].kind != "OP" or stripped[p_idx].value != "(":
+        return False
+    close_p = luau_lex.matching_close(stripped, p_idx)
+    if close_p is None:
+        return False
+    return close_p + 1 == len(stripped) - 1
+
+
 def scan_spec_tautologies(spec_files: list[Path | str], root: Path) -> list[dict]:
     """Statically scan spec files for tautological assertions using `luau_lex`."""
     findings: list[dict] = []
@@ -213,25 +308,40 @@ def scan_spec_tautologies(spec_files: list[Path | str], root: Path) -> list[dict
 
             if is_sert_receiver and method in _EQ_METHODS and len(args) >= 2:
                 sig0, sig1 = _expr_sig(args[0]), _expr_sig(args[1])
-                if sig0 and sig0 == sig1:
+                same_span = bool(sig0) and sig0 == sig1 and not _has_call_token(args[0])
+                num0, num1 = _parse_luau_number(args[0]), _parse_luau_number(args[1])
+                same_num = num0 is not None and num1 is not None and num0 == num1
+                if same_span or same_num:
                     lhs = text[args[0][0].start : args[0][-1].end].strip()
+                    rhs = text[args[1][0].start : args[1][-1].end].strip()
                     findings.append(
                         {
                             "file": rel,
                             "line": line,
                             "kind": "tautology-eq",
-                            "message": f"tautological {call_label}({lhs}, {lhs}) compares identical token spans",
+                            "message": f"tautological {call_label}({lhs}, {rhs}) compares equivalent values",
                         }
                     )
             elif ((is_sert_receiver and method in _OK_METHODS) or is_assert_fn) and len(args) >= 1:
-                sig0 = _expr_sig(args[0])
-                if sig0 == (("KEYWORD", "true"),):
+                value_consumed = callee_start > 0 and tokens[callee_start - 1].kind == "OP" and tokens[callee_start - 1].value in ("(", ",", "=", "{")
+                if not value_consumed and _is_truthy_literal(args[0]):
+                    lit = text[args[0][0].start : args[0][-1].end].strip()
                     findings.append(
                         {
                             "file": rel,
                             "line": line,
                             "kind": "tautology-ok",
-                            "message": f"tautological {call_label}(true) always passes",
+                            "message": f"tautological {call_label}({lit}) always passes",
+                        }
+                    )
+            elif is_sert_receiver and method in _DOES_NOT_THROW_METHODS and len(args) >= 1:
+                if _is_empty_fn_callback(args[0]):
+                    findings.append(
+                        {
+                            "file": rel,
+                            "line": line,
+                            "kind": "tautology-does-not-throw",
+                            "message": f"tautological {call_label}(function() end) has an empty body",
                         }
                     )
             elif is_sert_receiver and method in _NE_METHODS and len(args) >= 2:
@@ -251,18 +361,8 @@ def scan_spec_tautologies(spec_files: list[Path | str], root: Path) -> list[dict
     return findings
 
 
-def _cfg_table(cfg, section: str) -> dict:
-    if hasattr(cfg, "table"):
-        val = cfg.table(section)
-        return val if isinstance(val, dict) else {}
-    if isinstance(cfg, dict):
-        val = cfg.get(section)
-        return val if isinstance(val, dict) else {}
-    return {}
-
-
 def _collect_source_files(root: Path, cfg, *, diff_files: set[str] | None = None) -> list[Path]:
-    cov_table = _cfg_table(cfg, "coverage")
+    cov_table = config_mod.section_table(cfg, "coverage")
     spec_set = {_to_path(p, root).resolve() for p in graph_mod.discover_specs(root, cfg)}
     include_dirs = list(util.as_list(cov_table.get("include")) or ["src"])
     exclude = list(util.as_list(cov_table.get("exclude")))
@@ -308,7 +408,9 @@ def _spec_coverage_index(root: Path, cfg) -> list[dict]:
         idents = {tok.value for tok in tokens if tok.kind == "IDENT"}
         strings = {tok.value[1:-1] for tok in tokens if tok.kind == "STRING" and len(tok.value) >= 2}
         has_fuzz = ("fuzzRemote" in idents) or ("remotePayload" in idents)
-        has_remote_api = has_fuzz or bool(idents & _REMOTE_COVER_TOKENS)
+        has_event_api = has_fuzz or bool(idents & _REMOTE_EVENT_TOKENS)
+        has_invoke_api = has_fuzz or bool(idents & _REMOTE_INVOKE_TOKENS)
+        has_remote_api = has_event_api or has_invoke_api
         req_stems: set[str] = set()
         for idx, tok in enumerate(tokens):
             if tok.kind == "IDENT" and tok.value == "require" and idx + 2 < len(tokens):
@@ -328,6 +430,8 @@ def _spec_coverage_index(root: Path, cfg) -> list[dict]:
                 "idents_lower": {s.lower() for s in idents},
                 "strings_lower": {s.lower() for s in strings},
                 "has_fuzz": has_fuzz,
+                "has_event_api": has_event_api,
+                "has_invoke_api": has_invoke_api,
                 "has_remote_api": has_remote_api,
                 "req_stems": req_stems,
             }
@@ -396,7 +500,7 @@ def _extract_remote_bindings(tokens: list[luau_lex.Token], rel_path: str) -> lis
     return bindings
 
 
-def _is_remote_covered(binding: dict, spec_index: list[dict], src_stem: str) -> bool:
+def _is_remote_covered(binding: dict, spec_index: list[dict], src_stem: str, *, handler_count: int = 1) -> bool:
     remote_low = binding["remote"].lower()
     handler_low = binding["handler"].lower()
     src_low = src_stem.lower()
@@ -406,12 +510,15 @@ def _is_remote_covered(binding: dict, spec_index: list[dict], src_stem: str) -> 
     if handler_low and handler_low not in _GENERIC_NAMES:
         candidates.append(handler_low)
 
+    kind_flag = "has_event_api" if binding.get("kind") == "OnServerEvent" else "has_invoke_api"
     for spec in spec_index:
-        if not spec["has_remote_api"]:
+        if not spec.get(kind_flag, spec["has_remote_api"]):
             continue
         if candidates and any(c in spec["idents_lower"] or any(c in s for s in spec["strings_lower"]) for c in candidates):
             return True
-        if src_low in spec["req_stems"] or src_low == spec["stem"] or src_low in spec["idents_lower"]:
+        if (handler_count <= 1 or not candidates) and (
+            src_low in spec["req_stems"] or src_low == spec["stem"] or src_low in spec["idents_lower"]
+        ):
             return True
     return False
 
@@ -428,8 +535,9 @@ def scan_remote_handlers(root: Path, cfg, *, diff_files: set[str] | None = None)
             continue
         rel = util.posix(path, root)
         tokens = _sig_tokens(text)
-        for binding in _extract_remote_bindings(tokens, rel):
-            if not _is_remote_covered(binding, spec_index, path.stem):
+        bindings = _extract_remote_bindings(tokens, rel)
+        for binding in bindings:
+            if not _is_remote_covered(binding, spec_index, path.stem, handler_count=len(bindings)):
                 label = binding["remote"] or binding["kind"]
                 findings.append(
                     {
@@ -657,6 +765,7 @@ def find_uncovered_exports(
     coverage_files: dict[str, dict[int, bool]] | None,
     *,
     diff_files: set[str] | None = None,
+    fn_hits: dict[str, dict[int, bool]] | None = None,
 ) -> list[ExportSpan]:
     """Return exported `src/` functions with zero covered body hits in `coverage_files`."""
     if coverage_files is None:
@@ -673,10 +782,15 @@ def find_uncovered_exports(
         if not exports:
             continue
         hits_map = coverage_files.get(rel)
+        fn_map = fn_hits.get(rel) if fn_hits is not None else None
         if hits_map is None:
             uncovered.extend(exports)
             continue
         for exp in exports:
+            if exp.start_line == exp.end_line and fn_map is not None and exp.start_line in fn_map:
+                if not fn_map[exp.start_line]:
+                    uncovered.append(exp)
+                continue
             interior = [ln for ln in hits_map if exp.start_line < ln < exp.end_line]
             span_lines = interior if interior else [ln for ln in hits_map if exp.start_line <= ln <= exp.end_line]
             if not span_lines:
@@ -765,6 +879,9 @@ def run_audit(
     coverage_file: str | Path | None = None,
     specs: list[Path] | None = None,
     skip_run: bool = False,
+    diff_lines: dict[str, set[int]] | None = None,
+    cov_files: dict[str, dict[int, int]] | None = None,
+    dep_graph=None,
 ) -> tuple[int, dict]:
     """Execute static and runtime reward-hacking checks and return `(exit_code, report)`."""
     if root is None:
@@ -773,15 +890,28 @@ def run_audit(
     if cfg is None:
         cfg = config_mod.load(root)
 
-    diff_lines: dict[str, set[int]] | None = None
+    resolved_diff_lines: dict[str, set[int]] | None = None
     diff_files: set[str] | None = None
     if diff is not None:
-        diff_lines = coverage_mod.git_diff_lines(root, diff)
-        diff_files = set(diff_lines)
+        resolved_diff_lines = coverage_mod.git_diff_lines(root, diff) if diff_lines is None else diff_lines
+        diff_files = set(resolved_diff_lines)
 
     all_specs: list[Path] = [_to_path(p, root) for p in (specs if specs is not None else graph_mod.discover_specs(root, cfg))]
     if diff_files is not None:
-        target_specs = [p for p in all_specs if util.posix(p, root) in diff_files]
+        all_spec_rels = [util.posix(p, root) for p in all_specs]
+        if specs is not None:
+            impacted_set = set(all_spec_rels) | diff_files
+        else:
+            impacted_rels = graph_mod.affected_specs_for_files(
+                root,
+                cfg,
+                diff_files,
+                diff_lines=resolved_diff_lines,
+                all_specs=all_spec_rels,
+                dep_graph=dep_graph,
+            )
+            impacted_set = set(impacted_rels) | diff_files
+        target_specs = [p for p in all_specs if util.posix(p, root) in impacted_set]
     else:
         target_specs = all_specs
 
@@ -798,12 +928,12 @@ def run_audit(
         skip_run=skip_run,
     )
 
-    cov_default = str(_cfg_table(cfg, "coverage").get("file") or "coverage.out")
-    cov_path = Path(coverage_file) if coverage_file is not None else root / cov_default
-    if not cov_path.is_absolute():
-        cov_path = root / cov_path
-    cov_files = coverage_mod.parse(cov_path, root=root) if cov_path.is_file() else None
-    uncovered_exports = find_uncovered_exports(root, cfg, cov_files, diff_files=diff_files)
+    cov_path = coverage_mod.output_path(cfg, root, coverage_file)
+    resolved_cov = cov_files if cov_files is not None else (coverage_mod.parse(cov_path, root=root) if cov_path.is_file() else None)
+    resolved_fn_hits = coverage_mod.parse_function_hits(cov_path, root=root) if cov_path.is_file() else None
+    uncovered_exports = find_uncovered_exports(
+        root, cfg, resolved_cov, diff_files=diff_files, fn_hits=resolved_fn_hits
+    )
 
     zero_assertions = list(telemetry.get("zeroAssertionTests") or [])
     runtime_tautologies = list(telemetry.get("tautologies") or [])
@@ -838,6 +968,7 @@ def run_audit(
         issues.append(rem)
     if run_error:
         issues.append({"file": "", "line": 0, "kind": "runner-error", "message": run_error})
+    explicit_skips = int(skipped_by_reason.get("explicit", 0) or 0) if strict else 0
     if strict:
         for exp in uncovered_exports:
             issues.append(
@@ -848,9 +979,23 @@ def run_audit(
                     "message": f"uncovered export {exp.name} ({exp.span})",
                 }
             )
+        if explicit_skips > 0:
+            issues.append(
+                {
+                    "file": "",
+                    "line": 0,
+                    "kind": "explicit-skip",
+                    "message": f"{explicit_skips} explicit skipped test(s) (sert.test.skip) under --strict",
+                }
+            )
 
     reward_hack_count = len(zero_assertions) + len(combined_tautologies) + len(vacuous_props) + len(unfuzzed_remotes)
-    fail_count = reward_hack_count + (len(uncovered_exports) if strict else 0) + (1 if run_error else 0)
+    fail_count = (
+        reward_hack_count
+        + (len(uncovered_exports) if strict else 0)
+        + (1 if explicit_skips > 0 else 0)
+        + (1 if run_error else 0)
+    )
     exit_code = 1 if fail_count > 0 else 0
 
     report = {
@@ -979,4 +1124,56 @@ def cmd_audit(args, root: Path | None = None, cfg=None) -> int:
     if rendered:
         sys.stdout.write(rendered + "\n")
         sys.stdout.flush()
+    if fmt == "human" and util.on_github_actions():
+        emitted = 0
+        for name in report.get("zero_assertion_tests", ()):
+            if emitted >= 25:
+                break
+            util.annotate("error", f"zero-assertion test (missing {{ smoke = true }}): {name}", title="sert audit")
+            emitted += 1
+        for taut in report.get("tautologies", ()):
+            if emitted >= 25:
+                break
+            util.annotate(
+                "error",
+                str(taut.get("message") or "tautological assertion"),
+                file=taut.get("file") or None,
+                line=taut.get("line") or None,
+                title="sert audit",
+            )
+            emitted += 1
+        for vp in report.get("vacuous_properties", ()):
+            if emitted >= 25:
+                break
+            util.annotate(
+                "error",
+                f"vacuous property '{vp.get('name', '?')}': {vp.get('message', '')}",
+                file=vp.get("file") or None,
+                line=vp.get("line") or None,
+                title="sert audit",
+            )
+            emitted += 1
+        for rem in report.get("unfuzzed_remotes", ()):
+            if emitted >= 25:
+                break
+            util.annotate(
+                "error",
+                str(rem.get("message") or "unfuzzed remote handler"),
+                file=rem.get("file") or None,
+                line=rem.get("line") or None,
+                title="sert audit",
+            )
+            emitted += 1
+        strict_flag = bool(report.get("strict"))
+        for exp in report.get("uncovered_exports", ()):
+            if emitted >= 25:
+                break
+            util.annotate(
+                "error" if strict_flag else "warning",
+                f"uncovered export {exp.get('name', '?')} ({exp.get('span', '?')})",
+                file=exp.get("file") or None,
+                line=exp.get("start_line") or None,
+                title="sert audit",
+            )
+            emitted += 1
     return exit_code

@@ -171,7 +171,11 @@ class TypesAndLintTest(ToolCase):
         )
         code, out, err = self.sert("lint", "--root", grp)
         self.assertEqual(code, 0, out + err)
-        portable_old, portable_new, roblox = self.lsp_log.read_text().splitlines()
+        logged = self.lsp_log.read_text().splitlines()
+        self.assertEqual(len(logged), 3)
+        portable_old = next(ln for ln in logged if "old-solver.json" in ln)
+        portable_new = next(ln for ln in logged if "new-solver.json" in ln and "globalTypes" not in ln)
+        roblox = next(ln for ln in logged if "globalTypes.d.luau" in ln)
         self.assertTrue("old-solver.json" in portable_old and "new-solver.json" in portable_new and "--defs" not in portable_old)
         self.assertTrue("--platform=standard" in portable_old and portable_old.endswith("core gen/a/portable gen/b/portable"))
         self.assertIn("--ignore=.sert/** --ignore=core/skip/**", portable_old)
@@ -425,15 +429,26 @@ class CoverageAndStagingTest(ToolCase):
         self.assertEqual(lint.error_lines(cfg, LSP_SAMPLE, errors_only=True), {"p.luau": {1, 4}, "syn.luau": {2}})
 
         self.fake_tools()
+        rojo_log = self.tmp / "rojo.log"
         rojo = self.write_fake_tool(
             self.tmp / "bin/rojo",
-            "import pathlib\npathlib.Path(sys.argv[-1]).write_text('{}\\n', encoding='utf-8')\n",
+            f"import pathlib\npathlib.Path({str(rojo_log)!r}).open('a').write('rojo\\n')\npathlib.Path(sys.argv[-1]).write_text('{{}}\\n', encoding='utf-8')\n",
         )
         r_ws = self.project('[lint]\nproject = "custom.project.json"\n', name="ana-1")
         (r_ws / "custom.project.json").write_text("{}\n")
         cfg_ws = config.load(r_ws)
         with lint.Workspace(cfg_ws, dry_run=False) as ws:
             self.assertTrue(ws.build_sourcemap()[1] and ws.sourcemap.is_file())
+        self.assertEqual(len(rojo_log.read_text().splitlines()), 1)
+        # Second build on unchanged tree hits `.sert/sourcemap.json` cache without spawning rojo
+        with lint.Workspace(cfg_ws, dry_run=False) as ws2:
+            self.assertTrue(ws2.build_sourcemap()[1] and ws2.sourcemap.is_file())
+        self.assertEqual(len(rojo_log.read_text().splitlines()), 1)
+        # Modifying `custom.project.json` invalidates the sourcemap cache
+        (r_ws / "custom.project.json").write_text('{"name":"changed"}\n')
+        with lint.Workspace(cfg_ws, dry_run=False) as ws3:
+            self.assertTrue(ws3.build_sourcemap()[1] and ws3.sourcemap.is_file())
+        self.assertEqual(len(rojo_log.read_text().splitlines()), 2)
         self.write_fake_tool(rojo, "sys.stderr.write('rojo failed\\n')\nsys.exit(1)\n")
         with lint.Workspace(cfg_ws, dry_run=False) as ws:
             self.assertEqual((ws.build_sourcemap()[1], ws.sourcemap), (False, None))
@@ -453,6 +468,60 @@ class CoverageAndStagingTest(ToolCase):
         self.setenv("GITHUB_ACTIONS", "true")
         code2, out2, _ = self.sert("lint", "--only", "analyze", "--root", root)
         self.assertEqual((code2, "::warning file=src/a.luau,line=2," in out2, "::error file=src/a.luau,line=3," in out2), (1, True, True))
+
+    def test_lint_format_json_agent_and_error_envelope(self):
+        self.fake_tools()
+        r_bad = self.project('[lint]\npaths = ["src"]\nproject = false\nstub = false\nselene = false\n', name="lint-fmt")
+        (r_bad / "rokit.toml").write_text((REPO / "rokit.toml").read_text(encoding="utf-8"), encoding="utf-8")
+        (r_bad / ".sert/types").mkdir(parents=True, exist_ok=True)
+        (r_bad / ".sert/types/globalTypes.d.luau").write_text("declare FIXTURE: number\n", encoding="utf-8")
+        self.write(r_bad, {"src/a.luau": "local x=1\n"})
+        self.write_fake_tool(self.tmp / "bin/stylua", 'sys.stderr.write("Diff in src/a.luau:\\n")\nsys.exit(1)\n')
+        self.write_fake_tool(
+            self.tmp / "bin/luau-lsp",
+            'if sys.argv[1] == "analyze":\n    print("src/a.luau(1,7): LocalUnused: local x is unused")\n    sys.exit(1)\n',
+        )
+        self.setenv("GITHUB_ACTIONS", "true")
+        code_j, out_j, err_j = self.sert("lint", "--root", r_bad, "--format", "json")
+        self.assertEqual(code_j, 1, out_j + err_j)
+        self.assertNotIn("::error", out_j)
+        self.assertNotIn("::warning", out_j)
+        env = json.loads(out_j)
+        self.assertEqual((env["command"], env["exit_code"], env["status"]), ("lint", 1, "failed"))
+        self.assertIn("stylua", env["summary"]["failed_checks"])
+        self.assertIn("analyze", env["summary"]["failed_checks"])
+        self.assertNotIn("analyze failed", env["errors"])
+        self.assertGreaterEqual(env["summary"]["diagnostics"], 2)
+
+        code_a, out_a, _ = self.sert("lint", "--root", r_bad, "--agent")
+        self.assertEqual(code_a, 1)
+        self.assertTrue(out_a.startswith("FAIL lint="), out_a)
+        self.assertIn("src/a.luau", out_a)
+        self.assertNotIn("analyze failed", out_a)
+
+        # Missing --root / SertError under --format json emits single valid JSON envelope
+        empty_dir = self.tmp / "no_toml"
+        empty_dir.mkdir()
+        code_err, out_err, _ = self.sert("lint", "--root", empty_dir, "--format", "json")
+        self.assertEqual(code_err, 2)
+        err_env = json.loads(out_err)
+        self.assertEqual((err_env["command"], err_env["exit_code"]), ("lint", 2))
+        self.assertTrue(err_env["errors"])
+
+        # Zero-config `sert lint` works without `sert.toml` when `src/`, `test/`, or `default.project.json` exists
+        self.write_fake_tool(self.tmp / "bin/stylua", "sys.exit(0)\n")
+        zc_dir = self.tmp / "zero_config_lint"
+        (zc_dir / "src").mkdir(parents=True)
+        (zc_dir / "src/mod.luau").write_text("return 1\n", encoding="utf-8")
+        (zc_dir / ".sert/types").mkdir(parents=True)
+        (zc_dir / ".sert/types/globalTypes.d.luau").write_text("declare FIXTURE: number\n", encoding="utf-8")
+        code_zc, out_zc, err_zc = self.sert("lint", "--root", zc_dir, "--skip", "analyze")
+        self.assertEqual((code_zc, "lint: ok" in out_zc), (0, True), out_zc + err_zc)
+
+        zc_test_only = self.tmp / "zero_config_test_only"
+        (zc_test_only / "test").mkdir(parents=True)
+        (zc_test_only / "test/ex.spec.luau").write_text("return 1\n", encoding="utf-8")
+        self.assertEqual(lint.analyze_groups(config.load(zc_test_only)), [{"name": "", "paths": ["test"]}])
 
 
 if __name__ == "__main__":

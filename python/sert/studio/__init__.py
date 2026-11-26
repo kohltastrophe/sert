@@ -63,12 +63,16 @@ from sert.util import (
     INFRA,
     INTERRUPTED,
     SertError,
+    annotate_test_failures,
     build_place,
     check_selection,
     expand_globs,
     is_ci,
     load_json,
+    load_json_strict,
     luau_string,
+    on_github_actions,
+    supported_kwargs,
     worst,
     write_atomic,
 )
@@ -252,6 +256,7 @@ class Settings:
         self.clients: int | None = studio.get("clients")
         self.warm: bool = bool(studio.get("warm", False))
         self.studio_id: str | None = studio.get("studio")
+        self.bridge: str | None = studio.get("bridge")
         self.capture: bool = bool(studio.get("capture", False))
         raw_run_level = studio.get("run_level", RUN_LEVEL_DEFAULT)
         try:
@@ -303,27 +308,110 @@ def known_sides(settings: Settings | None) -> list[str] | None:
     return found or None
 
 
+def _ensure_json_bundle(opts) -> dict:
+    bundle = getattr(opts, "_json_bundle", None)
+    if bundle is None:
+        bundle = {
+            "modes": [],
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "todo": 0,
+            "total": 0,
+            "seconds": 0.0,
+            "errors": [],
+            "runIds": [],
+            "skipped_by_reason": {"explicit": 0, "roblox": 0, "server": 0, "client": 0},
+            "snapshots_updated": [],
+            "regressions_saved": [],
+            "list": None,
+            "check": None,
+            "affected_specs": None,
+        }
+        opts._json_bundle = bundle
+    return bundle
+
+
+def _emit_studio_json_envelope(opts, code: int) -> None:
+    bundle = _ensure_json_bundle(opts)
+    if bundle["list"] is not None:
+        tests = bundle["list"]
+        envelope = agent.json_envelope(
+            "studio",
+            code,
+            summary={"listed": len(tests)},
+            errors=bundle["errors"],
+            data={"tests": tests},
+        )
+    elif bundle["check"] is not None:
+        envelope = agent.json_envelope(
+            "studio",
+            code,
+            summary=bundle["check"],
+            errors=bundle["errors"],
+            data=bundle["check"],
+        )
+    elif bundle["affected_specs"] == [] and not bundle["modes"]:
+        envelope = agent.json_envelope(
+            "studio",
+            code,
+            summary={"passed": 0, "failed": 0, "skipped": 0, "total": 0, "affected_specs": 0},
+            errors=bundle["errors"],
+            data={"affected_specs": []},
+        )
+    else:
+        summary: dict = {
+            "passed": bundle["passed"],
+            "failed": bundle["failed"],
+            "skipped": bundle["skipped"],
+            "total": bundle["total"],
+            "seconds": round(bundle["seconds"], 3),
+        }
+        if bundle["todo"]:
+            summary["todo"] = bundle["todo"]
+        if len(bundle["modes"]) == 1:
+            summary["mode"] = bundle["modes"][0]["mode"]
+        else:
+            summary["modes"] = [m["mode"] for m in bundle["modes"]]
+        data: dict = {
+            "runIds": bundle["runIds"],
+            "modes": bundle["modes"],
+            "skipped_by_reason": bundle["skipped_by_reason"],
+            "snapshots_updated": bundle["snapshots_updated"],
+            "regressions_saved": bundle["regressions_saved"],
+        }
+        if len(bundle["runIds"]) == 1:
+            data["runId"] = bundle["runIds"][0]
+        envelope = agent.json_envelope("studio", code, summary=summary, errors=bundle["errors"], data=data)
+    print(agent.json_dumps_compact(envelope))
+
+
 def run_suites(settings: Settings, opts, run_one) -> int:
+    fmt = agent.output_format(opts)
     names = list(dict.fromkeys(getattr(opts, "suite", None) or settings.default_suites or settings.suites))
     codes, skipped = [], []
     for suite in (Settings(settings.root, settings.conf, name) for name in names):
         if opts.file and len(names) > 1:
             bases = {base(path).lower() for path in suite.spec_files()}
             if bases and not any(base(name).lower() in bases for name in opts.file):
-                print(f"== suite {suite.suite}: no spec named {', '.join(opts.file)}; skipped", flush=True)
+                if fmt == "human":
+                    print(f"== suite {suite.suite}: no spec named {', '.join(opts.file)}; skipped", flush=True)
                 skipped.append(suite.suite)
                 continue
-        print(f"== suite {suite.suite}", flush=True)
-        code = run_one(suite, argparse.Namespace(**vars(opts)))
+        if fmt == "human":
+            print(f"== suite {suite.suite}", flush=True)
+        child_opts = argparse.Namespace(**vars(opts))
+        child_opts._studio_top = False
+        code = run_one(suite, child_opts)
         if code == INTERRUPTED:
             return INTERRUPTED
         codes.append(code)
     if skipped and not codes:
-        print(
-            f"sert studio: --file: no spec named {', '.join(opts.file)} in any suite ({', '.join(skipped)})",
-            file=sys.stderr,
-            flush=True,
-        )
+        msg = f"sert studio: --file: no spec named {', '.join(opts.file)} in any suite ({', '.join(skipped)})"
+        if fmt == "json":
+            _ensure_json_bundle(opts)["errors"].append(msg)
+        else:
+            print(msg, file=sys.stderr, flush=True)
         return INFRA
     return worst(codes)
 
@@ -465,7 +553,7 @@ def synthesize_rojo_overlay(
     sert_lib = resolve_sert_lib_dir(root)
     if sert_lib is None:
         return None
-    raw_proj = load_json(project_path)
+    raw_proj = load_json_strict(project_path)
     if not isinstance(raw_proj, dict) or not isinstance(raw_proj.get("tree"), dict):
         return None
 
@@ -741,11 +829,14 @@ def load_hooks(path: str | None) -> Hooks:
         return Hooks()
     if not os.path.isfile(path):
         raise SertError(f"[studio].hooks: no such file {path}")
-    folder = os.path.dirname(os.path.abspath(path))
+    abs_path = os.path.abspath(path)
+    folder = os.path.dirname(abs_path)
     if folder not in sys.path:
         sys.path.insert(0, folder)
-    spec = importlib.util.spec_from_file_location("sert_studio_hooks", path)
+    mod_name = f"sert_studio_hooks_{hashlib.sha256(abs_path.encode('utf-8')).hexdigest()[:12]}"
+    spec = importlib.util.spec_from_file_location(mod_name, abs_path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
     spec.loader.exec_module(module)
     return Hooks(module)
 
@@ -1029,7 +1120,7 @@ class Attempt:
 def _maybe_capture(settings: Settings, opts, mode: str) -> None:
     if not (getattr(opts, "capture", False) or settings.capture):
         return
-    link_cmd = runscript.find_studio_link()
+    link_cmd = runscript.find_studio_link(getattr(opts, "bridge", None) or settings.bridge)
     if link_cmd is None:
         return
     os.makedirs(settings.out, exist_ok=True)
@@ -1110,8 +1201,15 @@ def launch(
             "launcher": opts.launcher or settings.launcher,
         }
         if warm:
-            run_kwargs["warm"] = True
-            run_kwargs["studio_id"] = studio_id
+            run_kwargs.update(
+                warm=True,
+                studio_id=studio_id,
+                **supported_kwargs(
+                    runscript.run,
+                    runner_path=runner_path if runner_path is not None else settings.runner_path,
+                    bridge=(getattr(opts, "bridge", None) or settings.bridge) or None,
+                ),
+            )
         code = runscript.run(place, **run_kwargs)
         if warm:
             _maybe_capture(settings, opts, mode)
@@ -1145,9 +1243,12 @@ def refresh_catalogue(settings: Settings, opts, hooks: Hooks, mode: str, work: s
             print("catalogue: the headless listing failed", file=sys.stderr)
             return None
         return store_catalogue(settings, tests)["tests"]
-    proj_path, runner_path, config_path = prepare_studio_project(settings, work, label="overlay-list")
-    place = os.path.join(work, "list.rbxl")
     warm = bool(getattr(opts, "warm", False) or settings.warm)
+    if warm:
+        proj_path, runner_path, config_path = settings.project, settings.runner_path, settings.config_path
+    else:
+        proj_path, runner_path, config_path = prepare_studio_project(settings, work, label="overlay-list")
+    place = os.path.join(work, "list.rbxl")
     if not warm and build_place(settings.root, proj_path, place, quiet=True) is None:
         return None
     request = {"runId": f"sert-list-{int(time.time())}", "mode": mode, "list": True, "filter": ""}
@@ -1201,14 +1302,35 @@ def drift(settings: Settings) -> list[str]:
 
 
 def check(settings: Settings, opts, hooks: Hooks) -> int:
+    fmt = agent.output_format(opts)
     if problems := drift(settings) + list(hooks.call("check", opts, default=[]) or []):
-        print("\n".join(problems))
+        if fmt == "json":
+            bundle = _ensure_json_bundle(opts)
+            bundle["check"] = {"ok": False, "project": os.path.relpath(settings.project, settings.root)}
+            bundle["errors"].extend(problems)
+        else:
+            print("\n".join(problems))
         return INFRA
     with tempfile.TemporaryDirectory(prefix="sert-check-") as work:
         proj_path, _, _ = prepare_studio_project(settings, work, label="overlay-check")
         if build_place(settings.root, proj_path, os.path.join(work, "check.rbxl"), quiet=True) is None:
+            if fmt == "json":
+                bundle = _ensure_json_bundle(opts)
+                rel_proj = os.path.relpath(settings.project, settings.root)
+                bundle["check"] = {"ok": False, "project": rel_proj}
+                if not os.path.isfile(proj_path):
+                    bundle["errors"].append(
+                        f"Rojo project not found: {rel_proj} "
+                        "(create default.project.json or set [studio].project in sert.toml)"
+                    )
+                else:
+                    bundle["errors"].append("rojo build failed")
             return INFRA
-    print(f"built {os.path.relpath(settings.project, settings.root)}; the checks pass")
+    rel_proj = os.path.relpath(settings.project, settings.root)
+    if fmt == "json":
+        _ensure_json_bundle(opts)["check"] = {"ok": True, "project": rel_proj}
+    else:
+        print(f"built {rel_proj}; the checks pass")
     return 0
 
 
@@ -1237,6 +1359,10 @@ def build_request(settings: Settings, opts, mode: str, selection: Selection, run
     if getattr(opts, "repeat", 1) > 1:
         request["repeat"] = opts.repeat
         request["repeatCount"] = opts.repeat
+    if getattr(opts, "retry", 0) and opts.retry > 0:
+        request["retry"] = int(opts.retry)
+    if getattr(opts, "shuffle", False):
+        request["shuffle"] = True
     clients = getattr(opts, "clients", None)
     if clients is None:
         clients = settings.clients
@@ -1282,6 +1408,27 @@ def ignored_keys(parsed: Parsed, sent: set[str]) -> list[str]:
     return sorted(sent & {key for key in unknown if isinstance(key, str)}) if isinstance(unknown, list) else []
 
 
+def _ensure_junit_bag(opts) -> dict:
+    bag = getattr(opts, "_junit_bag", None)
+    if bag is None:
+        bag = {"entries": [], "tests": []}
+        opts._junit_bag = bag
+    return bag
+
+
+def write_junit_out(opts, code: int, root: str | None = None) -> int:
+    if not (path := getattr(opts, "junit", None)):
+        return code
+    bag = _ensure_junit_bag(opts)
+    res = run_mod.RunResult(status=code, entries=bag["entries"], tests=bag["tests"])
+    try:
+        run_mod.write_junit_file(root or ".", path, res)
+    except OSError as err:
+        print(f"sert studio: cannot write {path}: {err}", file=sys.stderr)
+        return code or INFRA
+    return code
+
+
 def run_mode(
     settings: Settings,
     opts,
@@ -1292,9 +1439,12 @@ def run_mode(
     work: str,
 ) -> int:
     fmt = agent.output_format(opts)
-    proj_path, runner_path, config_path = prepare_studio_project(settings, work, label=f"overlay-{mode}")
-    place = os.path.join(work, f"{mode}.rbxl")
     warm = bool(getattr(opts, "warm", False) or settings.warm)
+    if warm:
+        proj_path, runner_path, config_path = settings.project, settings.runner_path, settings.config_path
+    else:
+        proj_path, runner_path, config_path = prepare_studio_project(settings, work, label=f"overlay-{mode}")
+    place = os.path.join(work, f"{mode}.rbxl")
     if warm:
         built = 0.0
     else:
@@ -1412,7 +1562,14 @@ def run_mode(
             if test["status"] == "fail":
                 prefix = f"[{test['iteration']}] " if opts.repeat > 1 and "iteration" in test else ""
                 seed = f" (seed {test['seed']})" if "seed" in test else ""
-                print(f"FAIL {prefix}{test.get('file', '?')}: {test['name']}{seed}\n   {test.get('message') or ''}")
+                tfile = test.get("file", "?")
+                raw_ln = test.get("line")
+                tline = raw_ln if isinstance(raw_ln, int) and not isinstance(raw_ln, bool) and raw_ln > 0 else None
+                if tline is None:
+                    _, loc_line = run_mod.failure_location(Path(settings.root), test)
+                    tline = loc_line if loc_line and loc_line > 0 else None
+                loc = f"{tfile}:{tline}" if tline else tfile
+                print(f"FAIL {prefix}{loc}: {test['name']}{seed}\n   {test.get('message') or ''}")
     elif opts.repeat > 1:
         update_flakes(
             settings,
@@ -1499,22 +1656,62 @@ def run_mode(
             for t in tests
             if t.get("status") == "fail"
         ]
-        print(
-            agent.json_dumps_compact(
-                agent.json_envelope(
-                    "studio",
-                    code,
-                    summary={**counts, "mode": mode, "seconds": report.get("seconds") or 0},
-                    errors=errors,
-                    data={
-                        "runId": run_id,
-                        "skipped_by_reason": parsed.skipped_by_reason,
-                        "snapshots_updated": snap_updates,
-                        "regressions_saved": saved_regressions,
-                    },
-                )
-            )
+        if code != 0 and not errors:
+            errors.append(summary)
+        bundle = _ensure_json_bundle(opts)
+        bundle["passed"] += int(counts.get("passed") or 0)
+        bundle["failed"] += int(counts.get("failed") or 0)
+        bundle["skipped"] += int(counts.get("skipped") or 0)
+        bundle["todo"] += int(counts.get("todo") or 0)
+        bundle["total"] += int(counts.get("total") or 0)
+        bundle["seconds"] += float(report.get("seconds") or 0)
+        bundle["errors"].extend(errors)
+        bundle["runIds"].append(run_id)
+        for reason, val in (parsed.skipped_by_reason or {}).items():
+            bundle["skipped_by_reason"][reason] = bundle["skipped_by_reason"].get(reason, 0) + int(val or 0)
+        bundle["snapshots_updated"].extend(snap_updates)
+        bundle["regressions_saved"].extend(saved_regressions)
+        bundle["modes"].append(
+            {
+                "mode": mode,
+                "suite": settings.suite,
+                "runId": run_id,
+                "exit": code,
+                "counts": counts,
+                "seconds": report.get("seconds") or 0,
+            }
         )
+    elif on_github_actions():
+        def _resolve_studio_loc(t: dict) -> tuple[str | None, int | None]:
+            loc_file, loc_line = run_mod.failure_location(root_path, t)
+            if not loc_file and t.get("file") not in (None, "", "?"):
+                loc_file = str(t["file"])
+            if not loc_line and isinstance(t.get("line"), int) and not isinstance(t.get("line"), bool) and t["line"] > 0:
+                loc_line = t["line"]
+            return loc_file, loc_line
+
+        annotate_test_failures(
+            tests,
+            title=f"sert studio ({mode})",
+            fallback_msg=(summary if code != 0 else None),
+            resolve_loc=_resolve_studio_loc,
+        )
+
+    entry_label = f"{settings.suite}/{mode}" if settings.suite else mode
+    junit_bag = _ensure_junit_bag(opts)
+    junit_bag["entries"].append(
+        run_mod.EntryRun(
+            entry=entry_label,
+            code=code,
+            seconds=float(report.get("seconds") or 0),
+            output=output,
+            timed_out=(code == 3),
+        )
+    )
+    for t in tests:
+        tc = dict(t)
+        tc.setdefault("entry", entry_label)
+        junit_bag["tests"].append(tc)
 
     state.update({"parsed": parsed, "tests": tests, "results": parsed.results, "summary": summary, "exit": code})
     override = hooks.call("report", state)
@@ -1602,6 +1799,7 @@ def add_arguments(parser: argparse.ArgumentParser, settings: Settings | None = N
     )
     parser.add_argument(
         "--studio",
+        "--studio-id",
         dest="studio_id",
         default=None,
         metavar="ID",
@@ -1656,12 +1854,20 @@ def add_arguments(parser: argparse.ArgumentParser, settings: Settings | None = N
         help="the tests that failed in the last run of the mode, replaying their property seeds",
     )
     parser.add_argument("--list", action="store_true", help="print the tests the selection picks; run none")
+    parser.add_argument("--shuffle", action="store_true", help="randomize test execution order deterministically (replay with --seed)")
     parser.add_argument(
         "--repeat",
         type=int,
         default=1,
         metavar="N",
         help="run the selection N times in one Studio session; writes flake.json",
+    )
+    parser.add_argument(
+        "--retry",
+        type=int,
+        default=0,
+        metavar="N",
+        help="retry failing tests up to N times and mark recovered passes as flaky",
     )
     parser.add_argument("--seed", metavar="N|random", help="base seed for property and model tests")
     parser.add_argument("--runs", type=int, metavar="N", help="cases per property and model test")
@@ -1729,6 +1935,7 @@ def add_arguments(parser: argparse.ArgumentParser, settings: Settings | None = N
         help="output format (default: human; or agent when SERT_AGENT=1)",
     )
     parser.add_argument("--json-out", metavar="FILE", help="write each session's verdict as JSON (as `sert cloud`)")
+    parser.add_argument("--junit", metavar="FILE", help="write a JUnit XML report (relative to the root)")
     parser.add_argument("--check", action="store_true", help="build the place and run drift and hook checks; no Studio")
     suites_list = settings.suites if settings is not None and settings.suites else None
     parser.add_argument(
@@ -1832,14 +2039,21 @@ def main(args) -> int:
         else:
             cfg = settings.conf if isinstance(settings.conf, sert_config.Config) else sert_config.load(root)
     except Exception as err:
-        print(f"sert studio: {err}", file=sys.stderr)
-        return getattr(err, "code", INFRA)
+        err_code = getattr(err, "code", INFRA)
+        if agent.output_format(args) == "json":
+            _ensure_json_bundle(args)["errors"].append(str(err))
+            _emit_studio_json_envelope(args, err_code)
+        else:
+            print(f"sert studio: {err}", file=sys.stderr)
+        return err_code
     from sert import fetch
 
     fetch.refresh_overrides(cfg)
     fetch.ensure_fetched(cfg)
     args.json_records = []
-    return write_json_out(args, guarded(settings, hooks, args), root=settings.root)
+    exit_code = guarded(settings, hooks, args)
+    exit_code = write_json_out(args, exit_code, root=settings.root)
+    return write_junit_out(args, exit_code, root=settings.root)
 
 
 def run_suite(settings: Settings, opts) -> int:
@@ -1847,20 +2061,34 @@ def run_suite(settings: Settings, opts) -> int:
 
 
 def guarded(settings: Settings, hooks: Hooks, opts) -> int:
+    is_top = getattr(opts, "_studio_top", True)
+    fmt = agent.output_format(opts)
     try:
         if settings.pending_suites:
-            return run_suites(settings, opts, run_suite)
-        if getattr(opts, "suite", None) and settings.suite not in opts.suite:
+            code = run_suites(settings, opts, run_suite)
+        elif getattr(opts, "suite", None) and settings.suite not in opts.suite:
             raise SertError("--suite: sert.toml names no [studio.suites]")
-        return execute(settings, hooks, opts)
+        else:
+            code = execute(settings, hooks, opts)
     except SertError as err:
-        print(f"sert studio: {err}", file=sys.stderr)
+        if is_top and fmt == "json":
+            _ensure_json_bundle(opts)["errors"].append(str(err))
+            _emit_studio_json_envelope(opts, err.code)
+        else:
+            print(f"sert studio: {err}", file=sys.stderr)
         return err.code
     except SystemExit as err:
         if isinstance(err.code, int) or err.code is None:
             raise
-        print(err.code, file=sys.stderr)
+        if is_top and fmt == "json":
+            _ensure_json_bundle(opts)["errors"].append(str(err.code))
+            _emit_studio_json_envelope(opts, INFRA)
+        else:
+            print(err.code, file=sys.stderr)
         return INFRA
+    if is_top and fmt == "json":
+        _emit_studio_json_envelope(opts, code)
+    return code
 
 
 def execute(settings: Settings, hooks: Hooks, opts) -> int:
@@ -1901,10 +2129,20 @@ def execute(settings: Settings, hooks: Hooks, opts) -> int:
         ):
             raise SertError("[studio].hooks passes() must return a list of argument lists (list[list[str]])")
         if passes:
+            fmt = agent.output_format(opts)
             codes = []
             for argv in passes:
-                print(f"== pass: {' '.join(argv)}", flush=True)
-                code = run(["--root", settings.root, *argv], records=getattr(opts, "json_records", None))
+                if fmt == "human":
+                    print(f"== pass: {' '.join(argv)}", flush=True)
+                pass_argv = ["--root", settings.root, *argv]
+                if fmt == "json" and "--format" not in argv and "--agent" not in argv:
+                    pass_argv.extend(["--format", "json"])
+                code = run(
+                    pass_argv,
+                    records=getattr(opts, "json_records", None),
+                    bundle=_ensure_json_bundle(opts) if fmt == "json" else None,
+                    junit_bag=_ensure_junit_bag(opts),
+                )
                 if code == INTERRUPTED:
                     return INTERRUPTED
                 codes.append(code)
@@ -1913,7 +2151,10 @@ def execute(settings: Settings, hooks: Hooks, opts) -> int:
     if opts.check:
         return check(settings, opts, hooks)
     if problems := drift(settings):
-        print("\n".join(problems))
+        if agent.output_format(opts) == "json":
+            _ensure_json_bundle(opts)["errors"].extend(problems)
+        else:
+            print("\n".join(problems))
         return INFRA
 
     selection = Selection()
@@ -1933,7 +2174,7 @@ def execute(settings: Settings, hooks: Hooks, opts) -> int:
             if fmt == "agent":
                 print("OK passed=0 failed=0 skipped=0 duration=0ms affected=0")
             elif fmt == "json":
-                print(agent.json_dumps_compact(agent.json_envelope("studio", 0, summary={"passed": 0, "failed": 0, "skipped": 0, "total": 0, "affected_specs": 0}, data={"affected_specs": []})))
+                _ensure_json_bundle(opts)["affected_specs"] = []
             else:
                 print(f"sert studio: 0 specs impacted by diff against {opts.affected or 'HEAD'}; skipping")
             return 0
@@ -2008,18 +2249,30 @@ def execute(settings: Settings, hooks: Hooks, opts) -> int:
                 continue
             picked.resolve(catalogue)
             if opts.list:
+                fmt = agent.output_format(opts)
                 tests = [test for test in catalogue if picked.matches(test)]
                 if picked.names is not None:
                     tests = [test for test in tests if test["name"] in picked.names]
-                for test in tests:
-                    print(f"{test.get('file', '?')}: {test['name']}")
-                print(f"{len(tests)} test(s) match ({mode}; the catalogue: tests registered in Roblox)")
+                if fmt == "json":
+                    bundle = _ensure_json_bundle(opts)
+                    if bundle["list"] is None:
+                        bundle["list"] = []
+                    bundle["list"].extend({"file": test.get("file", "?"), "name": test["name"], "mode": mode} for test in tests)
+                else:
+                    for test in tests:
+                        print(f"{test.get('file', '?')}: {test['name']}")
+                    print(f"{len(tests)} test(s) match ({mode}; the catalogue: tests registered in Roblox)")
                 codes.append(0)
                 if len(modes) > 1 and catalogue is not None and not opts.failed:
                     break
                 continue
             if picked.names is not None and not picked.names:
-                print(f"{mode}: no test matches the selection; nothing to run")
+                msg = f"{mode}: no test matches the selection; nothing to run"
+                if agent.output_format(opts) == "json":
+                    if not (opts.failed and not picked.patterns):
+                        _ensure_json_bundle(opts)["errors"].append(msg)
+                else:
+                    print(msg)
                 codes.append(0 if opts.failed and not picked.patterns else 1)
                 continue
             code = run_mode(settings, opts, hooks, mode, picked, catalogue, work)
@@ -2029,18 +2282,30 @@ def execute(settings: Settings, hooks: Hooks, opts) -> int:
     return worst(codes)
 
 
-def run(argv: list[str], records: list | None = None) -> int:
+def run(argv: list[str], records: list | None = None, bundle: dict | None = None, junit_bag: dict | None = None) -> int:
     settings, hooks, problem, *_ = context(argv)
     parser = build_parser(settings, hooks, load_suite_hooks=not _is_help_argv(argv))
     opts = parser.parse_args(argv)
     if problem:
-        print(f"sert studio: {problem}", file=sys.stderr)
+        if agent.output_format(opts) == "json":
+            _ensure_json_bundle(opts)["errors"].append(problem)
+            _emit_studio_json_envelope(opts, INFRA)
+        else:
+            print(f"sert studio: {problem}", file=sys.stderr)
         return INFRA
+    if bundle is not None:
+        opts._json_bundle = bundle
+        opts._studio_top = False
+    if junit_bag is not None:
+        opts._junit_bag = junit_bag
     if records is not None:
         opts.json_records = records
         return guarded(settings, hooks, opts)
     opts.json_records = []
-    return write_json_out(opts, guarded(settings, hooks, opts), root=settings.root if settings is not None else None)
+    exit_code = guarded(settings, hooks, opts)
+    root_path = settings.root if settings is not None else None
+    exit_code = write_json_out(opts, exit_code, root=root_path)
+    return write_junit_out(opts, exit_code, root=root_path)
 
 
 markers = suites = flake = driver = sys.modules[__name__]

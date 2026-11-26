@@ -43,6 +43,7 @@ from sert.util import (
     has_glob,
     is_ci,
     load_json,
+    load_json_strict,
     luau_string,
     note,
     on_github_actions,
@@ -171,7 +172,9 @@ def save_regression_tokens(root: Path, events: list[dict]) -> list[dict[str, str
             )
         )
     content = ("\n\n".join(blocks) + "\n") if blocks else ""
-    write_atomic(root_path / REGRESSIONS_REL, content.encode("utf-8"))
+    target_path = root_path / REGRESSIONS_REL
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(target_path, content.encode("utf-8"))
     return added
 
 ENV_GLOBAL_NAMES = (
@@ -419,7 +422,7 @@ def _sync_sert_luaurc(root: Path, *, include_game: bool = False) -> None:
     sert_dir = root / ".sert"
     sert_dir.mkdir(parents=True, exist_ok=True)
     root_luaurc = root / ".luaurc"
-    data = load_json(root_luaurc) if root_luaurc.is_file() else {}
+    data = load_json_strict(root_luaurc) if root_luaurc.is_file() else {}
     raw_aliases = data.get("aliases") if isinstance(data, dict) and isinstance(data.get("aliases"), dict) else {}
     reanchored: dict[str, str] = {}
     for k, v in raw_aliases.items():
@@ -602,13 +605,30 @@ def stage_project(root: Path | config_mod.Config, project_rel: str | None = None
 
     stage_dir = root / ".sert" / "stage"
     lexical_dir, init_path = stage_dir / "lexical", stage_dir / "init.luau"
+    manifest_path = stage_dir / "manifest.json"
     force_rewrite = not init_path.is_file() or not init_path.read_text(encoding="utf-8", errors="replace").startswith(
         STAGE_HEADER
     )
     lexical_dir.mkdir(parents=True, exist_ok=True)
+    manifest_files: dict[str, list[int]] = {}
+    if not force_rewrite and manifest_path.is_file():
+        loaded_manifest = load_json(manifest_path)
+        if (
+            isinstance(loaded_manifest, dict)
+            and loaded_manifest.get("version") == 1
+            and loaded_manifest.get("header") == STAGE_HEADER
+            and isinstance(loaded_manifest.get("files"), dict)
+        ):
+            manifest_files = {
+                str(k): list(v)
+                for k, v in loaded_manifest["files"].items()
+                if isinstance(k, str) and isinstance(v, list) and len(v) == 4
+            }
+    manifest_dirty = False
     staged_files: dict[str, Path] = {}
 
     def register_file(file_path: Path) -> str:
+        nonlocal manifest_dirty
         resolved = file_path.resolve()
         try:
             rel = resolved.relative_to(root_resolved).as_posix()
@@ -617,9 +637,15 @@ def stage_project(root: Path | config_mod.Config, project_rel: str | None = None
         if rel not in staged_files:
             staged_files[rel] = resolved
             dest = lexical_dir / rel
-            needs_write = (
-                force_rewrite or not dest.is_file() or dest.stat().st_mtime_ns < resolved.stat().st_mtime_ns
-            )
+            src_st = resolved.stat()
+            dest_st = dest.stat() if dest.is_file() else None
+            cached_meta = manifest_files.get(rel) if not force_rewrite else None
+            if (
+                dest_st is not None
+                and cached_meta == [src_st.st_mtime_ns, src_st.st_size, dest_st.st_mtime_ns, dest_st.st_size]
+            ):
+                return rel
+            needs_write = force_rewrite or dest_st is None or dest_st.st_mtime_ns < src_st.st_mtime_ns
             if not needs_write:
                 head = dest.read_text(encoding="utf-8", errors="replace")[:1024]
                 if LEXICAL_MARKER not in head or "setfenv" in head or "__SERT_MUTANT" in head:
@@ -630,6 +656,12 @@ def stage_project(root: Path | config_mod.Config, project_rel: str | None = None
                     wrap_luau_source(resolved.read_text(encoding="utf-8", errors="replace")),
                     encoding="utf-8",
                 )
+                dest_st = dest.stat()
+            if dest_st is not None:
+                new_meta = [src_st.st_mtime_ns, src_st.st_size, dest_st.st_mtime_ns, dest_st.st_size]
+                if manifest_files.get(rel) != new_meta:
+                    manifest_files[rel] = new_meta
+                    manifest_dirty = True
         return rel
 
     def load_meta(meta_path: Path) -> dict | None:
@@ -769,6 +801,16 @@ def stage_project(root: Path | config_mod.Config, project_rel: str | None = None
     )
     if not init_path.is_file() or init_path.read_text(encoding="utf-8", errors="replace") != init_luau:
         init_path.write_text(init_luau, encoding="utf-8")
+    stale_manifest = [k for k in manifest_files if k not in staged_files]
+    for k in stale_manifest:
+        manifest_files.pop(k, None)
+        manifest_dirty = True
+    if manifest_dirty or not manifest_path.is_file():
+        with contextlib.suppress(OSError):
+            write_atomic(
+                manifest_path,
+                (json.dumps({"version": 1, "header": STAGE_HEADER, "files": manifest_files}, separators=(",", ":")) + "\n").encode("utf-8"),
+            )
     return init_path
 
 
@@ -964,8 +1006,8 @@ def write_spec_runner(
         "end",
         "local options: any = sert.parseCliArgs(_coreArgs)",
         "for _ek, _ev in _extraOpts do options[_ek] = _ev end",
-        "if #_greps == 1 then options.grep = _greps[1] elseif #_greps > 1 then options.grep = table.concat(_greps, \"|\") end",
-        "if #_excludes == 1 then options.exclude = _excludes[1]; options.excludes = _excludes elseif #_excludes > 1 then options.exclude = table.concat(_excludes, \"|\"); options.excludes = _excludes end",
+        "if #_greps == 1 then options.grep = _greps[1]; options.greps = _greps elseif #_greps > 1 then options.greps = _greps end",
+        "if #_excludes == 1 then options.exclude = _excludes[1]; options.excludes = _excludes elseif #_excludes > 1 then options.excludes = _excludes end",
         "if #_files > 0 then options.file = _files[1]; options.files = _files end",
     ]
     if regressions := load_regressions_by_test(root):
@@ -1003,7 +1045,7 @@ def write_spec_runner(
         "local shard = options.shard",
         "local shardIndex = if shard and shard.only == nil and shard.except == nil and (shard.count or 1) > 1 then shard.index else nil",
         "local shardCount = if shardIndex then shard.count else 1",
-        f"local shardBySpec = shardIndex ~= nil and {len(spec_rels)} >= shardCount * 2 and options.filter == nil and options.grep == nil and options.files == nil and options.names == nil",
+        f"local shardBySpec = shardIndex ~= nil and {len(spec_rels)} >= shardCount * 2 and options.filter == nil and options.grep == nil and options.greps == nil and options.files == nil and options.names == nil",
         "if shardBySpec then options.shard = nil; options._specSharded = true end",
         "local specIndex = 0",
         "local function spec(file: string, load: () -> any, isSetup: boolean?)",
@@ -1095,10 +1137,16 @@ class RunResult:
 
     @property
     def counts(self) -> dict:
-        counts = {"passed": 0, "failed": 0, "skipped": 0, "todo": 0, "total": len(self.tests)}
+        counts = {"passed": 0, "failed": 0, "skipped": 0, "todo": 0, "flaky": 0, "total": len(self.tests)}
         for test in self.tests:
-            if key := {"pass": "passed", "fail": "failed", "skip": "skipped", "todo": "todo"}.get(test.get("status")):
+            status = test.get("status")
+            if status == "flaky":
+                counts["passed"] += 1
+                counts["flaky"] += 1
+            elif key := {"pass": "passed", "fail": "failed", "skip": "skipped", "todo": "todo"}.get(status):
                 counts[key] += 1
+                if test.get("flaky"):
+                    counts["flaky"] += 1
         return counts
 
     @property
@@ -1243,6 +1291,7 @@ def _run_sharded_entry(
             for pump in pumps:
                 pump.start()
             timed_out = False
+            interrupted = False
             code: int | None = None
             try:
                 code = process.wait(timeout=timeout)
@@ -1250,12 +1299,16 @@ def _run_sharded_entry(
                 _kill(process)
                 timed_out = True
             except KeyboardInterrupt:
+                interrupted = True
                 _kill(process)
                 raise
-            for pump, stream in zip(pumps, (process.stdout, process.stderr)):
-                pump.join(timeout=10)
-                if not pump.is_alive() and stream is not None:
-                    stream.close()
+            finally:
+                join_wait = 2 if interrupted else 10
+                for pump, stream in zip(pumps, (process.stdout, process.stderr)):
+                    pump.join(timeout=join_wait)
+                    if stream is not None and (not pump.is_alive() or interrupted):
+                        with contextlib.suppress(OSError):
+                            stream.close()
             cov_file = shard_cwd / "coverage.out"
             cov_text = cov_file.read_text(encoding="utf-8", errors="replace") if coverage and cov_file.is_file() else ""
             return code, timed_out, "".join(out_chunks), "".join(err_chunks), cov_text
@@ -1271,7 +1324,9 @@ def _run_sharded_entry(
     if coverage:
         cov_chunks = [cov_text for _, _, _, _, cov_text in shard_runs if cov_text]
         if cov_chunks:
-            (cfg.root / "coverage.out").write_text("".join(cov_chunks), encoding="utf-8")
+            target_cov = coverage_mod.output_path(cfg, cfg.root)
+            target_cov.parent.mkdir(parents=True, exist_ok=True)
+            target_cov.write_text("".join(cov_chunks), encoding="utf-8")
 
     wall_seconds = time.monotonic() - started
     run = EntryRun(entry, 0, wall_seconds)
@@ -1404,14 +1459,17 @@ def run_entries(
     asked = "--markers" in args
     if markers and not asked:
         args.append("--markers")
-    coverage_out = cfg.root / "coverage.out"
+    raw_cov_out = cfg.root / "coverage.out"
+    target_cov = coverage_mod.output_path(cfg, cfg.root)
+    if coverage and target_cov != raw_cov_out:
+        target_cov.unlink(missing_ok=True)
     chunks: list[str] = []
     result = RunResult(OK)
     sub_env = dict(os.environ, PATH=tool_search_path())
 
     for entry in entries:
         if coverage:
-            coverage_out.unlink(missing_ok=True)
+            raw_cov_out.unlink(missing_ok=True)
         shards = _entry_shard_count(cfg.root, entry, args, coverage, jobs)
         if shards > 1:
             run = _run_sharded_entry(
@@ -1467,18 +1525,23 @@ def run_entries(
                 pumps.append(threading.Thread(target=_pump, args=(process.stderr, err_chunks, None, False), daemon=True))
             for pump in pumps:
                 pump.start()
+            interrupted = False
             try:
                 run.code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill(process)
                 run.timed_out = True
             except KeyboardInterrupt:
+                interrupted = True
                 _kill(process)
                 raise
-            for pump, stream in zip(pumps, (process.stdout, process.stderr)):
-                pump.join(timeout=10)
-                if not pump.is_alive() and stream is not None:
-                    stream.close()
+            finally:
+                join_wait = 2 if interrupted else 10
+                for pump, stream in zip(pumps, (process.stdout, process.stderr)):
+                    pump.join(timeout=join_wait)
+                    if stream is not None and (not pump.is_alive() or interrupted):
+                        with contextlib.suppress(OSError):
+                            stream.close()
             if closed.is_set():
                 raise OutputClosed
             run.output = "".join(out_chunks) + "".join(err_chunks)
@@ -1489,9 +1552,21 @@ def run_entries(
 
         result.entries.append(run)
         for test in markers_mod.parse(run.output).tests:
+            msg = test.get("message")
+            if isinstance(msg, str) and msg:
+                test = {**test, "message": _strip_stage_prefixes(msg)}
             result.tests.append({**test, "entry": entry})
-        if coverage and len(entries) > 1 and coverage_out.is_file():
-            chunks.append(coverage_out.read_text(encoding="utf-8", errors="replace"))
+        if coverage:
+            entry_cov = target_cov if shards > 1 else raw_cov_out
+            if entry_cov.is_file():
+                cov_text = entry_cov.read_text(encoding="utf-8", errors="replace")
+                if len(entries) > 1:
+                    chunks.append(cov_text)
+                elif target_cov != entry_cov:
+                    target_cov.parent.mkdir(parents=True, exist_ok=True)
+                    target_cov.write_text(cov_text, encoding="utf-8")
+                if target_cov != raw_cov_out:
+                    raw_cov_out.unlink(missing_ok=True)
         if run.timed_out:
             if echo:
                 lost = not any(test.get("entry") == entry for test in result.tests)
@@ -1515,42 +1590,35 @@ def run_entries(
             if result.status == OK:
                 result.status = FAILED
     if coverage and len(entries) > 1 and chunks:
-        coverage_out.write_text("".join(chunks), encoding="utf-8")
+        target_cov.parent.mkdir(parents=True, exist_ok=True)
+        target_cov.write_text("".join(chunks), encoding="utf-8")
     return result
 
 
 LOCATION = re.compile(r"([\w@./\\-]+?)(?:\.luau|\.lua)?:(\d+):")
 SNIPPET_LOC = re.compile(r"([\w@./\\-]+?\.(?:luau|lua)|[\w@./\\-]+?):(\d+)(?::|\b)")
 _STAGE_STRIP_PREFIXES = (
-    "./",
-    "../",
     ".sert/stage/lexical/",
     ".sert/stage/files/",
     ".sert/stage/specs/",
+    ".sert/fuzz/overlay/",
     "stage/lexical/",
     "stage/files/",
     "stage/specs/",
-    "self/lexical/",
-    "self/files/",
 )
 
 
+def _strip_stage_prefixes(text: str) -> str:
+    if not text:
+        return text
+    out = text
+    for prefix in _STAGE_STRIP_PREFIXES:
+        out = out.replace("./" + prefix, "").replace(prefix, "")
+    return out
+
+
 def _resolve_root_file(root: Path, raw_name: str) -> Path | None:
-    clean = raw_name.replace("\\", "/").lstrip("@")
-    changed = True
-    while changed:
-        changed = False
-        for prefix in _STAGE_STRIP_PREFIXES:
-            if clean.startswith(prefix):
-                clean = clean[len(prefix) :]
-                changed = True
-    for candidate in (clean, clean + ".luau", clean + ".lua", raw_name):
-        if not candidate:
-            continue
-        path = root / candidate
-        if path.is_file():
-            return path
-    return None
+    return snapshots_mod._resolve_root_file(root, raw_name, glob_tail=False)
 
 
 def _format_failure_snippets(output_text: str, root: Path) -> str:
@@ -1568,16 +1636,22 @@ def _format_failure_snippets(output_text: str, root: Path) -> str:
     rendered_blocks: list[str] = []
     for block in failure_blocks:
         seen: list[tuple[str, int, Path]] = []
-        for line in block.splitlines():
+        for idx, line in enumerate(block.splitlines()):
             if "[sert-" in line:
                 continue
+            if idx > 0:
+                stripped = line.lstrip()
+                if stripped.startswith(("✅", "⏭", "📝", "Coverage dump written")) or re.match(
+                    r"^\d+ passed · ", stripped
+                ):
+                    break
             for match in SNIPPET_LOC.finditer(line):
                 raw_name, line_str = match.group(1), match.group(2)
                 path = _resolve_root_file(root, raw_name)
                 if path is None:
                     continue
                 rel = posix(path, root)
-                if rel == ".sert/run.luau":
+                if rel == ".sert/run.luau" or rel.startswith(".sert/sert/src/core/"):
                     continue
                 line_no = int(line_str)
                 if not any(r == rel and ln == line_no for r, ln, _ in seen):
@@ -1628,17 +1702,14 @@ def failure_location(root: Path, test: dict) -> tuple[str | None, int | None]:
 def annotate_failures(root: Path, result: RunResult, *, out=None) -> None:
     if not on_github_actions():
         return
-    for test in result.tests:
-        if test.get("status") == "fail":
-            file, line = failure_location(root, test)
-            annotate(
-                "error",
-                f"{test.get('name')}: {test.get('message') or 'failed'}",
-                file=file,
-                line=line,
-                title="sert run",
-                out=out,
-            )
+    from sert.util import annotate_test_failures
+
+    annotate_test_failures(
+        result.tests,
+        title="sert run",
+        resolve_loc=lambda t: failure_location(root, t),
+        out=out,
+    )
     for run in result.crashed:
         why = "timed out" if run.timed_out else f"exited {run.code}"
         annotate("error", f"{run.entry} {why} without a failed test", file=run.entry, title="sert run", out=out)
@@ -1700,12 +1771,42 @@ def junit_xml(result: RunResult) -> bytes:
                 message = xml_text(test.get("message") or "failed")
                 failure = ElementTree.SubElement(case, "failure", message=message.splitlines()[0] if message else "")
                 failure.text = message
+            elif test.get("status") == "flaky" or test.get("flaky"):
+                props_el = ElementTree.SubElement(case, "properties")
+                ElementTree.SubElement(props_el, "property", name="flaky", value="true")
+                if test.get("attempts") is not None:
+                    ElementTree.SubElement(props_el, "property", name="attempts", value=str(test.get("attempts")))
+                if first_err := test.get("firstError"):
+                    first_txt = xml_text(first_err)
+                    flaky_el = ElementTree.SubElement(
+                        case,
+                        "flakyFailure",
+                        message=first_txt.splitlines()[0] if first_txt else "flaky",
+                    )
+                    flaky_el.text = first_txt
             elif test.get("status") == "skip":
                 ElementTree.SubElement(case, "skipped")
             elif test.get("status") == "todo":
                 ElementTree.SubElement(case, "skipped", message="todo")
     ElementTree.indent(root)
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
+
+
+_JSON_REPORT_TEST_KEYS = (
+    "name",
+    "file",
+    "target",
+    "status",
+    "ms",
+    "message",
+    "seed",
+    "entry",
+    "flaky",
+    "attempts",
+    "firstError",
+    "expected",
+    "actual",
+)
 
 
 def json_report(result: RunResult) -> dict:
@@ -1716,10 +1817,7 @@ def json_report(result: RunResult) -> dict:
             {"entry": run.entry, "code": run.code, "seconds": round(run.seconds, 3), "timedOut": run.timed_out}
             for run in result.entries
         ],
-        "tests": [
-            {k: v for k, v in test.items() if k in ("name", "file", "target", "status", "ms", "message", "seed", "entry")}
-            for test in result.tests
-        ],
+        "tests": [{k: v for k, v in test.items() if k in _JSON_REPORT_TEST_KEYS} for test in result.tests],
     }
 
 
@@ -1817,15 +1915,20 @@ def ran_nothing(result: RunResult) -> bool:
     return reported or _unreported_spec_entry(result) is not None
 
 
+def write_junit_file(root: Path | str, junit_arg: str | Path, result: RunResult) -> Path:
+    raw = Path(junit_arg)
+    target = raw if raw.is_absolute() else (Path(root) / raw)
+    write_atomic(target.resolve(), junit_xml(result), 0o644)
+    return target
+
+
 def write_reports(root: Path, result: RunResult, junit: str | None = None, json_out: str | None = None) -> None:
-    for target, data in (
-        (junit, lambda: junit_xml(result)),
-        (json_out, lambda: (json.dumps(json_report(result), indent=2) + "\n").encode()),
-    ):
-        if target:
-            path = root / target
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data())
+    if junit:
+        write_junit_file(root, junit, result)
+    if json_out:
+        path = root / json_out
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((json.dumps(json_report(result), indent=2) + "\n").encode())
 
 
 def _seed(value: str) -> str:
@@ -1893,6 +1996,8 @@ _RUN_ARG_DEFAULTS: dict[str, object] = {
     "compact": False,
     "list": False,
     "repeat": None,
+    "retry": None,
+    "shuffle": False,
     "slowest": None,
     "test_timeout": None,
     "allow_focused": False,
@@ -1934,6 +2039,7 @@ def selection_args(args) -> list[str]:
         "fail_fast",
         "compact",
         "list",
+        "shuffle",
         "exhaustive",
         "allow_focused",
         "ci",
@@ -1949,6 +2055,7 @@ def selection_args(args) -> list[str]:
         ("replay", "replay"),
         ("budget", "budget"),
         ("repeat", "repeat"),
+        ("retry", "retry"),
         ("slowest", "slowest"),
         ("test_timeout", "test-timeout"),
     ):
@@ -1957,18 +2064,47 @@ def selection_args(args) -> list[str]:
     return tokens
 
 
-def _snapshot_luau_mtimes(root: Path) -> dict[str, int]:
-    snap: dict[str, int] = {}
+_WATCH_EXACT_NAMES = frozenset(
+    {"sert.toml", "sert.local.toml", ".luaurc", ".sert-regressions.toml"}
+)
+_WATCH_SUFFIXES = (".luau", ".lua", ".snap", ".meta.json", ".project.json")
+
+
+def snapshot_watch_files(root: Path) -> dict[str, tuple[int, int]]:
+    snap: dict[str, tuple[int, int]] = {}
     for cur, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in (".git", ".sert", "node_modules", "__pycache__")]
+        cur_path = Path(cur)
         for name in files:
-            if name.endswith((".luau", ".lua")) or name in ("sert.toml", "sert.local.toml"):
-                full = Path(cur) / name
+            if name in _WATCH_EXACT_NAMES or name.endswith(_WATCH_SUFFIXES):
+                full = cur_path / name
                 try:
-                    snap[str(full)] = full.stat().st_mtime_ns
+                    st = full.stat()
+                    rel = full.relative_to(root).as_posix()
+                    snap[rel] = (st.st_mtime_ns, st.st_size)
                 except OSError:
                     continue
     return snap
+
+
+def changed_watch_files(
+    prev: dict[str, tuple[int, int]],
+    cur: dict[str, tuple[int, int]],
+) -> set[str]:
+    changed = {p for p, meta in cur.items() if prev.get(p) != meta}
+    changed.update(p for p in prev if p not in cur)
+    return changed
+
+
+def format_watch_banner(changed: set[str], *, clear: bool = False) -> str:
+    ordered = sorted(changed)
+    if len(ordered) <= 3:
+        shown = ", ".join(ordered)
+    else:
+        shown = ", ".join(ordered[:3]) + f" (+{len(ordered) - 3} more)"
+    stamp = time.strftime("%H:%M:%S")
+    prefix = "\x1b[2J\x1b[H" if clear else "\n"
+    return f"{prefix}[{stamp}] changed: {shown}"
 
 
 def watch_loop(
@@ -1990,15 +2126,44 @@ def watch_loop(
     cycles += 1
     if max_cycles is not None and cycles >= max_cycles:
         return last_status
-    prev = _snapshot_luau_mtimes(root)
-    print("\nwatching .luau files for changes (Ctrl+C to stop)...", file=err_stream, flush=True)
+    prev = snapshot_watch_files(root)
+    is_tty = bool(getattr(out_stream, "isatty", lambda: False)())
+    print("\nwatching project files for changes (Ctrl+C to stop)...", file=err_stream, flush=True)
     while True:
         time.sleep(poll_interval)
-        cur = _snapshot_luau_mtimes(root)
+        cur = snapshot_watch_files(root)
         if cur != prev:
+            changed = changed_watch_files(prev, cur)
             prev = cur
-            fresh_cfg = config_mod.load(root)
-            last_status = cmd_run(single_args, root=root, cfg=fresh_cfg, out=out_stream, err=err_stream)
+            print(format_watch_banner(changed, clear=is_tty), file=err_stream, flush=True)
+            try:
+                fresh_cfg = config_mod.load(root)
+                has_explicit_scope = bool(
+                    getattr(single_args, "specs", None)
+                    or getattr(single_args, "entry", None)
+                    or getattr(single_args, "filter", None)
+                    or getattr(single_args, "grep", None)
+                    or getattr(single_args, "file", None)
+                    or getattr(single_args, "failed", False)
+                )
+                manual_entries_only = not fresh_cfg.get("test.specs") and bool(fresh_cfg.get("test.entries"))
+                if not has_explicit_scope and not manual_entries_only:
+                    impacted = graph_mod.affected_specs_for_files(root, fresh_cfg, changed)
+                    if not impacted:
+                        print("watching: 0 affected spec(s); waiting...", file=err_stream, flush=True)
+                        cycles += 1
+                        if max_cycles is not None and cycles >= max_cycles:
+                            return last_status
+                        continue
+                    cycle_args = argparse.Namespace(**vars(single_args))
+                    cycle_args.specs = impacted
+                    print(f"watching: running {len(impacted)} affected spec(s)...", file=err_stream, flush=True)
+                    last_status = cmd_run(cycle_args, root=root, cfg=fresh_cfg, out=out_stream, err=err_stream)
+                else:
+                    last_status = cmd_run(single_args, root=root, cfg=fresh_cfg, out=out_stream, err=err_stream)
+            except SertError as err_exc:
+                print(f"error: {err_exc}", file=err_stream, flush=True)
+                last_status = err_exc.code
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
                 return last_status
@@ -2054,7 +2219,9 @@ def add_parser(subparsers) -> None:
     selection.add_argument("-x", "--fail-fast", action="store_true", help="stop at the first failure")
     selection.add_argument("--compact", action="store_true", help="suppress passing ✅ lines while keeping failures and summary")
     selection.add_argument("--list", action="store_true", help="print the catalogue; run nothing")
+    selection.add_argument("--shuffle", action="store_true", help="randomize test execution order deterministically (replay with --seed)")
     selection.add_argument("--repeat", type=int, metavar="N", help="repeat selected tests N times")
+    selection.add_argument("--retry", type=int, metavar="N", help="retry failing tests up to N times and mark recovered passes as flaky")
     selection.add_argument("--slowest", type=int, metavar="N", help="report the N slowest tests")
     selection.add_argument("--test-timeout", type=float, metavar="S", help="per-test timeout in seconds")
     selection.add_argument("--allow-focused", action="store_true", help="allow .focus tests even in CI mode")
@@ -2073,6 +2240,53 @@ def add_parser(subparsers) -> None:
     parser.set_defaults(func=main)
 
 
+def _validate_luau_pattern(pat: str) -> str | None:
+    """Validate basic Luau string pattern syntax (`%` escapes, `[...]` sets, `(...)` captures)."""
+    i = 0
+    n = len(pat)
+    paren_depth = 0
+    in_set = False
+    set_start = False
+    while i < n:
+        ch = pat[i]
+        if ch == "%":
+            if i + 1 >= n:
+                return "malformed pattern (ends with '%')"
+            nxt = pat[i + 1]
+            if not in_set and nxt == "b":
+                if i + 3 >= n:
+                    return "malformed pattern (missing arguments to '%b')"
+                i += 4
+                continue
+            i += 2
+            set_start = False
+            continue
+        if in_set:
+            if ch == "^" and set_start:
+                set_start = False
+            elif ch == "]" and not set_start:
+                in_set = False
+            else:
+                set_start = False
+            i += 1
+            continue
+        if ch == "[":
+            in_set = True
+            set_start = True
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            if paren_depth == 0:
+                return "invalid capture index (unmatched ')')"
+            paren_depth -= 1
+        i += 1
+    if in_set:
+        return "malformed pattern (missing ']')"
+    if paren_depth != 0:
+        return "unfinished capture"
+    return None
+
+
 def _validate_extra_flags(args) -> None:
     if (rep := getattr(args, "repeat", None)) is not None and rep < 1:
         raise SertError(f"--repeat takes a whole number from 1, got {rep}")
@@ -2082,10 +2296,8 @@ def _validate_extra_flags(args) -> None:
         raise SertError(f"--test-timeout takes a number of seconds above 0, got {tt:g}")
     for grep_pat in as_list(getattr(args, "grep", None)):
         if grep_pat:
-            try:
-                re.compile(str(grep_pat))
-            except re.error as exc:
-                raise SertError(f"--grep: invalid pattern {grep_pat!r}: {exc}") from exc
+            if err := _validate_luau_pattern(str(grep_pat)):
+                raise SertError(f"--grep: invalid pattern {grep_pat!r}: {err}")
 
 
 def _check_run_selection(args) -> None:
@@ -2216,7 +2428,7 @@ def _record_run_coverage(
     parsed_list: list[markers_mod.Parsed],
     explicit_specs: list[str] | None,
 ) -> None:
-    cov_path = root / "coverage.out"
+    cov_path = coverage_mod.output_path(cfg, root)
     if not cov_path.is_file():
         return
     try:
@@ -2225,6 +2437,7 @@ def _record_run_coverage(
         return
     if not cov_files:
         return
+    result._cov_files = cov_files  # type: ignore[attr-defined]
 
     specs: list[str] = []
     seen: set[str] = set()
@@ -2289,13 +2502,16 @@ def _record_run_coverage(
         return
 
     dep_graph = graph_mod.build_graph(root, cfg)
+    updates: list[tuple[str, dict, int, bool]] = []
     for spec_rel in specs:
         norm_spec = graph_mod._norm_rel(spec_rel, root)
         deps = dep_graph.dependencies(norm_spec, transitive=True) | {norm_spec}
         sub_cov = {src: lines for src, lines in cov_files.items() if graph_mod._norm_rel(src, root) in deps}
         if not sub_cov:
             sub_cov = cov_files
-        graph_mod.record_spec_coverage(root, norm_spec, sub_cov, ms_by_spec.get(norm_spec, default_ms), exact=False)
+        updates.append((norm_spec, sub_cov, ms_by_spec.get(norm_spec, default_ms), False))
+    if updates:
+        graph_mod.record_specs_coverage(root, updates)
 
 
 def _collect_telemetry(result: RunResult, parsed_list: list[markers_mod.Parsed]) -> dict:
@@ -2351,6 +2567,8 @@ def execute_run(
     root: Path | None = None,
     cfg: config_mod.Config | dict | None = None,
     *,
+    skip_fetch: bool = False,
+    affected_result: tuple[list[str], set[str]] | None = None,
     out=None,
     err=None,
 ) -> tuple[int, RunResult, list[markers_mod.Parsed]]:
@@ -2380,7 +2598,11 @@ def execute_run(
     cli_entries = getattr(args, "entry", None)
     affected_rev = getattr(args, "affected", None)
     if affected_rev is not None and not cli_specs and not cli_entries:
-        impacted, modified = graph_mod.affected_specs(run_root, cfg, base_rev=str(affected_rev or "HEAD"))
+        impacted, modified = (
+            affected_result
+            if affected_result is not None
+            else graph_mod.affected_specs(run_root, cfg, base_rev=str(affected_rev or "HEAD"))
+        )
         if not impacted:
             empty_res = RunResult(OK)
             _persist_telemetry(run_root, empty_res, [])
@@ -2418,8 +2640,9 @@ def execute_run(
     if jobs is not None and jobs < 1:
         raise SertError(f"--jobs takes a whole number from 1, got {jobs}")
 
-    fetch.refresh_overrides(cfg)
-    fetch.ensure_fetched(cfg)
+    if not skip_fetch:
+        fetch.refresh_overrides(cfg)
+        fetch.ensure_fetched(cfg)
 
     if stage_spec := cfg.get("test.stage"):
         stage_project(cfg, str(stage_spec))
@@ -2441,6 +2664,8 @@ def execute_run(
         eff_args.test_timeout = float(cfg.get("test.timeout"))
     if getattr(eff_args, "repeat", None) is None and cfg.get("test.repeat") is not None:
         eff_args.repeat = int(cfg.get("test.repeat"))
+    if (retry_val := getattr(eff_args, "retry", None)) is not None and int(retry_val) < 0:
+        raise SertError("run: --retry must be >= 0")
     if getattr(eff_args, "slowest", None) is None and cfg.get("test.slowest") is not None:
         eff_args.slowest = int(cfg.get("test.slowest"))
 
@@ -2559,6 +2784,18 @@ def execute_run(
         ]
         if nothing_msg:
             errors.append(nothing_msg)
+        shuffle_seed = next((p.shuffle_seed for p in parsed_list if p.shuffle_seed is not None), None)
+        data_payload = {
+            "entries": [
+                {"entry": r.entry, "code": r.code, "seconds": round(r.seconds, 3), "timedOut": r.timed_out}
+                for r in result.entries
+            ],
+            "skipped_by_reason": telemetry["skippedByReason"],
+            "snapshots_updated": snap_updates,
+            "regressions_saved": saved_regressions,
+        }
+        if shuffle_seed is not None:
+            data_payload["shuffle_seed"] = shuffle_seed
         env_data = agent.json_envelope(
             "run",
             result.status,
@@ -2567,15 +2804,7 @@ def execute_run(
                 "wall_ms": round(sum(r.seconds for r in result.entries) * 1000),
             },
             errors=errors,
-            data={
-                "entries": [
-                    {"entry": r.entry, "code": r.code, "seconds": round(r.seconds, 3), "timedOut": r.timed_out}
-                    for r in result.entries
-                ],
-                "skipped_by_reason": telemetry["skippedByReason"],
-                "snapshots_updated": snap_updates,
-                "regressions_saved": saved_regressions,
-            },
+            data=data_payload,
         )
         out_stream.write(agent.json_dumps_compact(env_data) + "\n")
         out_stream.flush()

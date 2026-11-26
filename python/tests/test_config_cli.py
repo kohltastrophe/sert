@@ -69,9 +69,18 @@ class ConfigAndCliTest(Case):
         self.assertEqual(config.root_of(nested), (self.tmp / "outer").resolve())
         repo = self.tmp / "repo"
         (repo / "sub").mkdir(parents=True)
+        (repo / "other").mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         (repo / "sub/sert.toml").write_text("")
-        self.assertEqual(config.root_of(repo / "sub"), repo.resolve())
+        self.assertEqual(config.root_of(repo / "sub"), (repo / "sub").resolve())
+        self.assertEqual(config.root_of(repo / "other"), repo.resolve())
+        schema_ok = config.load(
+            self.project(
+                '[coverage]\nfile = "cov.lcov"\n[mutate]\ncache = "strict"\n[studio]\nbridge = "bridge.py"\n',
+                name="schema_extra",
+            )
+        )
+        self.assertEqual((schema_ok.get("coverage.file"), schema_ok.get("mutate.cache"), schema_ok.get("studio.bridge")), ("cov.lcov", "strict", "bridge.py"))
 
         bad_toml = self.project("[lint\n", name="bad_toml")
         self.assertEqual(self.sert("lint", "--root", bad_toml)[0], 2)
@@ -215,12 +224,40 @@ class ConfigAndCliTest(Case):
 
         rokit_dir = self.tmp / "fake_home" / ".rokit" / "bin"
         rokit_dir.mkdir(parents=True)
+        aftman_dir = self.tmp / "fake_home" / ".aftman" / "bin"
+        aftman_dir.mkdir(parents=True)
+        mise_dir = self.tmp / "fake_home" / ".local" / "share" / "mise" / "shims"
+        mise_dir.mkdir(parents=True)
         with (
             mock.patch.dict(os.environ, {"HOME": str(self.tmp / "fake_home"), "USERPROFILE": str(self.tmp / "fake_home"), "PATH": "/usr/bin"}),
             mock.patch.object(util.shutil, "which", return_value="/found/rojo") as mock_which,
         ):
             self.assertEqual(util.which("rojo"), "/found/rojo")
-            self.assertIn(str(rokit_dir), mock_which.call_args.kwargs["path"])
+            which_path = mock_which.call_args.kwargs["path"]
+            for expected_dir in (rokit_dir, aftman_dir, mise_dir):
+                self.assertIn(str(expected_dir), which_path)
+
+        # skill_schema() commands and flags stay in sync with cli.COMMANDS & argparse parsers
+        from sert import skill
+
+        schema = skill.skill_schema()
+        real_commands = {k for k in cli.COMMANDS if k != "ghost"}
+        self.assertEqual(set(schema["commands"].keys()), real_commands)
+        cross_cutting = ("--format", "--agent", "--watch", "--shuffle", "--retry", "--junit")
+        for cmd in real_commands:
+            cmd_parser = next(a for a in cli.build([cmd])._actions if isinstance(a, argparse._SubParsersAction)).choices[cmd]
+            real_opts = {opt for action in cmd_parser._actions for opt in action.option_strings}
+            doc_flags = schema["commands"][cmd]["flags"]
+            doc_tokens: set[str] = set()
+            for entry in doc_flags:
+                for piece in entry.split("/"):
+                    tok = piece.strip().split()[0]
+                    if tok.startswith("-"):
+                        self.assertIn(tok, real_opts, f"skill_schema {cmd} documents unknown flag {tok!r}")
+                        doc_tokens.add(tok)
+            for req in cross_cutting:
+                if req in real_opts:
+                    self.assertIn(req, doc_tokens, f"skill_schema {cmd} is missing cross-cutting flag {req}")
 
         raw_cp1252 = io.BytesIO()
         cp1252_stream = io.TextIOWrapper(raw_cp1252, encoding="cp1252", errors="strict", newline="\n")
@@ -407,6 +444,82 @@ class RunReportTest(Case):
         self.assertEqual(doc.getElementsByTagName("failure")[0].getAttribute("message"), "expected 2\ufffd, got \U0001F600")
         self.assertEqual(doc.getElementsByTagName("testcase")[0].getAttribute("name"), "a\ufffdb \ufffd")
 
+        # Verify `--shuffle`, `--seed`, `--retry`, and negative `--retry` validation.
+        sroot = self.runner_project(name="shuffle_retry")
+        code_s, _, err_s = self.sert("run", "--root", sroot, "--shuffle", "--seed", "42", "--retry", "2")
+        self.assertEqual(code_s, 1, err_s)
+        forwarded_sr = (sroot / "args.txt").read_text(encoding="utf-8").strip()
+        for arg in ("--shuffle", "--seed=42", "--retry=2"):
+            self.assertIn(arg, forwarded_sr)
+        code_bad_r, _, err_bad_r = self.sert("run", "--root", sroot, "--retry=-1")
+        self.assertEqual(code_bad_r, 2)
+        self.assertIn("--retry", err_bad_r)
+
+        # Smart TIA watch + manifest cache in stage_project
+        wroot = self.project('[test]\nspecs = ["test/*.spec.luau"]\n', name="smart_watch")
+        (wroot / "src").mkdir()
+        (wroot / "test").mkdir()
+        (wroot / "src/ModA.luau").write_text("return 1\n", encoding="utf-8")
+        (wroot / "src/Unrelated.luau").write_text("return 2\n", encoding="utf-8")
+        (wroot / "test/Alpha.spec.luau").write_text('local A = require("../src/ModA")\nreturn {}\n', encoding="utf-8")
+        (wroot / "test/Beta.spec.luau").write_text("return {}\n", encoding="utf-8")
+
+        seen_specs: list[list[str]] = []
+
+        def spy_cmd_run(run_a, root=None, cfg=None, out=None, err=None):
+            seen_specs.append(list(getattr(run_a, "specs", None) or []))
+            return 0
+
+        sleep_tick = [0]
+
+        def watch_sleep(_iv):
+            sleep_tick[0] += 1
+            if sleep_tick[0] == 1:
+                p = wroot / "src/ModA.luau"
+                st = p.stat()
+                p.write_text("return 11\n", encoding="utf-8")
+                os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+            elif sleep_tick[0] == 2:
+                p = wroot / "src/Unrelated.luau"
+                st = p.stat()
+                p.write_text("return 22\n", encoding="utf-8")
+                os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+
+        sw_err = io.StringIO()
+        sw_args = cli.build(["run"]).parse_args(["run", "--root", str(wroot)])
+        with (
+            mock.patch.object(run, "cmd_run", side_effect=spy_cmd_run),
+            mock.patch("sert.run.time.sleep", side_effect=watch_sleep),
+        ):
+            rc_sw = run.watch_loop(sw_args, wroot, config.load(wroot), max_cycles=3, out=io.StringIO(), err=sw_err)
+        self.assertEqual(rc_sw, 0)
+        self.assertEqual(seen_specs, [[], ["test/Alpha.spec.luau"]])
+        self.assertIn("changed: src/ModA.luau", sw_err.getvalue())
+        self.assertIn("0 affected spec(s); waiting", sw_err.getvalue())
+
+        # stage_project writes `.sert/stage/manifest.json` and skips re-reading unchanged dest files
+        stage_root = self.project('[test]\nstage = "default.project.json"\n', name="stage_manifest")
+        (stage_root / "src").mkdir()
+        (stage_root / "src/Lib.luau").write_text("return 1\n", encoding="utf-8")
+        (stage_root / "default.project.json").write_text(
+            json.dumps({"name": "StageManifest", "tree": {"$className": "DataModel", "ReplicatedStorage": {"Src": {"$path": "src"}}}}),
+            encoding="utf-8",
+        )
+        run.stage_project(stage_root, "default.project.json")
+        self.assertTrue((stage_root / ".sert/stage/manifest.json").is_file())
+        staged_lib = stage_root / ".sert/stage/lexical/src/Lib.luau"
+        orig_read_text = Path.read_text
+        staged_reads: list[Path] = []
+
+        def tracking_read(self_path: Path, *args, **kwargs):
+            if self_path == staged_lib:
+                staged_reads.append(self_path)
+            return orig_read_text(self_path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", tracking_read):
+            run.stage_project(stage_root, "default.project.json")
+        self.assertEqual(staged_reads, [])
+
     @unittest.skipUnless(util.which("luau", REPO), "luau not fetched or on PATH")
     def test_generated_luau_strings_zero_return_and_bad_specs(self):
         luau_bin = util.which("luau", REPO)
@@ -558,6 +671,109 @@ class WiringAndTodoTest(Case):
         self.assertEqual(driver.summarize(parsed, {}), "PASSED 1/3 (0 failed, 1 skipped, 1 todo)")
         verdict = markers.parse('[sert-verdict] {"passed":true,"counts":{"passed":1,"failed":0,"skipped":0,"todo":2,"total":3}}')
         self.assertEqual((verdict.results["todo"], driver.summarize(verdict, {})), (2, "PASSED · 1 passed · 0 failed · 0 skipped · 2 todo"))
+
+    def test_strict_json_luaurc_multi_grep_luau_pattern_and_format_human_override(self):
+        import argparse
+        from sert import agent, graph
+
+        self.assertEqual(agent.output_format(argparse.Namespace(format="human", agent=True), env={"SERT_AGENT": "1"}), "human")
+        bad_rc = self.project("", name="bad_luaurc")
+        (bad_rc / ".luaurc").write_text("{bad json\n", encoding="utf-8")
+        with self.assertRaises(config.SertError):
+            graph.load_luaurc_aliases(bad_rc)
+        with self.assertRaises(config.SertError):
+            run._sync_sert_luaurc(bad_rc)
+
+        # Multi-`--grep` with Luau patterns (`%d+`) and `--exclude` works end-to-end.
+        if shutil.which("luau") or (Path.home() / ".rokit/bin/luau").is_file():
+            mroot = self.project('[test]\nspecs = ["test/*.spec.luau"]\n', name="multi_grep")
+            copy_sert_src(mroot / ".sert/sert/src")
+            (mroot / ".luaurc").write_text('{"aliases": {"sert": "./.sert/sert/src"}}\n', encoding="utf-8")
+            (mroot / "test").mkdir()
+            (mroot / "test/Grep.spec.luau").write_text(
+                'local sert = require("@sert")\n'
+                'sert.test("alpha_1", function() sert.ok(true) end)\n'
+                'sert.test("beta_2", function() sert.ok(true) end)\n'
+                'sert.test("beta_9", function() sert.ok(true) end)\n'
+                'sert.test("gamma_3", function() sert.ok(true) end)\n',
+                encoding="utf-8",
+            )
+            code, out, err = self.sert("run", "--root", mroot, "--grep", "alpha_%d+$", "--grep", "beta_%d+$", "--exclude", "beta_9$")
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("2 passed · 0 failed", out)
+
+        # `_format_failure_snippets` stops before subsequent passing tests / summary lines and skips core runner files
+        snip_root = self.project("", name="snip_bounds")
+        (snip_root / "test/unit").mkdir(parents=True)
+        (snip_root / ".sert/sert/src/core").mkdir(parents=True)
+        (snip_root / "test/unit/RealFail.spec.luau").write_text("-- line1\nsert.eq(1, 2)\n", encoding="utf-8")
+        (snip_root / "test/unit/Util.spec.luau").write_text("-- line1\nerror('logged')\n", encoding="utf-8")
+        (snip_root / ".sert/sert/src/core/runner.luau").write_text("-- runner\nerror('bad')\n", encoding="utf-8")
+        raw_out = "\n".join(
+            [
+                "❌ real fail · 5 ms",
+                "   ⚠️ test/unit/RealFail.spec.luau:2: values differ",
+                "✅ Util · String > handled error · 1 ms",
+                "String failed: test/unit/Util.spec.luau:2: logged",
+                "2 passed · 1 failed · 0 skipped · 6 ms",
+                ".sert/sert/src/core/runner.luau:2: 1 of 3 tests failed",
+            ]
+        )
+        snips = run._format_failure_snippets(raw_out, snip_root)
+        self.assertIn("test/unit/RealFail.spec.luau:2:", snips)
+        self.assertNotIn("Util.spec.luau", snips)
+        self.assertNotIn("runner.luau", snips)
+
+        # `[coverage].file` works end-to-end across `sert run --coverage` and `sert coverage`
+        if shutil.which("luau") or (Path.home() / ".rokit/bin/luau").is_file():
+            cf_root = self.project(
+                '[test]\nspecs = ["test/*.spec.luau"]\n[coverage]\ninclude = ["src"]\nfile = "build/lcov.info"\nmin = 100\n',
+                name="custom_cov_file",
+            )
+            copy_sert_src(cf_root / ".sert/sert/src")
+            (cf_root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/sert/src"}}\n', encoding="utf-8")
+            (cf_root / "src").mkdir()
+            (cf_root / "test").mkdir()
+            (cf_root / "src/A.luau").write_text("local M = {}\nfunction M.ok()\n\treturn 42\nend\nreturn M\n", encoding="utf-8")
+            (cf_root / "test/A.spec.luau").write_text(
+                'local sert = require("@sert")\nlocal M = require("../src/A")\nsert.test("ok", function() sert.eq(M.ok(), 42) end)\n',
+                encoding="utf-8",
+            )
+            rc_cf, out_cf, err_cf = self.sert("run", "--root", cf_root, "--coverage")
+            self.assertEqual(rc_cf, 0, out_cf + err_cf)
+            self.assertTrue((cf_root / "build/lcov.info").is_file())
+            self.assertFalse((cf_root / "coverage.out").exists())
+            rc_cov, out_cov, err_cov = self.sert("coverage", "--root", cf_root)
+            self.assertEqual((rc_cov, out_cov.strip()), (0, "100.0"), out_cov + err_cov)
+
+        # `watch_loop` survives transient malformed `sert.toml` and recovers cleanly next cycle
+        wl_root = self.project('[test]\nspecs = ["test/*.spec.luau"]\n', name="watch_transient")
+        (wl_root / "test").mkdir()
+        (wl_root / "test/A.spec.luau").write_text("return nil\n", encoding="utf-8")
+        wl_cfg = config.load(wl_root)
+        saved_wl_toml = (wl_root / "sert.toml").read_text(encoding="utf-8")
+        wl_cycles = [0]
+
+        def fake_wl_sleep(_iv):
+            wl_cycles[0] += 1
+            toml_p = wl_root / "sert.toml"
+            st = toml_p.stat()
+            if wl_cycles[0] == 1:
+                toml_p.write_text("[broken\n", encoding="utf-8")
+                os.utime(toml_p, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+            elif wl_cycles[0] == 2:
+                toml_p.write_text(saved_wl_toml, encoding="utf-8")
+                os.utime(toml_p, ns=(st.st_atime_ns, st.st_mtime_ns + 4_000_000))
+
+        wl_args = cli.build(["run"]).parse_args(["run", "--root", str(wl_root), "--watch"])
+        wl_out, wl_err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(run, "cmd_run", return_value=0) as mock_wrun,
+            mock.patch("sert.run.time.sleep", side_effect=fake_wl_sleep),
+        ):
+            rc_wl = run.watch_loop(wl_args, wl_root, wl_cfg, max_cycles=3, out=wl_out, err=wl_err)
+        self.assertEqual((rc_wl, mock_wrun.call_count), (0, 2))
+        self.assertIn("error:", wl_err.getvalue())
 
 
 if __name__ == "__main__":

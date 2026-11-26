@@ -126,6 +126,38 @@ class AgentFeaturesTest(helpers.Case):
             self.assertEqual(code_mut, 0)
             self.assertEqual(stdout_buf.getvalue().strip(), "mutate: no covered lines modified in diff; skipping")
 
+        # `[coverage].file` in sert.toml + `../` SF normalization + uncovered new file under `--diff`
+        cov_root = self.tmp / "cov_m2"
+        (cov_root / "src").mkdir(parents=True)
+        (cov_root / "alt").mkdir(parents=True)
+        (cov_root / "src/Foo.luau").write_text("local a = 1\nreturn a\n", encoding="utf-8")
+        (cov_root / "src/NewMod.luau").write_text("local M = {}\nfunction M.f(x: number)\n\treturn x + 1\nend\nreturn M\n", encoding="utf-8")
+        (cov_root / "src/TypesOnly.luau").write_text("export type Foo = {\n\tx: number,\n}\n", encoding="utf-8")
+        self.assertEqual(coverage.norm("../src/Foo.luau", root=cov_root), "src/Foo.luau")
+        self.assertEqual(coverage.norm(f"../{cov_root.name}/src/Foo.luau", root=cov_root), "src/Foo.luau")
+
+        (cov_root / "sert.toml").write_text('[coverage]\ninclude = ["src"]\nfile = "alt/cov.lcov"\n', encoding="utf-8")
+        (cov_root / "alt/cov.lcov").write_text("SF:../src/Foo.luau\nDA:1,1\nDA:2,1\nend_of_record\n", encoding="utf-8")
+        args_file = cli.build(["coverage"]).parse_args(["coverage", "--root", str(cov_root)])
+        out_f, err_f = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out_f), mock.patch("sys.stderr", err_f):
+            code_f = coverage.cmd_coverage(args_file, root=cov_root)
+        self.assertEqual((code_f, out_f.getvalue().strip()), (0, "100.0"))
+
+        with mock.patch("sert.coverage.git_diff_lines", return_value={"src/NewMod.luau": {1, 2, 3, 4, 5}}):
+            args_new = cli.build(["coverage"]).parse_args(["coverage", "--root", str(cov_root), "--diff", "HEAD", "--min", "80"])
+            out_n, err_n = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", out_n), mock.patch("sys.stderr", err_n):
+                code_n = coverage.cmd_coverage(args_new, root=cov_root)
+            self.assertEqual((code_n, out_n.getvalue().strip()), (1, "0.0"))
+
+        with mock.patch("sert.coverage.git_diff_lines", return_value={"src/TypesOnly.luau": {1, 2, 3}}):
+            args_typ = cli.build(["coverage"]).parse_args(["coverage", "--root", str(cov_root), "--diff", "HEAD", "--min", "80"])
+            out_t, err_t = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", out_t), mock.patch("sys.stderr", err_t):
+                code_t = coverage.cmd_coverage(args_typ, root=cov_root)
+            self.assertEqual((code_t, out_t.getvalue().strip()), (0, "coverage: no covered lines modified in diff"))
+
     def test_coverage_badge_json_without_git_plumbing(self) -> None:
         self.assertEqual(coverage.badge_color(30.0), coverage.badge_color(50.0))
         self.assertEqual(coverage.badge_color(95.0), coverage.badge_color(90.0))
@@ -313,6 +345,53 @@ class AgentFeaturesTest(helpers.Case):
         self.assertEqual(rc_fail, 1)
         self.assertIn("src/Bad.luau(3,1): TypeError: broken", out_buf.getvalue())
         self.assertIn("lint: failed: analyze", err_buf.getvalue())
+
+    def test_structured_diff_and_flaky_agent_json_junit_formatting(self) -> None:
+        from xml.etree import ElementTree
+        from sert import agent, markers
+
+        (self.root / "test").mkdir(parents=True, exist_ok=True)
+        (self.root / "test/Diff.spec.luau").write_text("-- s\nsert.eq(a, b)\n", encoding="utf-8")
+        stream = "\n".join(
+            [
+                "[sert-seed] shuffle 2027",
+                '[sert-test] {"name":"table mismatch","file":"test/Diff.spec.luau","line":2,"status":"fail","ms":3,'
+                '"error":"values differ","expected":{"x":1,"role":"admin"},"actual":{"x":1,"role":"guest"}}',
+                '[sert-test] {"name":"flaky check","file":"test/Diff.spec.luau","status":"flaky","ms":4,'
+                '"flaky":true,"attempts":2,"firstError":"transient glitch"}',
+                '[sert-done] {"passed":1,"failed":1,"flaky":1,"flakyTests":["flaky check"],"skipped":0,"total":2,"shuffleSeed":2027}',
+            ]
+        )
+        parsed = markers.parse(stream)
+        self.assertEqual(parsed.shuffle_seed, 2027)
+        self.assertEqual(parsed.flaky_tests, ["flaky check"])
+
+        res = run.RunResult(
+            status=1,
+            entries=[run.EntryRun("test/Diff.spec.luau", 1, 0.01, output=stream)],
+            tests=[{**t, "entry": "test/Diff.spec.luau"} for t in parsed.tests],
+        )
+        self.assertEqual(res.counts["flaky"], 1)
+
+        agent_text = agent.format_run_agent(res, root=self.root)
+        self.assertIn("FAIL passed=1 failed=1 skipped=0 flaky=1", agent_text)
+        self.assertIn("$.role: -'admin' +'guest'", agent_text)
+        self.assertIn("FLAKY flaky check (passed on attempt 2)", agent_text)
+
+        report = run.json_report(res)
+        self.assertEqual(report["counts"]["flaky"], 1)
+        self.assertEqual(report["tests"][0]["expected"], {"x": 1, "role": "admin"})
+        self.assertEqual(report["tests"][0]["actual"], {"x": 1, "role": "guest"})
+        self.assertEqual(report["tests"][1]["firstError"], "transient glitch")
+        self.assertEqual(report["tests"][1]["attempts"], 2)
+
+        xml = ElementTree.fromstring(run.junit_xml(res))
+        flaky_tc = xml.find(".//testcase[@name='flaky check']")
+        self.assertEqual(flaky_tc.find("properties/property[@name='flaky']").get("value"), "true")
+        self.assertEqual(flaky_tc.find("properties/property[@name='attempts']").get("value"), "2")
+        flaky_case = flaky_tc.find("flakyFailure")
+        self.assertIsNotNone(flaky_case)
+        self.assertEqual(flaky_case.get("message"), "transient glitch")
 
 
 if __name__ == "__main__":

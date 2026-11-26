@@ -256,6 +256,103 @@ class EndToEndStudioTest(unittest.TestCase):
         code2, out2, _ = self.run_driver(FakeStudio(replay), ["--failed"])
         self.assertEqual(code2, 0, out2)
 
+    def test_multi_mode_format_json_emits_single_valid_envelope(self):
+        fake = FakeStudio(
+            lambda n, r: (
+                0 if n == 1 else 1,
+                "\n".join(
+                    [
+                        test_line("button · clicks", "pass" if n == 1 else "fail", file="Button", error=None if n == 1 else "bad"),
+                        f'[sert-done] {{"passed":{1 if n == 1 else 0},"failed":{0 if n == 1 else 1},"total":1}}',
+                    ]
+                ),
+                {"ok": n == 1, "value": {"passed": 1 if n == 1 else 0, "failed": 0 if n == 1 else 1}},
+            )
+        )
+        code, out, _ = self.run_driver(fake, ["--mode", "play", "--mode", "run", "--format", "json"])
+        self.assertEqual(code, 1)
+        envelope = json.loads(out)
+        self.assertEqual(envelope["command"], "studio")
+        self.assertEqual(envelope["exit_code"], 1)
+        self.assertEqual(envelope["summary"]["modes"], ["play", "run"])
+        self.assertEqual((envelope["summary"]["passed"], envelope["summary"]["failed"]), (1, 1))
+        self.assertEqual(len(envelope["data"]["modes"]), 2)
+
+    def test_warm_skips_overlay_junit_isolated_hooks_clickable_line_and_gha(self):
+        # 1. `--warm` skips `synthesize_rojo_overlay` and passes `runner_path` to runscript
+        fake_warm = FakeStudio(
+            lambda n, r: (
+                0,
+                "\n".join([test_line("button · clicks", "pass", file="Button"), '[sert-done] {"passed":1,"failed":0,"total":1}']),
+                {"ok": True, "value": {"passed": 1, "failed": 0}},
+            )
+        )
+        with mock.patch.object(driver, "synthesize_rojo_overlay") as spy_overlay:
+            code_w, _, _ = self.run_driver(fake_warm, ["--warm"])
+        self.assertEqual(code_w, 0)
+        spy_overlay.assert_not_called()
+
+        # 2. `--junit` aggregates multi-mode Studio tests & crashes into JUnit XML
+        junit_file = os.path.join(self.root, "studio-junit.xml")
+        fake_fail = FakeStudio(
+            lambda n, r: (
+                1 if n == 2 else 0,
+                "\n".join(
+                    [
+                        test_line("button · clicks", "fail" if n == 2 else "pass", file="test/Button.spec.luau", line=42, error="boom")
+                        if n == 2
+                        else test_line("button · clicks", "pass", file="test/Button.spec.luau"),
+                        f'[sert-done] {{"passed":{0 if n == 2 else 1},"failed":{1 if n == 2 else 0},"total":1}}',
+                    ]
+                ),
+                {"ok": n != 2, "value": {"passed": 0 if n == 2 else 1, "failed": 1 if n == 2 else 0}},
+            )
+        )
+        settings = suites.Settings(self.root, self.conf)
+        opts = driver.build_parser(settings, driver.Hooks()).parse_args(["--mode", "play", "--mode", "run", "--junit", junit_file])
+        out_h = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}),
+            mock.patch.object(runscript, "run", fake_fail),
+            mock.patch.object(driver, "build_place", lambda root, project, place, quiet=False: 0.1),
+            contextlib.redirect_stdout(out_h),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            opts.json_records = []
+            rc_j = driver.write_junit_out(opts, driver.guarded(settings, driver.Hooks(), opts), root=self.root)
+        self.assertEqual(rc_j, 1)
+        self.assertIn("FAIL test/Button.spec.luau:42: button · clicks", out_h.getvalue())
+        self.assertIn("::error file=test/Button.spec.luau,line=42,title=sert studio (run)::button · clicks: boom", out_h.getvalue())
+        junit_text = pathlib.Path(junit_file).read_text(encoding="utf-8")
+        self.assertIn('<testsuite name="test/Button.spec.luau"', junit_text)
+        self.assertIn("boom", junit_text)
+
+        # 3. `load_hooks` isolates distinct hook module names per file path
+        h1_path = pathlib.Path(self.root) / "h1.py"
+        h2_path = pathlib.Path(self.root) / "h2.py"
+        h1_path.write_text("TAG = 'first'\n", encoding="utf-8")
+        h2_path.write_text("TAG = 'second'\n", encoding="utf-8")
+        h1 = driver.load_hooks(str(h1_path))
+        h2 = driver.load_hooks(str(h2_path))
+        self.assertEqual((h1.module.TAG, h2.module.TAG), ("first", "second"))
+        self.assertNotEqual(h1.module.__name__, h2.module.__name__)
+
+        # 4. Missing Rojo project gives an actionable error in human & `--format json` modes
+        no_proj = self.root + "_missing_proj"
+        os.makedirs(os.path.join(no_proj, "test"), exist_ok=True)
+        try:
+            err_human = io.StringIO()
+            with contextlib.redirect_stderr(err_human):
+                self.assertEqual(driver.run(["--root", no_proj, "--check"]), util.INFRA)
+            self.assertIn("Rojo project not found", err_human.getvalue())
+            out_json_chk = io.StringIO()
+            with contextlib.redirect_stdout(out_json_chk), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(driver.run(["--root", no_proj, "--check", "--format", "json"]), util.INFRA)
+            chk_env = json.loads(out_json_chk.getvalue())
+            self.assertTrue(any("Rojo project not found" in e for e in chk_env["errors"]), chk_env)
+        finally:
+            shutil.rmtree(no_proj, ignore_errors=True)
+
 
 RUNNER_LUAU = REPO / "src" / "roblox" / "Runner.luau"
 
@@ -304,8 +401,14 @@ class RequestKeysContractTest(unittest.TestCase):
                 "zzz",
                 "--clients",
                 "2",
+                "--shuffle",
+                "--retry",
+                "2",
+                "--studio-id",
+                "s9",
             ]
             opts = driver.build_parser(settings, driver.Hooks()).parse_args(every + ["needle"])
+            self.assertEqual(opts.studio_id, "s9")
             picked = selection(
                 filter="needle",
                 filters=["a"],
@@ -319,7 +422,10 @@ class RequestKeysContractTest(unittest.TestCase):
             request = driver.build_request(settings, opts, "play", picked, "run-1")
             allowed = runner_request_keys()
             self.assertEqual(sorted(set(request) - allowed), [])
-            self.assertEqual((request["replay"], request["exhaustive"], request["budget"], request["clients"]), (3, True, 4.0, 2))
+            self.assertEqual(
+                (request["replay"], request["exhaustive"], request["budget"], request["clients"], request["shuffle"], request["retry"]),
+                (3, True, 4.0, 2, True, 2),
+            )
 
 
 if __name__ == "__main__":

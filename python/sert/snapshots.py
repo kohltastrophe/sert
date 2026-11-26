@@ -45,12 +45,13 @@ def _clean_path(raw: str) -> str:
     text = str(raw).strip().replace("\\", "/")
     while text.startswith(("@", "=")):
         text = text[1:]
-    while text.startswith("./"):
-        text = text[2:]
+    for prefix in ("./", "../", ".sert/fuzz/overlay/", "stage/lexical/", "stage/files/", "stage/specs/", "self/lexical/", "self/files/"):
+        while text.startswith(prefix):
+            text = text[len(prefix) :]
     return text
 
 
-def _resolve_root_file(root: Path, raw_file: str) -> Path | None:
+def _resolve_root_file(root: Path, raw_file: str, *, glob_tail: bool = True) -> Path | None:
     cleaned = _clean_path(raw_file)
     if not cleaned:
         return None
@@ -94,7 +95,7 @@ def _resolve_root_file(root: Path, raw_file: str) -> Path | None:
             if hit is not None:
                 return hit
 
-    if normed:
+    if glob_tail and normed:
         tail = normed.rsplit("/", 1)[-1]
         for suffix in ("", ".luau", ".lua", ".spec.luau"):
             pattern = f"**/{tail}{suffix}"

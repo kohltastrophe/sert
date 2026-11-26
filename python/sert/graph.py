@@ -11,9 +11,11 @@ import re
 import sys
 
 from sert import config as config_mod, coverage as coverage_mod, luau_lex
-from sert.util import as_list, expand_globs, load_json, posix, strip_jsonc, write_atomic
+from sert.util import as_list, expand_globs, load_json, load_json_strict, posix, write_atomic
 
 COVERAGE_MAP_REL = ".sert/coverage-map.json"
+GRAPH_CACHE_REL = ".sert/graph-cache.json"
+_GRAPH_CACHE_VERSION = 1
 DEFAULT_SPEC_GLOBS = ("test/**/*.spec.luau", "tests/**/*.spec.luau")
 INIT_NAMES = (
     "init.luau",
@@ -40,6 +42,7 @@ GLOBAL_INVALIDATION_NAMES = frozenset(
         "rokit.toml",
         ".config.luau",
         "init.config.luau",
+        ".sert-regressions.toml",
     }
 )
 _SKIP_DIRS = frozenset({".git", ".sert", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"})
@@ -118,8 +121,40 @@ def _resolve_module_path(base: Path, root_resolved: Path) -> str | None:
     return None
 
 
+def _load_luaurc_layers(rc_path: Path, visited: set[Path]) -> list[tuple[Path, dict[str, str]]]:
+    resolved = rc_path.resolve()
+    if resolved in visited or not resolved.is_file():
+        return []
+    visited.add(resolved)
+    parsed = load_json_strict(resolved)
+    if not isinstance(parsed, dict):
+        return []
+    layers: list[tuple[Path, dict[str, str]]] = []
+    extends = parsed.get("extends")
+    if isinstance(extends, str) and extends.strip():
+        ext_spec = Path(extends.strip())
+        ext_cand = ext_spec if ext_spec.is_absolute() else (resolved.parent / ext_spec)
+        ext_rc = (
+            ext_cand
+            if (ext_cand.suffix == ".luaurc" or ext_cand.name == ".luaurc" or ext_cand.is_file())
+            else (ext_cand / ".luaurc")
+        )
+        if ext_rc.is_file():
+            layers.extend(_load_luaurc_layers(ext_rc, visited))
+    aliases = parsed.get("aliases")
+    if isinstance(aliases, dict):
+        clean = {
+            k: v.replace("\\", "/")
+            for k, v in aliases.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+        if clean:
+            layers.append((resolved.parent, clean))
+    return layers
+
+
 def load_luaurc_aliases(root: Path, directory: Path | None = None) -> dict[str, Path]:
-    """Load `.luaurc` aliases inherited from `root` down to `directory` (closer `.luaurc` overrides parent)."""
+    """Load `.luaurc` aliases (including `extends`) inherited from `root` down to `directory`."""
     root_resolved = Path(root).resolve()
     target_dir = root_resolved if directory is None else Path(directory).resolve()
     if not target_dir.is_relative_to(root_resolved):
@@ -135,27 +170,15 @@ def load_luaurc_aliases(root: Path, directory: Path | None = None) -> dict[str, 
 
     raw_aliases: dict[str, tuple[Path, str]] = {}
     lower_to_key: dict[str, str] = {}
+    visited_rcs: set[Path] = set()
     for folder in reversed(chain):
-        rc_path = folder / ".luaurc"
-        if not rc_path.is_file():
-            continue
-        try:
-            parsed = json.loads(strip_jsonc(rc_path.read_text(encoding="utf-8-sig")))
-        except (OSError, UnicodeDecodeError, ValueError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        aliases = parsed.get("aliases")
-        if not isinstance(aliases, dict):
-            continue
-        for key, val in aliases.items():
-            if not isinstance(key, str) or not isinstance(val, str):
-                continue
-            prev_key = lower_to_key.get(key.lower())
-            if prev_key is not None and prev_key != key:
-                raw_aliases.pop(prev_key, None)
-            lower_to_key[key.lower()] = key
-            raw_aliases[key] = (folder, val.replace("\\", "/"))
+        for base_dir, aliases in _load_luaurc_layers(folder / ".luaurc", visited_rcs):
+            for key, val in aliases.items():
+                prev_key = lower_to_key.get(key.lower())
+                if prev_key is not None and prev_key != key:
+                    raw_aliases.pop(prev_key, None)
+                lower_to_key[key.lower()] = key
+                raw_aliases[key] = (base_dir, val)
 
     resolved: dict[str, Path] = {}
 
@@ -314,9 +337,7 @@ def _parse_rojo_project_tree(proj_file: Path, root_resolved: Path) -> _RojoNode 
             return None
         active_projects.add(resolved)
         try:
-            data = json.loads(strip_jsonc(resolved.read_text(encoding="utf-8-sig")))
-        except (OSError, UnicodeDecodeError, ValueError):
-            return None
+            data = load_json_strict(resolved)
         finally:
             active_projects.discard(resolved)
         if not isinstance(data, dict) or not isinstance(data.get("tree"), dict):
@@ -406,17 +427,46 @@ def _parse_instance_chain(
     head = tokens[idx].value
     if head == "game":
         root_kind, parts = "game", []
+        idx += 1
     elif head == "workspace":
         root_kind, parts = "game", ["Workspace"]
+        idx += 1
     elif head == "script":
         root_kind, parts = "script", []
+        idx += 1
     elif head in bindings:
         root_kind, base_parts = bindings[head]
         parts = list(base_parts)
+        idx += 1
+    elif (
+        idx + 2 < end
+        and tokens[idx + 1].kind == "OP"
+        and tokens[idx + 1].value == "."
+        and tokens[idx + 2].kind == "IDENT"
+        and tokens[idx + 2].value in ("game", "workspace")
+    ):
+        root_kind = "game"
+        parts = [] if tokens[idx + 2].value == "game" else ["Workspace"]
+        idx += 3
+    elif (
+        idx + 3 < end
+        and tokens[idx + 1].kind == "OP"
+        and tokens[idx + 1].value == ":"
+        and tokens[idx + 2].kind == "IDENT"
+        and tokens[idx + 2].value in ("GetService", "getService", "FindService")
+        and tokens[idx + 3].kind == "OP"
+        and tokens[idx + 3].value == "("
+    ):
+        close = luau_lex.matching_close(tokens, idx + 3, "(", ")")
+        if close is None or close >= end or idx + 4 >= close or tokens[idx + 4].kind != "STRING":
+            return None
+        svc_name = luau_lex.unquote_string(tokens[idx + 4].value)
+        if svc_name is None:
+            return None
+        root_kind, parts = "game", [svc_name]
+        idx = close + 1
     else:
         return None
-
-    idx += 1
     while idx < end:
         tok = tokens[idx]
         if tok.kind == "OP" and tok.value == "::":
@@ -456,7 +506,7 @@ def _parse_instance_chain(
                 arg_str = luau_lex.unquote_string(tokens[arg_idx].value)
                 if arg_str is None:
                     return None
-                if method in ("GetService", "FindService") and root_kind == "game" and not parts:
+                if method in ("GetService", "getService", "FindService") and root_kind == "game" and not parts:
                     parts.append(arg_str)
                 elif method in ("WaitForChild", "FindFirstChild"):
                     parts.append(arg_str)
@@ -554,8 +604,18 @@ def extract_requires(source: str) -> tuple[list[str], list[tuple[str, list[str]]
         if tok.kind == "IDENT" and tok.value == "require":
             prev = tokens[i - 1] if i > 0 else None
             nxt = tokens[i + 1] if i + 1 < n else None
-            is_member = prev is not None and prev.kind == "OP" and prev.value in (".", ":")
-            is_def = prev is not None and prev.kind == "KEYWORD" and prev.value == "function"
+            is_member = prev is not None and prev.kind == "OP" and prev.value == "."
+            is_method_def = False
+            if prev is not None and prev.kind == "OP" and prev.value == ":":
+                scan = i - 2
+                while scan >= 0 and tokens[scan].kind == "IDENT":
+                    if scan >= 2 and tokens[scan - 1].kind == "OP" and tokens[scan - 1].value == ".":
+                        scan -= 2
+                    else:
+                        if scan > 0 and tokens[scan - 1].kind == "KEYWORD" and tokens[scan - 1].value == "function":
+                            is_method_def = True
+                        break
+            is_def = is_method_def or (prev is not None and prev.kind == "KEYWORD" and prev.value == "function")
             is_assign = nxt is not None and nxt.kind == "OP" and nxt.value == "="
             if not is_member and not is_def and not is_assign and nxt is not None:
                 if nxt.kind == "STRING":
@@ -744,25 +804,89 @@ def _iter_luau_files(root_resolved: Path) -> list[Path]:
     return found
 
 
-def build_graph(root: Path, cfg=None, files: list[Path] | None = None) -> DependencyGraph:
+def _load_graph_cache(root: Path) -> dict[str, dict]:
+    data = load_json(root / GRAPH_CACHE_REL)
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != _GRAPH_CACHE_VERSION
+        or not isinstance(data.get("files"), dict)
+    ):
+        return {}
+    return data["files"]
+
+
+def _save_graph_cache(root: Path, files_cache: dict[str, dict]) -> None:
+    payload = {"version": _GRAPH_CACHE_VERSION, "files": files_cache}
+    try:
+        write_atomic(root / GRAPH_CACHE_REL, (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8"))
+    except OSError:
+        pass
+
+
+def build_graph(
+    root: Path,
+    cfg=None,
+    files: list[Path] | None = None,
+    *,
+    use_cache: bool = True,
+) -> DependencyGraph:
     """Build forward and reverse static Luau module dependency edges across `root`."""
     root_resolved = Path(root).resolve()
     rojo = load_rojo_trees(root_resolved, cfg)
     graph = DependencyGraph(root=root_resolved, rojo=rojo)
     alias_cache: dict[Path, dict[str, Path]] = {}
 
+    files_cache = _load_graph_cache(root_resolved) if use_cache else {}
+    cache_dirty = False
+    seen_rels: set[str] = set()
+
     luau_files = _iter_luau_files(root_resolved) if files is None else [Path(f).resolve() for f in files]
     for file_path in luau_files:
         rel = _rel_if_inside(file_path, root_resolved)
         if rel is None:
             continue
+        seen_rels.add(rel)
         graph.forward.setdefault(rel, set())
         graph.reverse.setdefault(rel, set())
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        str_reqs, chain_reqs = extract_requires(source)
+
+        str_reqs: list[str]
+        chain_reqs: list[tuple[str, list[str]]]
+        cached = files_cache.get(rel) if use_cache else None
+        st = None
+        if use_cache:
+            try:
+                st = file_path.stat()
+            except OSError:
+                continue
+        if (
+            isinstance(cached, dict)
+            and st is not None
+            and cached.get("mtime_ns") == st.st_mtime_ns
+            and cached.get("size") == st.st_size
+            and isinstance(cached.get("str_reqs"), list)
+            and isinstance(cached.get("chain_reqs"), list)
+        ):
+            str_reqs = [str(r) for r in cached["str_reqs"]]
+            chain_reqs = [
+                (str(c[0]), [str(p) for p in c[1]])
+                for c in cached["chain_reqs"]
+                if isinstance(c, (list, tuple)) and len(c) == 2 and isinstance(c[1], (list, tuple))
+            ]
+        else:
+            try:
+                source = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            str_reqs, chain_reqs = extract_requires(source)
+            if use_cache and st is not None:
+                files_cache[rel] = {
+                    "mtime_ns": st.st_mtime_ns,
+                    "size": st.st_size,
+                    "str_reqs": list(str_reqs),
+                    "chain_reqs": [[rk, list(parts)] for rk, parts in chain_reqs],
+                }
+                cache_dirty = True
+
         if not str_reqs and not chain_reqs:
             continue
         if str_reqs:
@@ -776,6 +900,14 @@ def build_graph(root: Path, cfg=None, files: list[Path] | None = None) -> Depend
         for chain in chain_reqs:
             if dst := _resolve_chain_require(file_path, rel, chain, root_resolved, rojo):
                 graph.add_edge(rel, dst)
+
+    if use_cache and files is None and files_cache:
+        stale_keys = [k for k in files_cache if k not in seen_rels]
+        for stale in stale_keys:
+            files_cache.pop(stale, None)
+            cache_dirty = True
+    if use_cache and cache_dirty:
+        _save_graph_cache(root_resolved, files_cache)
 
     return graph
 
@@ -804,49 +936,51 @@ def _file_sha256(path: Path) -> str:
         return ""
 
 
-def record_spec_coverage(root: Path, spec_rel: str, cov_files: dict, ms: int, *, exact: bool = True) -> dict:
-    """Update `.sert/coverage-map.json` for `spec_rel` from LCOV coverage (`cov_files`) and duration `ms`."""
+def record_specs_coverage(root: Path, updates: list[tuple[str, dict, int, bool]]) -> dict:
+    """Batch-update `.sert/coverage-map.json` for multiple `(spec_rel, cov_files, ms, exact)` entries."""
     root_path = Path(root)
-    norm_spec = _norm_rel(spec_rel, root_path)
-    norm_files: dict[str, list[int]] = {}
-    for src_name, raw_lines in cov_files.items():
-        src_rel = _norm_rel(src_name, root_path)
-        if not src_rel or src_rel.startswith(("/", "../")) or (len(src_rel) >= 2 and src_rel[1] == ":"):
-            continue
-        if isinstance(raw_lines, dict):
-            hits = sorted({int(ln) for ln, hit in raw_lines.items() if hit})
-        else:
-            hits = sorted({int(ln) for ln in raw_lines})
-        if hits:
-            existing_hits = norm_files.get(src_rel)
-            if existing_hits is not None:
-                norm_files[src_rel] = sorted(set(existing_hits) | set(hits))
-            else:
-                norm_files[src_rel] = hits
-
     cov_map = load_coverage_map(root_path)
-    cur_sha = _file_sha256(root_path / norm_spec)
-    prev_entry = cov_map["specs"].get(norm_spec)
-    if (
-        not exact
-        and isinstance(prev_entry, dict)
-        and prev_entry.get("exact") is not False
-        and isinstance(prev_entry.get("files"), dict)
-        and prev_entry.get("sha256") == cur_sha
-    ):
-        prev_entry["ms"] = max(0, int(round(ms)))
-        save_coverage_map(root_path, cov_map)
-        return cov_map
-    spec_entry: dict = {
-        "ms": max(0, int(round(ms))),
-        "sha256": cur_sha,
-        "files": norm_files,
-    }
-    if not exact:
-        spec_entry["exact"] = False
-    cov_map["specs"][norm_spec] = spec_entry
+    for spec_rel, cov_files, ms, exact in updates:
+        norm_spec = _norm_rel(spec_rel, root_path)
+        norm_files: dict[str, list[int]] = {}
+        for src_name, raw_lines in cov_files.items():
+            src_rel = _norm_rel(src_name, root_path)
+            if not src_rel or src_rel.startswith(("/", "../")) or (len(src_rel) >= 2 and src_rel[1] == ":"):
+                continue
+            if isinstance(raw_lines, dict):
+                hits = sorted({int(ln) for ln, hit in raw_lines.items() if hit})
+            else:
+                hits = sorted({int(ln) for ln in raw_lines})
+            if hits:
+                existing_hits = norm_files.get(src_rel)
+                norm_files[src_rel] = sorted(set(existing_hits) | set(hits)) if existing_hits is not None else hits
+
+        cur_sha = _file_sha256(root_path / norm_spec)
+        prev_entry = cov_map["specs"].get(norm_spec)
+        if (
+            not exact
+            and isinstance(prev_entry, dict)
+            and prev_entry.get("exact") is not False
+            and isinstance(prev_entry.get("files"), dict)
+            and prev_entry.get("sha256") == cur_sha
+        ):
+            prev_entry["ms"] = max(0, int(round(ms)))
+            continue
+        spec_entry: dict = {
+            "ms": max(0, int(round(ms))),
+            "sha256": cur_sha,
+            "files": norm_files,
+        }
+        if not exact:
+            spec_entry["exact"] = False
+        cov_map["specs"][norm_spec] = spec_entry
     save_coverage_map(root_path, cov_map)
     return cov_map
+
+
+def record_spec_coverage(root: Path, spec_rel: str, cov_files: dict, ms: int, *, exact: bool = True) -> dict:
+    """Update `.sert/coverage-map.json` for `spec_rel` from LCOV coverage (`cov_files`) and duration `ms`."""
+    return record_specs_coverage(root, [(spec_rel, cov_files, ms, exact)])
 
 
 def discover_specs(root: Path, cfg=None) -> list[str]:
@@ -881,39 +1015,91 @@ def _is_global_config_change(rel_file: str, cfg=None) -> bool:
     return False
 
 
-def affected_specs(
+def _specs_for_meta_change(
+    mod_file: str,
+    dep_graph: DependencyGraph,
+    specs_cov: dict[str, dict],
+    all_spec_set: set[str],
+) -> set[str]:
+    targets: set[str] = set()
+    known_files = set(dep_graph.forward) | all_spec_set
+    if Path(mod_file).name == "init.meta.json":
+        dir_prefix = mod_file[: -len("init.meta.json")]
+        for cand in known_files:
+            if not dir_prefix or cand.startswith(dir_prefix):
+                targets.add(cand)
+    else:
+        stem = mod_file[: -len(".meta.json")]
+        init_prefix = f"{stem}/init."
+        for cand in known_files:
+            if cand.startswith(f"{stem}.") or cand.startswith(init_prefix):
+                targets.add(cand)
+
+    hit: set[str] = set()
+    for target in targets:
+        if target in all_spec_set:
+            hit.add(target)
+        hit.update(dep_graph.dependents(target, transitive=True) & all_spec_set)
+        for norm_spec, spec_entry in specs_cov.items():
+            if norm_spec not in all_spec_set:
+                continue
+            files_map = spec_entry.get("files")
+            if isinstance(files_map, dict) and files_map.get(target):
+                hit.add(norm_spec)
+    return hit
+
+
+def affected_specs_for_files(
     root: Path,
     cfg=None,
-    base_rev: str = "HEAD",
+    modified_files: set[str] | list[str] | tuple[str, ...] = (),
+    *,
+    diff_lines: dict[str, set[int]] | None = None,
     all_specs: list[str] | None = None,
-) -> tuple[list[str], set[str]]:
-    """Return `(sorted_affected_specs, modified_files)` via hybrid static + dynamic TIA."""
+    dep_graph: DependencyGraph | None = None,
+    cov_map: dict | None = None,
+) -> list[str]:
+    """Return sorted impacted spec files for an explicit set of changed repository files."""
     root_path = Path(root)
     specs_raw = discover_specs(root_path, cfg) if all_specs is None else list(all_specs)
-    norm_to_spec: dict[str, str] = {}
-    for s in specs_raw:
-        norm_to_spec[_norm_rel(s, root_path)] = _norm_rel(s, root_path)
-    all_spec_set = set(norm_to_spec)
+    all_spec_set = {_norm_rel(s, root_path) for s in specs_raw}
+    mod_set = {_norm_rel(f, root_path) for f in modified_files}
+    if not mod_set:
+        return []
 
-    diff_lines = coverage_mod.git_diff_lines(root_path, base_rev)
-    modified_files = {_norm_rel(f, root_path) for f in diff_lines}
-    if not modified_files:
-        return [], set()
+    if any(_is_global_config_change(f, cfg) for f in mod_set):
+        return sorted(all_spec_set)
 
-    if any(_is_global_config_change(f, cfg) for f in modified_files):
-        return sorted(all_spec_set), modified_files
-
-    graph = build_graph(root_path, cfg)
-    cov_map = load_coverage_map(root_path)
-    raw_specs_cov = cov_map.get("specs") if isinstance(cov_map.get("specs"), dict) else {}
+    graph = build_graph(root_path, cfg) if dep_graph is None else dep_graph
+    loaded_cov_map = load_coverage_map(root_path) if cov_map is None else cov_map
+    raw_specs_cov = loaded_cov_map.get("specs") if isinstance(loaded_cov_map.get("specs"), dict) else {}
     specs_cov = {_norm_rel(k, root_path): v for k, v in raw_specs_cov.items() if isinstance(v, dict)}
+    norm_diff_lines = (
+        {_norm_rel(k, root_path): v for k, v in diff_lines.items()} if diff_lines is not None else {}
+    )
 
+    snap_lookup: dict[str, list[str]] | None = None
     affected: set[str] = set()
-    for mod_raw, mod_line_set in diff_lines.items():
-        mod_file = _norm_rel(mod_raw, root_path)
+    for mod_file in mod_set:
+        if mod_file.endswith(".snap"):
+            if snap_lookup is None:
+                from sert import snapshots as snapshots_mod
+
+                snap_lookup = {}
+                for spec in all_spec_set:
+                    snap_rel = _norm_rel(snapshots_mod.snapshot_path_for(root_path, spec), root_path)
+                    snap_lookup.setdefault(snap_rel, []).append(spec)
+            affected.update(snap_lookup.get(mod_file, ()))
+            continue
+
+        if mod_file.endswith(".meta.json"):
+            affected.update(_specs_for_meta_change(mod_file, graph, specs_cov, all_spec_set))
+            continue
+
         if mod_file in all_spec_set:
             affected.add(mod_file)
         affected.update(graph.dependents(mod_file, transitive=True) & all_spec_set)
+        mod_line_set = norm_diff_lines.get(mod_file) if diff_lines is not None else None
         for norm_spec, spec_entry in specs_cov.items():
             if norm_spec not in all_spec_set:
                 continue
@@ -926,7 +1112,35 @@ def affected_specs(
             ):
                 affected.add(norm_spec)
 
-    return sorted(affected), modified_files
+    return sorted(affected)
+
+
+def affected_specs(
+    root: Path,
+    cfg=None,
+    base_rev: str = "HEAD",
+    all_specs: list[str] | None = None,
+    *,
+    diff_lines: dict[str, set[int]] | None = None,
+    dep_graph: DependencyGraph | None = None,
+    cov_map: dict | None = None,
+) -> tuple[list[str], set[str]]:
+    """Return `(sorted_affected_specs, modified_files)` via hybrid static + dynamic TIA."""
+    root_path = Path(root)
+    resolved_diff = coverage_mod.git_diff_lines(root_path, base_rev) if diff_lines is None else diff_lines
+    modified_files = {_norm_rel(f, root_path) for f in resolved_diff}
+    if not modified_files:
+        return [], set()
+    affected = affected_specs_for_files(
+        root_path,
+        cfg,
+        modified_files,
+        diff_lines=resolved_diff,
+        all_specs=all_specs,
+        dep_graph=dep_graph,
+        cov_map=cov_map,
+    )
+    return affected, modified_files
 
 
 def covering_specs_for_line(

@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import ssl
 import subprocess
 import tempfile
 import tomllib
@@ -24,6 +25,7 @@ import urllib.parse
 import urllib.request
 
 REPO = "kohltastrophe/sert"
+DEFAULT_VERSION = "0.2.1"
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -160,7 +162,15 @@ def fetch_bytes(url: str, repo: str, tag: str, asset_name: str) -> bytes:
         with opener.open(req, timeout=120) as resp:
             return _read_exact(resp)
     except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as err:
-        die(f"download failed ({url}): {err}")
+        hint = ""
+        if isinstance(err, urllib.error.URLError) and isinstance(err.reason, ssl.SSLError):
+            hint = " (check system CA certificates / SSL_CERT_FILE or corporate proxy settings)"
+        elif isinstance(err, urllib.error.HTTPError) and err.code in (401, 403, 404) and "github" in url.lower():
+            hint = " (check [sert].version / [sert].repo, or set GITHUB_TOKEN for private repos)"
+        elif isinstance(err, urllib.error.URLError):
+            hint = " (check network / HTTPS_PROXY, or pass --offline if cached)"
+        detail = repr(err) if isinstance(err, http.client.IncompleteRead) else str(err)
+        die(f"download failed ({url}): {detail}{hint}")
 
 
 def ensure_verified_pyz(root: Path, repo: str, version: str, offline: bool) -> Path:
@@ -242,6 +252,18 @@ def _run_checkout(checkout: Path, argv: list[str], env: dict[str, str]) -> int:
     return _exec_child([sys.executable, "-P", "-m", "sert", *argv], env)
 
 
+def _first_command(argv: list[str]) -> str | None:
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg == "--root":
+            skip = True
+        elif not arg.startswith("-"):
+            return arg
+    return None
+
+
 def main() -> int:
     argv = sys.argv[1:]
     root = find_root(argv)
@@ -261,7 +283,18 @@ def main() -> int:
     if not version:
         if (root / "python" / "sert" / "__main__.py").is_file():
             return _run_checkout(root, argv, env)
-        die(f"missing [sert].version in {root / 'sert.toml'}")
+        if _first_command(argv) == "init":
+            version = DEFAULT_VERSION
+        elif not (root / "sert.toml").is_file():
+            die(
+                f"no sert.toml found in {root} "
+                f"(run `{py_name} tools/sert.py init --fetch` to create one, or set SERT_SOURCE)"
+            )
+        else:
+            die(
+                f'missing [sert].version in {root / "sert.toml"} '
+                f'(add `[sert]` with `version = "{DEFAULT_VERSION}"` or set SERT_SOURCE)'
+            )
     repo = str(cfg.get("repo") or REPO).strip()
     offline = "--offline" in argv or os.environ.get("SERT_OFFLINE", "").strip().lower() in ("1", "true", "yes")
     pyz = ensure_verified_pyz(root, repo, version, offline=offline)

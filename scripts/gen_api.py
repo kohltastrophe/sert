@@ -74,8 +74,10 @@ def flags_of(m: dict) -> str:
     read, write = security(m)
     if m["MemberType"] == "Property" and write not in ALLOWED:
         out.add("r")
-    if "PluginSecurity" in (read, write):
+    if read == "PluginSecurity":
         out.add("p")
+    elif m["MemberType"] == "Property" and write == "PluginSecurity":
+        out.add("q")
     return "".join(sorted(out))
 
 
@@ -136,7 +138,7 @@ def default_of(m: dict) -> str:
                 return ""
         if name in ("Axes", "Faces"):
             return ",".join(p.strip() for p in raw.split(",") if p.strip()) or "-"
-        if name == "ContentId":
+        if name in ("ContentId", "Content"):
             return "=" + escape_text(raw)
         if name == "TweenInfo":
             fields = dict(p.split(":", 1) for p in raw.split())
@@ -194,6 +196,8 @@ export type Property = {
 \twriteOnly: boolean,
 \tdeprecated: boolean,
 \tplugin: boolean,
+\tpluginRead: boolean,
+\tpluginWrite: boolean,
 \tnotReplicated: boolean,
 \tdefault: string?,
 }
@@ -324,7 +328,9 @@ local function parseClass(name: string): Class?
 \t\t\t\treadOnly = hasFlag(flags, "r"),
 \t\t\t\twriteOnly = hasFlag(flags, "w"),
 \t\t\t\tdeprecated = hasFlag(flags, "d"),
-\t\t\t\tplugin = hasFlag(flags, "p"),
+\t\t\t\tplugin = hasFlag(flags, "p") or hasFlag(flags, "q"),
+\t\t\t\tpluginRead = hasFlag(flags, "p"),
+\t\t\t\tpluginWrite = hasFlag(flags, "p") or hasFlag(flags, "q"),
 \t\t\t\tnotReplicated = hasFlag(flags, "n"),
 \t\t\t\tdefault = default,
 \t\t\t}
@@ -538,7 +544,7 @@ function Generated.defaultValue(className: string, name: string, ctx: any): any
 \telseif category == "Enum" then
 \t\tlocal enumType = ctx.Enum and ctx.Enum[typeName]
 \t\treturn if enumType ~= nil then enumType[raw] else nil
-\telseif typeName == "ContentId" then
+\telseif typeName == "ContentId" or typeName == "Content" then
 \t\treturn unescape(string.sub(raw, 2))
 \tend
 \tlocal ctor = ctx[typeName]

@@ -116,11 +116,16 @@ WARM_EDIT_TEMPLATE = """\
 --!strict
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
+local SENTINEL = {sentinel}
 local PRELUDE = {prelude}
 local BODY = {script}
 local captured = {{}}
+local verdictSeen = false
 local conn = LogService.MessageOut:Connect(function(msg)
     table.insert(captured, msg)
+    if string.sub(msg, 1, #SENTINEL + 1) == SENTINEL .. " " then
+        verdictSeen = true
+    end
 end)
 local ok, err = pcall(function()
     if PRELUDE ~= nil then
@@ -132,10 +137,13 @@ local ok, err = pcall(function()
     if chunk == nil then error("driver: " .. tostring(compileErr), 0) end
     chunk()
 end)
-task.wait(0.05)
+local settleDeadline = os.clock() + 2
+while not verdictSeen and os.clock() < settleDeadline do
+    task.wait(0.02)
+end
 conn:Disconnect()
 if not ok then
-    table.insert(captured, {sentinel} .. " " .. HttpService:JSONEncode({{ ok = false, error = tostring(err) }}))
+    table.insert(captured, SENTINEL .. " " .. HttpService:JSONEncode({{ ok = false, error = tostring(err) }}))
 end
 return HttpService:JSONEncode({{ output = table.concat(captured, "\\n") .. "\\n" }})
 """
@@ -148,6 +156,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local SENTINEL = {sentinel}
 local ARGS_JSON = {args}
 local PRELUDE = {prelude}
+local RUNNER_PATH_JSON = {runner_path}
 local TIMEOUT = {timeout}
 
 local captured = {{}}
@@ -176,12 +185,27 @@ local ok, err = pcall(function()
             error("warm session timed out waiting for [sert-verdict]", 0)
         end
     else
+        if RUNNER_PATH_JSON ~= nil then
+            local parts = HttpService:JSONDecode(RUNNER_PATH_JSON)
+            local node: Instance? = game
+            for i, part in parts do
+                node = if i == 1 then game:FindService(part) elseif node ~= nil then node:FindFirstChild(part) else nil
+                if node == nil then
+                    error("warm Studio readiness check failed: Runner not found at " .. table.concat(parts, "/") .. " in open Studio place (sync your project with Rojo or run without --warm)", 0)
+                end
+            end
+        elseif ReplicatedStorage:FindFirstChild("sert") == nil and ReplicatedStorage:FindFirstChild("__sert_lib") == nil then
+            error("warm Studio readiness check failed: Runner not found at ReplicatedStorage/sert in open Studio place (sync your project with Rojo or run without --warm)", 0)
+        end
         local StudioTestService = game:GetService("StudioTestService")
         local value = StudioTestService:{method}(HttpService:JSONDecode(ARGS_JSON))
         print(SENTINEL .. " " .. HttpService:JSONEncode({{ ok = true, value = value }}))
     end
 end)
-task.wait(0.05)
+local settleDeadline = os.clock() + 2
+while not verdictSeen and os.clock() < settleDeadline do
+    task.wait(0.02)
+end
 conn:Disconnect()
 if not ok then
     table.insert(captured, SENTINEL .. " " .. HttpService:JSONEncode({{ ok = false, error = tostring(err) }}))
@@ -215,10 +239,12 @@ class Options:
         launcher=None,
         warm=False,
         studio_id=None,
+        bridge=None,
+        runner_path=None,
     ):
         self.place, self.mode, self.script, self.args_json, self.prelude = place, mode, script, args_json, prelude
         self.timeout, self.keep, self.launcher = timeout, keep, launcher
-        self.warm, self.studio_id = warm, studio_id
+        self.warm, self.studio_id, self.bridge, self.runner_path = warm, studio_id, bridge, runner_path
 
 
 CURRENT = None
@@ -247,10 +273,12 @@ def build_warm_driver(opts) -> str:
             script=luau_string(opts.script or ""),
             sentinel=luau_string(VERDICT),
         )
+    runner_path = getattr(opts, "runner_path", None)
     return WARM_PLAY_TEMPLATE.format(
         sentinel=luau_string(VERDICT),
         args=luau_string(opts.args_json),
         prelude=prelude,
+        runner_path="nil" if runner_path is None else luau_string(json.dumps(runner_path)),
         timeout=max(1.0, float(opts.timeout)),
         method="ExecuteRunModeAsync" if opts.mode == "run" else "ExecutePlayModeAsync",
     )
@@ -295,6 +323,8 @@ def default_launcher(platform=None, local_appdata=None):
             None,
             f"Roblox Studio not found at {MAC_STUDIO}; install it or pass --launcher CMD",
         )
+    if name == "linux" and not os.path.isdir(VINEGAR_DATA) and shutil.which("vinegar"):
+        return ("vinegar studio run", None)
     return None, None
 
 
@@ -332,7 +362,7 @@ def uses_wine_paths(opts) -> bool:
     if not prefix:
         return False
     exe = os.path.basename(prefix[0]).lower()
-    return exe in ("wine", "wine64") or exe.startswith("wine-")
+    return exe in ("wine", "wine64", "vinegar", "proton", "umu-run") or exe.startswith("wine-")
 
 
 def studio_path(opts, path):
@@ -361,22 +391,33 @@ def vinegar_problem(opts):
     return None
 
 
-def find_studio_link() -> list[str] | None:
-    env_link = os.environ.get("SERT_STUDIO_BRIDGE") or os.environ.get("STUDIO_LINK")
-    if env_link:
-        expanded = os.path.expanduser(env_link)
-        if os.path.isdir(expanded):
-            for rel in ("scripts/studio_link.py", "studio_link.py"):
-                cand = os.path.join(expanded, rel)
-                if os.path.isfile(cand):
-                    return [sys.executable, cand]
-        elif os.path.isfile(expanded):
-            return [sys.executable, expanded] if expanded.endswith(".py") else [expanded]
-    skill_script = os.path.expanduser("~/.agents/skills/roblox-dev/scripts/studio_link.py")
-    if os.path.isfile(skill_script):
-        return [sys.executable, skill_script]
-    found = shutil.which("studio-link")
-    return [found] if found else None
+def _bridge_command(raw_path: str) -> list[str] | None:
+    expanded = os.path.expanduser(raw_path.strip())
+    if not expanded:
+        return None
+    if os.path.isdir(expanded):
+        for rel in ("sert-studio-bridge.py", "scripts/studio_link.py", "studio_link.py"):
+            cand = os.path.join(expanded, rel)
+            if os.path.isfile(cand):
+                return [sys.executable, cand]
+    elif os.path.isfile(expanded):
+        return [sys.executable, expanded] if expanded.endswith(".py") else [expanded]
+    return None
+
+
+def find_studio_link(bridge: str | None = None) -> list[str] | None:
+    for candidate in (
+        bridge,
+        os.environ.get("SERT_STUDIO_BRIDGE"),
+        os.environ.get("STUDIO_LINK"),
+    ):
+        if candidate:
+            if cmd := _bridge_command(candidate):
+                return cmd
+    for exe in ("sert-studio-bridge", "studio-link"):
+        if found := shutil.which(exe):
+            return [found]
+    return None
 
 
 def parse_tasklist(text):
@@ -395,16 +436,44 @@ def parse_cim_processes(text):
     }
 
 
+def parse_wmic_processes(text):
+    table = {}
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) >= 3 and (pid := row[-1].strip()).isdigit():
+            table[int(pid)] = row[1].strip() or WIN_STUDIO_EXE
+    return table
+
+
 def process_table():
     if os.name == "nt":
+        ps_cmd = (
+            "Get-CimInstance Win32_Process -Filter \"Name = 'RobloxStudioBeta.exe'\" "
+            "| Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation"
+        )
+        for shell_bin in ("powershell", "pwsh"):
+            try:
+                result = subprocess.run(
+                    [shell_bin, "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    return parse_cim_processes(result.stdout)
+            except (OSError, subprocess.SubprocessError):
+                continue
         try:
             result = subprocess.run(
                 [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "Get-CimInstance Win32_Process -Filter \"Name = 'RobloxStudioBeta.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation",
+                    "wmic",
+                    "process",
+                    "where",
+                    "name='RobloxStudioBeta.exe'",
+                    "get",
+                    "ProcessId,CommandLine",
+                    "/FORMAT:CSV",
                 ],
                 capture_output=True,
                 text=True,
@@ -412,8 +481,8 @@ def process_table():
                 errors="replace",
                 timeout=10,
             )
-            if result.returncode == 0:
-                return parse_cim_processes(result.stdout)
+            if result.returncode == 0 and result.stdout.strip():
+                return parse_wmic_processes(result.stdout)
         except (OSError, subprocess.SubprocessError):
             pass
         try:
@@ -588,6 +657,15 @@ def wine_logs():
     return os.path.join(prefix, "drive_c", "users", user, "AppData", "Local", "Roblox", "logs")
 
 
+def native_vinegar_logs():
+    try:
+        user = getpass.getuser()
+    except OSError:
+        return None
+    xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(xdg_data, "vinegar", "prefixes", "studio", "drive_c", "users", user, "AppData", "Local", "Roblox", "logs")
+
+
 def studio_log_dirs(opts):
     if uses_vinegar(opts):
         candidates = [os.path.join(VINEGAR_DATA, "vinegar", "appdata", "Roblox", "logs")]
@@ -597,6 +675,7 @@ def studio_log_dirs(opts):
             os.path.join(os.path.expanduser("~"), "Library", "Logs", "Roblox")
         ]
         if platform_name() == "linux":
+            candidates.append(native_vinegar_logs())
             candidates.append(wine_logs())
     return [folder for folder in candidates if folder and os.path.isdir(folder)]
 
@@ -733,18 +812,99 @@ def collect_output(out_path, studio_log, driver_source):
     return text
 
 
-def launcher_tail(stage, count=15):
-    lines = [line for line in read_text(os.path.join(stage, "launcher.out")).split("\n") if line.strip()]
-    return ("\nlauncher output:\n  " + "\n  ".join(lines[-count:])) if lines else ""
+_STAGE_DIR_RE = re.compile(r"^\d{8}-\d{6}-(\d+)-[0-9a-f]{4,}$")
+
+
+def _win_pid_alive(pid: int) -> bool | None:
+    try:
+        import ctypes
+    except ImportError:
+        return None
+    windll = getattr(ctypes, "windll", None)
+    kernel32 = getattr(windll, "kernel32", None) if windll is not None else None
+    if kernel32 is None:
+        return None
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))
+    if not handle:
+        return kernel32.GetLastError() == 5
+    try:
+        exit_code = ctypes.c_ulong(0)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == 259
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_alive(pid: int, *, active_table: dict[int, str] | None = None) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        win_alive = _win_pid_alive(pid)
+        if win_alive is not None:
+            return win_alive
+        return pid in active_table if active_table is not None else True
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
+def sweep_orphaned_stages(stage_base: str, *, active_table: dict[int, str] | None = None) -> list[str]:
+    if not stage_base or not os.path.isdir(stage_base):
+        return []
+    table = process_table() if active_table is None else active_table
+    active_studios = studio_processes(table)
+    active_cmds = [(table or {}).get(pid, "") for pid in active_studios]
+    removed: list[str] = []
+    try:
+        names = os.listdir(stage_base)
+    except OSError:
+        return []
+    for name in sorted(names):
+        match = _STAGE_DIR_RE.match(name)
+        if not match:
+            continue
+        stage_dir = os.path.join(stage_base, name)
+        if not os.path.isdir(stage_dir) or os.path.exists(os.path.join(stage_dir, ".sert-kept")):
+            continue
+        pid = int(match.group(1))
+        if pid == os.getpid() or _pid_alive(pid, active_table=table):
+            continue
+        if any(name in cmd for cmd in active_cmds):
+            continue
+        try:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            if not os.path.exists(stage_dir):
+                removed.append(stage_dir)
+        except OSError:
+            continue
+    return removed
+
+
+def file_tail(path, count=40, label="log"):
+    if not path:
+        return ""
+    lines = [line for line in read_text(path).split("\n") if line.strip()]
+    return (f"\n{label}:\n  " + "\n  ".join(lines[-count:])) if lines else ""
+
+
+def launcher_tail(stage, count=40):
+    return file_tail(os.path.join(stage, "launcher.out"), count=count, label="launcher output")
 
 
 def execute_warm(opts) -> Outcome:
-    link_cmd = find_studio_link()
+    link_cmd = find_studio_link(getattr(opts, "bridge", None))
     if link_cmd is None:
         return Outcome(
             INFRA,
             "error",
-            "--warm requires studio_link.py (set STUDIO_LINK or install the roblox-dev Studio bridge)",
+            "--warm requires a Studio bridge (set [studio].bridge, SERT_STUDIO_BRIDGE, or place sert-studio-bridge / studio-link on PATH)",
         )
     code = build_warm_driver(opts)
     argv = list(link_cmd)
@@ -881,7 +1041,7 @@ def run_attempt(opts, stage, run_id, place, driver, driver_source):
                     INFRA,
                     "error",
                     f"Studio did not start: {prefix[0]} exited with code {code}, and no Studio process with this"
-                    f" run's paths appeared{launcher_tail(stage)}",
+                    f" run's paths appeared{launcher_tail(stage, 40)}{file_tail(studio_log, 40, label='Studio log')}",
                     studio_log=studio_log,
                 )
         if now >= deadline:
@@ -900,7 +1060,7 @@ def run_attempt(opts, stage, run_id, place, driver, driver_source):
             return Outcome(
                 TIMEOUT,
                 "timeout",
-                f"timed out after {opts.timeout:g} s; killed {what}",
+                f"timed out after {opts.timeout:g} s; killed {what}{launcher_tail(stage, 40)}{file_tail(studio_log, 40, label='Studio log')}",
                 output=output,
                 studio_log=studio_log,
             )
@@ -923,7 +1083,7 @@ def run_attempt(opts, stage, run_id, place, driver, driver_source):
         return Outcome(
             INFRA,
             "error",
-            f"{why}; Studio log: {studio_log or 'not found'}",
+            f"{why}; Studio log: {studio_log or 'not found'}{launcher_tail(stage, 40)}{file_tail(studio_log, 40, label='Studio log')}",
             output=output,
             studio_log=studio_log,
         )
@@ -961,6 +1121,8 @@ def options(
     launcher,
     warm=False,
     studio_id=None,
+    bridge=None,
+    runner_path=None,
 ):
     if mode not in MODES:
         raise SertError(f"unknown mode {mode!r} (edit, play or run)")
@@ -983,6 +1145,8 @@ def options(
         launcher=launcher,
         warm=warm,
         studio_id=studio_id,
+        bridge=bridge,
+        runner_path=runner_path,
     )
     if launcher is not None:
         try:
@@ -1007,6 +1171,11 @@ def execute(opts, run_id, stage):
     finally:
         stop_strays(opts, stage)
         if opts.keep and os.path.isdir(stage):
+            try:
+                with open(os.path.join(stage, ".sert-kept"), "w", encoding="utf-8") as fh:
+                    fh.write("kept\n")
+            except OSError:
+                pass
             say(f"kept {stage}")
         else:
             shutil.rmtree(stage, ignore_errors=True)
@@ -1025,6 +1194,8 @@ def run(
     launcher=None,
     warm=False,
     studio_id=None,
+    bridge=None,
+    runner_path=None,
 ):
     global CURRENT
     opts = options(
@@ -1038,6 +1209,8 @@ def run(
         launcher=launcher,
         warm=warm,
         studio_id=studio_id,
+        bridge=bridge,
+        runner_path=runner_path,
     )
     main_thread = threading.current_thread() is threading.main_thread()
     previous = signal.getsignal(signal.SIGTERM) if main_thread else None
@@ -1054,7 +1227,12 @@ def run(
             problem = None
             if opts.launcher is None:
                 opts.launcher, problem = default_launcher()
-            stage = os.path.join(stage_root(opts), run_id)
+            stage_base = stage_root(opts)
+            try:
+                sweep_orphaned_stages(stage_base)
+            except OSError:
+                pass
+            stage = os.path.join(stage_base, run_id)
             problem = problem or vinegar_problem(opts)
             outcome = Outcome(INFRA, "error", problem) if problem else execute(opts, run_id, stage)
         seconds = time.monotonic() - started

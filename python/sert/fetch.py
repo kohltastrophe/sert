@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import ssl
 import sys
 import tempfile
 import urllib.error
@@ -109,6 +110,23 @@ def _resolve_private_asset_url(opener, api_base: str, repo: str, tag: str, asset
     return asset_url
 
 
+def _format_fetch_error(url: str, err: BaseException) -> str:
+    if isinstance(err, urllib.error.HTTPError):
+        hint = ""
+        if err.code in (401, 403, 404) and "github" in url.lower():
+            hint = " (check [sert].version / [sert].repo, or set GITHUB_TOKEN for private repos or rate limits)"
+        return f"download failed ({url}): HTTP {err.code} {err.reason}{hint}"
+    if isinstance(err, urllib.error.URLError):
+        if isinstance(err.reason, ssl.SSLError):
+            hint = " (check system CA certificates / SSL_CERT_FILE or corporate proxy settings)"
+        else:
+            hint = " (check network / HTTPS_PROXY, or pass --offline if cached)"
+        return f"download failed ({url}): {err}{hint}"
+    if isinstance(err, http.client.IncompleteRead):
+        return f"download failed ({url}): {err!r}"
+    return f"download failed ({url}): {err}"
+
+
 def _open_asset_stream(url: str, *, repo: str | None = None, tag: str | None = None, asset: str | None = None):
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     host = urllib.parse.urlparse(url).netloc.lower()
@@ -133,10 +151,8 @@ def _open_asset_stream(url: str, *, repo: str | None = None, tag: str | None = N
         req = urllib.request.Request(url, headers=headers)
     try:
         return opener.open(req, timeout=120)
-    except urllib.error.HTTPError as err:
-        raise SertError(f"download failed ({url}): HTTP {err.code} {err.reason}") from err
     except (OSError, urllib.error.URLError) as err:
-        raise SertError(f"download failed ({url}): {err}") from err
+        raise SertError(_format_fetch_error(url, err)) from err
 
 
 def fetch_raw_bytes(
@@ -152,13 +168,13 @@ def fetch_raw_bytes(
             cl = resp.headers.get("Content-Length") if hasattr(resp, "headers") and resp.headers else None
             if cl and cl.isdigit() and len(data) < int(cl):
                 raise SertError(
-                    f"download failed ({url}): {http.client.IncompleteRead(data, int(cl) - len(data))!r}"
+                    _format_fetch_error(url, http.client.IncompleteRead(data, int(cl) - len(data)))
                 )
             return data
     except SertError:
         raise
     except (OSError, urllib.error.URLError, http.client.HTTPException) as err:
-        raise SertError(f"download failed ({url}): {err}") from err
+        raise SertError(_format_fetch_error(url, err)) from err
 
 
 def offline() -> bool:
@@ -192,7 +208,7 @@ def download_verified(
             lock_mod.verify_file(label, dest, expected_sha256)
         return dest, actual
     if offline:
-        raise SertError(f"not in cache (--offline): {url}")
+        raise SertError(f"not in cache (--offline): {url} (run `sert fetch` online once to populate cache)")
     dest.parent.mkdir(parents=True, exist_ok=True)
     note(f"downloading {Path(urllib.parse.urlparse(url).path).name}")
     data = fetch_raw_bytes(url, repo=repo, tag=tag, asset=asset)
@@ -552,6 +568,66 @@ def ensure_fetched(cfg: config_mod.Config) -> None:
             fetch(cfg, only={"sert"})
 
 
+def _write_bin_wrapper(root: Path) -> Path:
+    bin_dir = root / ".sert" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    posix_path = bin_dir / "sert"
+    posix_body = (
+        "#!/bin/sh\n"
+        'ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"\n'
+        'PY="${PYTHON:-}"\n'
+        'if [ -z "$PY" ]; then\n'
+        "  if command -v python3 >/dev/null 2>&1; then\n"
+        '    PY="python3"\n'
+        "  elif command -v python >/dev/null 2>&1; then\n"
+        '    PY="python"\n'
+        "  else\n"
+        '    echo "sert: python3 or python not found on PATH" >&2\n'
+        "    exit 2\n"
+        "  fi\n"
+        "fi\n"
+        'if [ -f "$ROOT/tools/sert.py" ]; then\n'
+        '  exec "$PY" "$ROOT/tools/sert.py" "$@"\n'
+        'elif [ -f "$ROOT/.sert/sert.pyz" ]; then\n'
+        '  exec "$PY" "$ROOT/.sert/sert.pyz" "$@"\n'
+        'elif [ -f "$ROOT/python/sert/__main__.py" ]; then\n'
+        '  PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" -P -m sert "$@"\n'
+        "fi\n"
+        'echo "sert: could not locate tools/sert.py or .sert/sert.pyz under $ROOT" >&2\n'
+        "exit 2\n"
+    )
+    write_atomic(posix_path, posix_body.encode("utf-8"), 0o755)
+
+    cmd_path = bin_dir / "sert.cmd"
+    cmd_body = (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        'for %%I in ("%~dp0..\\..") do set "ROOT=%%~fI"\r\n'
+        'if not defined PYTHON (\r\n'
+        '  where python >nul 2>nul && (set "PY=python") || (set "PY=python3")\r\n'
+        ") else (\r\n"
+        '  set "PY=%PYTHON%"\r\n'
+        ")\r\n"
+        'if exist "%ROOT%\\tools\\sert.py" goto :run_stub\r\n'
+        'if exist "%ROOT%\\.sert\\sert.pyz" goto :run_pyz\r\n'
+        'if exist "%ROOT%\\python\\sert\\__main__.py" goto :run_pkg\r\n'
+        "echo sert: could not locate tools\\sert.py or .sert\\sert.pyz under %ROOT% 1>&2\r\n"
+        "exit /b 2\r\n"
+        ":run_stub\r\n"
+        '"%PY%" "%ROOT%\\tools\\sert.py" %*\r\n'
+        "exit /b %ERRORLEVEL%\r\n"
+        ":run_pyz\r\n"
+        '"%PY%" "%ROOT%\\.sert\\sert.pyz" %*\r\n'
+        "exit /b %ERRORLEVEL%\r\n"
+        ":run_pkg\r\n"
+        'set "PYTHONPATH=%ROOT%\\python;%PYTHONPATH%"\r\n'
+        '"%PY%" -P -m sert %*\r\n'
+        "exit /b %ERRORLEVEL%\r\n"
+    )
+    write_atomic(cmd_path, cmd_body.encode("utf-8"), 0o644)
+    return posix_path
+
+
 def fetch(
     cfg: config_mod.Config,
     *,
@@ -573,6 +649,7 @@ def fetch(
     if "sert" in wanted:
         sert_path, sert_assets = _fetch_sert(cfg, existing_lock, offline=is_offline)
         result["sert"] = sert_path
+        result["bin"] = str(_write_bin_wrapper(cfg.root))
         collected_assets.update(sert_assets)
         if update_luaurc:
             _update_luaurc(cfg.root, want_sert=bool(cfg.table("sert").get("version")) and "sert" not in cfg.overrides)

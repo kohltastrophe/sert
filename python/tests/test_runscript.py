@@ -198,6 +198,95 @@ class OutputProcessAndAttemptTest(unittest.TestCase):
             written = json.loads(Path(report).read_text(encoding="utf-8"))
             self.assertEqual((written["exitCode"], written["status"]), (0, "passed"))
 
+            # Portable warm bridge resolution: never probes `~/.agents/...`, honors explicit bridge param.
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("shutil.which", return_value=None),
+            ):
+                self.assertIsNone(runscript.find_studio_link())
+                self.assertEqual(runscript.find_studio_link(bridge), [sys.executable, bridge])
+
+            # Warm driver readiness handshake & verdict settle loop (edit + play)
+            warm_play = runscript.build_warm_driver(
+                runscript.Options("p.rbxl", "play", warm=True, runner_path=["ReplicatedStorage", "sert", "roblox", "Runner"])
+            )
+            self.assertIn("warm Studio readiness check failed", warm_play)
+            self.assertIn("while not verdictSeen and os.clock() < settleDeadline", warm_play)
+            warm_edit = runscript.build_warm_driver(runscript.Options("p.rbxl", "edit", script="print(1)", warm=True))
+            self.assertIn("while not verdictSeen and os.clock() < settleDeadline", warm_edit)
+
+            # Orphaned `roblox-testing/*` stage sweep preserves `.sert-kept` & active PIDs, deletes dead orphans
+            stage_base = os.path.join(tmp, "roblox-testing")
+            orphan = os.path.join(stage_base, "20260101-000000-999999-abcd")
+            kept = os.path.join(stage_base, "20260101-000000-999998-ef01")
+            live = os.path.join(stage_base, f"20260101-000000-{os.getpid()}-2345")
+            for d in (orphan, kept, live):
+                os.makedirs(d)
+            with open(os.path.join(kept, ".sert-kept"), "w", encoding="utf-8") as fh:
+                fh.write("kept\n")
+            swept = runscript.sweep_orphaned_stages(stage_base, active_table={})
+            self.assertEqual(swept, [orphan])
+            self.assertFalse(os.path.exists(orphan))
+            self.assertTrue(os.path.exists(kept) and os.path.exists(live))
+
+            # Crash outcome includes 40-line launcher/Studio log tails
+            crash_stage = os.path.join(tmp, "crash-stage")
+            os.makedirs(crash_stage)
+            crash_log = os.path.join(tmp, "crash_studio.log")
+            with open(crash_log, "w", encoding="utf-8") as fh:
+                fh.write("studio boom line\n")
+            fake_child = mock.MagicMock(pid=42)
+            fake_child.poll.return_value = 1
+
+            def fake_popen(argv, **kwargs):
+                log_fh = kwargs.get("stdout")
+                if log_fh is not None:
+                    log_fh.write(("\n".join(f"launch line {i}" for i in range(50)) + "\n").encode("utf-8"))
+                    log_fh.flush()
+                return fake_child
+
+            opts_cold = runscript.Options(os.path.join(tmp, "p.rbxl"), "play", launcher="my-studio")
+            with (
+                mock.patch("subprocess.Popen", side_effect=fake_popen),
+                mock.patch.object(runscript, "LAUNCH_ERROR_GRACE", 0.0),
+                mock.patch.object(runscript, "process_table", return_value={}),
+                mock.patch.object(runscript, "find_studio_log", return_value=crash_log),
+            ):
+                outcome = runscript.run_attempt(opts_cold, crash_stage, "run-c", opts_cold.place, "drv.luau", "")
+            self.assertEqual(outcome.code, runscript.INFRA)
+            self.assertIn("launch line 49", outcome.message)
+            self.assertIn("launch line 10", outcome.message)
+            self.assertNotIn("launch line 5\n", outcome.message)
+            self.assertIn("studio boom line", outcome.message)
+
+            # Linux native `vinegar` launcher detection & wine path support + Windows wmic fallback
+            with (
+                mock.patch.object(runscript.os.path, "isdir", return_value=False),
+                mock.patch.object(runscript.shutil, "which", side_effect=lambda b: "/usr/bin/vinegar" if b == "vinegar" else None),
+            ):
+                nat_launcher, nat_err = runscript.default_launcher(platform="linux")
+            self.assertEqual((nat_launcher, nat_err), ("vinegar studio run", None))
+            self.assertTrue(runscript.uses_wine_paths(runscript.Options("p.rbxl", "play", launcher="vinegar studio run")))
+            wmic_csv = "Node,CommandLine,ProcessId\r\nHOST,RobloxStudioBeta.exe -outputFile C:\\s\\out.log,5151\r\n"
+            self.assertEqual(runscript.parse_wmic_processes(wmic_csv), {5151: "RobloxStudioBeta.exe -outputFile C:\\s\\out.log"})
+
+            # Windows `_pid_alive` uses `_win_pid_alive` (not Studio-only `active_table` or `os.kill(pid, 0)`)
+            win_base = os.path.join(tmp, "win-stages")
+            win_live_py = os.path.join(win_base, "20260101-000000-44444-aaaa")
+            win_dead_py = os.path.join(win_base, "20260101-000000-55555-bbbb")
+            os.makedirs(win_live_py)
+            os.makedirs(win_dead_py)
+            with (
+                mock.patch.object(runscript.os, "name", "nt"),
+                mock.patch.object(runscript, "_win_pid_alive", side_effect=lambda p: p == 44444),
+                mock.patch.object(runscript.os, "kill", side_effect=AssertionError("os.kill must not run on Windows")) as kill_mock,
+            ):
+                win_swept = runscript.sweep_orphaned_stages(win_base, active_table={})
+            self.assertEqual(kill_mock.call_count, 0)
+            self.assertEqual(win_swept, [win_dead_py])
+            self.assertTrue(os.path.isdir(win_live_py))
+            self.assertFalse(os.path.exists(win_dead_py))
+
 
 if __name__ == "__main__":
     unittest.main()

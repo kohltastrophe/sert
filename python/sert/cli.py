@@ -27,7 +27,7 @@ COMMANDS: dict[str, tuple[str, str | None]] = {
     "coverage": ("sert.coverage", "summarize luau --coverage (LCOV) output"),
     "mutate": ("sert.mutate", "run token-stream coverage-guided mutation testing"),
 }
-ROOT_HELP = "project root (default: $SERT_ROOT, else git toplevel, else nearest parent with sert.toml)"
+ROOT_HELP = "project root (default: $SERT_ROOT, else nearest parent with sert.toml, else git toplevel)"
 
 
 def _base_parser() -> tuple[argparse.ArgumentParser, argparse._SubParsersAction]:

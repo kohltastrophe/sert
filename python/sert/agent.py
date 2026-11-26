@@ -33,7 +33,7 @@ def output_format(args: Any = None, *, env: Mapping[str, str] | None = None) -> 
     fmt = _get_field(args, "format", None)
     if isinstance(fmt, str):
         normed = fmt.strip().lower()
-        if normed in ("agent", "json"):
+        if normed in ("human", "agent", "json"):
             return normed
 
     if bool(_get_field(args, "json", False)):
@@ -263,10 +263,10 @@ def _collect_from_parsed(
             int(summary.get("failed", 0) or 0),
             int(summary.get("skipped", 0) or 0),
         )
-    p = sum(1 for t in parsed.tests if t.get("status") == "pass")
+    passed = sum(1 for t in parsed.tests if t.get("status") in ("pass", "flaky"))
     f = sum(1 for t in parsed.tests if t.get("status") in ("fail", "error"))
     s = sum(1 for t in parsed.tests if t.get("status") == "skip")
-    return p, f, s
+    return passed, f, s
 
 
 def format_run_agent(result: Any, *, root: Path | None = None) -> str:
@@ -275,6 +275,7 @@ def format_run_agent(result: Any, *, root: Path | None = None) -> str:
     passed = failed = skipped = 0
     duration_ms = 0
     failures: list[dict[str, Any]] = []
+    flaky_tests: list[dict[str, Any]] = []
     runtime_errors: list[dict[str, Any]] = []
     skipped_by_reason: dict[str, int] = {}
     zero_assertion_tests: list[str] = []
@@ -291,6 +292,7 @@ def format_run_agent(result: Any, *, root: Path | None = None) -> str:
             failures = list(result.get("failures") or ())
         else:
             failures = [t for t in (result.get("tests") or ()) if t.get("status") in ("fail", "error")]
+        flaky_tests = [t for t in (result.get("tests") or ()) if t.get("status") == "flaky" or t.get("flaky")]
         runtime_errors = list(result.get("errors", ()))
         skipped_by_reason = {str(k): int(v) for k, v in (result.get("skipped_by_reason") or {}).items()}
         zero_assertion_tests = [str(x) for x in result.get("zero_assertion_tests", ())]
@@ -311,12 +313,14 @@ def format_run_agent(result: Any, *, root: Path | None = None) -> str:
             regression_tokens,
             snapshots,
         )
+        flaky_tests = [t for t in result.tests if t.get("status") == "flaky" or t.get("flaky")]
         exit_status = 1 if failed > 0 or failures else 0
     else:
         entries = list(_get_field(result, "entries", ()) or ())
         result_tests = list(_get_field(result, "tests", ()) or ())
         if result_tests:
             failures.extend(t for t in result_tests if t.get("status") in ("fail", "error"))
+            flaky_tests.extend(t for t in result_tests if t.get("status") == "flaky" or t.get("flaky"))
             counts = _get_field(result, "counts", {}) or {}
             passed = int(counts.get("passed", 0) or 0)
             failed = int(counts.get("failed", 0) or 0)
@@ -342,6 +346,8 @@ def format_run_agent(result: Any, *, root: Path | None = None) -> str:
                     snapshots,
                     collect_tests=not result_tests,
                 )
+                if not result_tests:
+                    flaky_tests.extend(t for t in parsed.tests if t.get("status") == "flaky" or t.get("flaky"))
                 entry_skipped += es
                 if not result_tests:
                     passed += ep
@@ -361,7 +367,8 @@ def format_run_agent(result: Any, *, root: Path | None = None) -> str:
         exit_status = _get_field(result, "status", _get_field(result, "code", 0))
 
     status = "FAIL" if (failed > 0 or failures or runtime_errors or exit_status not in (0, None)) else "OK"
-    lines = [f"{status} passed={passed} failed={failed} skipped={skipped} duration={duration_ms}ms"]
+    flaky_tag = f" flaky={len(flaky_tests)}" if flaky_tests else ""
+    lines = [f"{status} passed={passed} failed={failed} skipped={skipped}{flaky_tag} duration={duration_ms}ms"]
 
     for fail in failures:
         name = fail.get("name") or fail.get("test") or "(unnamed)"
@@ -376,6 +383,12 @@ def format_run_agent(result: Any, *, root: Path | None = None) -> str:
             lines.append(f"  {_trim(str(fail['message']))}")
         if replay := (fail.get("replay") or fail.get("token")):
             regression_tokens.append(str(replay))
+
+    for flaky_item in flaky_tests:
+        fname = flaky_item.get("name") or "(unnamed)"
+        attempts = flaky_item.get("attempts")
+        att_text = f" (passed on attempt {attempts})" if attempts else " (passed on retry)"
+        lines.append(f"FLAKY {fname}{att_text}")
 
     for err in runtime_errors:
         raw_file = err.get("file") or err.get("source")

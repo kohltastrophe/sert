@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 import math
 import os
@@ -83,6 +84,17 @@ def load_json(path: str | Path):
         return None
 
 
+def load_json_strict(path: str | Path):
+    target = Path(path)
+    if not target.is_file():
+        return None
+    try:
+        with open(target, encoding="utf-8-sig") as handle:
+            return json.loads(strip_jsonc(handle.read()))
+    except (OSError, UnicodeDecodeError, ValueError) as err:
+        raise SertError(f"{target}: invalid JSON/JSONC: {err}") from err
+
+
 def sert_alias_key(aliases: dict) -> str | None:
     return next((key for key in aliases if isinstance(key, str) and key.lower() == "sert"), None)
 
@@ -125,8 +137,25 @@ def rokit_bin_dirs() -> list[str]:
     return dirs
 
 
+def tool_bin_dirs() -> list[str]:
+    dirs = rokit_bin_dirs()
+    candidates: list[str] = []
+    if aftman_home := os.environ.get("AFTMAN_HOME"):
+        candidates.append(os.path.join(os.path.expanduser(aftman_home), "bin"))
+    candidates.append(os.path.expanduser(os.path.join("~", ".aftman", "bin")))
+    if mise_data := os.environ.get("MISE_DATA_DIR"):
+        candidates.append(os.path.join(os.path.expanduser(mise_data), "shims"))
+    if xdg_data := os.environ.get("XDG_DATA_HOME"):
+        candidates.append(os.path.join(os.path.expanduser(xdg_data), "mise", "shims"))
+    candidates.append(os.path.expanduser(os.path.join("~", ".local", "share", "mise", "shims")))
+    for cand in candidates:
+        if os.path.isdir(cand) and cand not in dirs:
+            dirs.append(cand)
+    return dirs
+
+
 def tool_search_path() -> str:
-    parts = [p for p in [os.environ.get("PATH", ""), *rokit_bin_dirs()] if p]
+    parts = [p for p in [os.environ.get("PATH", ""), *tool_bin_dirs()] if p]
     return os.pathsep.join(parts)
 
 
@@ -148,7 +177,10 @@ def which(name: str, root: Path | None = None) -> str | None:
 def need(name: str, root: Path | None = None) -> str:
     if found := which(name, root):
         return found
-    raise SertError(f"{name} not found on PATH or ~/.rokit/bin (run `rokit install` to install tools from rokit.toml)")
+    raise SertError(
+        f"{name} not found on PATH, ~/.rokit/bin, ~/.aftman/bin, or mise shims "
+        "(run `rokit install` to install tools from rokit.toml)"
+    )
 
 
 def git(root: Path, *args: str, env: dict | None = None, check: bool = True, input: str | None = None) -> str:
@@ -251,6 +283,13 @@ def worst(codes) -> int:
 
 
 def build_place(root, project: str | Path, output: str | Path, *, quiet: bool = False) -> float | None:
+    proj_path = Path(project) if Path(project).is_absolute() else (Path(root) / project)
+    if not proj_path.is_file():
+        note(
+            f"Rojo project not found: {project} "
+            "(create default.project.json or set [studio].project / [cloud].project in sert.toml)"
+        )
+        return None
     env = dict(os.environ, PATH=tool_search_path())
     if not quiet:
         print(f"rojo build {project} -> {output}", flush=True)
@@ -348,3 +387,55 @@ def step_summary(markdown: str) -> bool:
         warn(f"cannot write the step summary {path}: {err}")
         return False
     return True
+
+
+def accepts_kwarg(fn, name: str) -> bool:
+    """Return True if *fn* (unwrapping mock side_effect callables) accepts keyword *name* or **kwargs."""
+    target = fn
+    seen: set[int] = set()
+    while id(target) not in seen:
+        seen.add(id(target))
+        side = getattr(target, "side_effect", None)
+        if callable(side):
+            target = side
+            continue
+        break
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD or p.name == name for p in sig.parameters.values())
+
+
+def supported_kwargs(fn, **candidates) -> dict:
+    """Return `{k: v}` for each non-`None` candidate keyword accepted by *fn*."""
+    return {name: value for name, value in candidates.items() if value is not None and accepts_kwarg(fn, name)}
+
+
+def annotate_test_failures(
+    tests: list[dict],
+    *,
+    title: str,
+    fallback_msg: str | None = None,
+    resolve_loc=None,
+    out=None,
+) -> None:
+    """Emit GitHub Actions error annotations for failed tests (or *fallback_msg* if none failed)."""
+    if not on_github_actions():
+        return
+    failed_tests = [t for t in tests if t.get("status") == "fail"]
+    for t in failed_tests:
+        if resolve_loc is not None:
+            loc_file, loc_line = resolve_loc(t)
+        else:
+            loc_file, loc_line = (t.get("file") or None), (t.get("line") or None)
+        annotate(
+            "error",
+            f"{t.get('name', '?')}: {t.get('message') or 'failed'}",
+            file=loc_file,
+            line=loc_line,
+            title=title,
+            out=out,
+        )
+    if fallback_msg and not failed_tests:
+        annotate("error", fallback_msg, title=title, out=out)

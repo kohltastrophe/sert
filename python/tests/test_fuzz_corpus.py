@@ -341,6 +341,25 @@ class FuzzCorpusTest(Case):
         self.assertEqual((env_f["status"], env_f["summary"]["passed"], env_f["summary"]["failed"]), ("ok", 1, 0))
         self.assertEqual(env_f["summary"]["iterations"], 12)
 
+        # Part C: lossless v2 (53-bit) and negative-seed tape token round-trips
+        big_tape = [0, 0xFFFFFFFF, 0x1_0000_0000, 9007199254740991]
+        tok_v2 = fuzz.encode_tape_token(-42, 64, big_tape)
+        self.assertTrue(tok_v2.startswith("v2:-42:64:"))
+        self.assertEqual(fuzz.decode_tape_token(tok_v2), (-42, 64, big_tape))
+        self.assertEqual(fuzz.decode_tape_token("v1:-7:10:00000005"), (-7, 10, [5]))
+
+    def test_fuzz_regression_helpers_share_run_toml_store_and_create_parent(self) -> None:
+        from sert import run as run_mod
+
+        root = self.tmp / "shared_reg"
+        root.mkdir()
+        # Note: `test/` does not exist yet — `save_regression_token` creates parent directory cleanly.
+        tok = fuzz.encode_v1_token(7, 40, [1, 2])
+        self.assertTrue(fuzz.save_regression_token(root, "prop X", "test/sub/X.spec.luau", tok))
+        self.assertTrue((root / "test/.sert-regressions.toml").is_file())
+        self.assertEqual(run_mod.load_regressions_by_test(root), {"prop X": [tok]})
+        self.assertEqual(fuzz.load_regressions_toml(root), {"prop X": [tok]})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ import tomllib
 from typing import Any
 
 from sert import agent, config as config_mod, coverage as coverage_mod, fetch, graph, luau_lex, mutate, run as run_mod
-from sert.util import FAILED, INFRA, SertError, as_list, expand_globs, has_glob, luau_string, posix, strip_jsonc, write_atomic
+from sert.util import FAILED, SertError, as_list, expand_globs, has_glob, luau_string, posix, strip_jsonc, write_atomic
 
 FUZZ_DIR = Path(".sert") / "fuzz"
 CORPUS_DEFAULT_REL = FUZZ_DIR / "corpus"
@@ -71,7 +71,8 @@ _RHS_STOP_KEYWORDS = frozenset(
 )
 _RHS_STOP_OPS = frozenset({",", ";", "=", "==", "~=", "<", "<=", ">", ">="})
 _TRIVIAL_NUMBERS = frozenset({0, 1, -1, 2})
-_RE_V1_TOKEN = re.compile(r"^v1:(\d+):(\d+):(.*)$")
+_RE_V1_TOKEN = re.compile(r"^v1:(-?\d+):(\d+):(.*)$")
+_RE_TAPE_TOKEN = re.compile(r"^v([12]):(-?\d+):(\d+):(.*)$")
 
 
 def encode_v1_token(seed: int, size: int, tape: list[int]) -> str:
@@ -80,19 +81,29 @@ def encode_v1_token(seed: int, size: int, tape: list[int]) -> str:
     return f"v1:{int(seed)}:{int(size)}:{''.join(hex_chunks)}"
 
 
-def decode_v1_token(token: str) -> tuple[int, int, list[int]] | None:
-    """Decode `v1:<seed>:<size>:<hex>` (or legacy comma-u32) into `(seed, size, tape)` or `None`."""
+def encode_tape_token(seed: int, size: int, tape: list[int]) -> str:
+    """Encode `(seed, size, tape)` as `v1:` (u32) or `v2:` (u53) lossless tape token."""
+    ints = [int(v) for v in tape]
+    if any(v < 0 or v > 0xFFFFFFFF for v in ints):
+        hex_chunks = [f"{max(0, v) & 0x1FFFFFFFFFFFFF:014x}" for v in ints]
+        return f"v2:{int(seed)}:{int(size)}:{''.join(hex_chunks)}"
+    return encode_v1_token(seed, size, ints)
+
+
+def decode_tape_token(token: str) -> tuple[int, int, list[int]] | None:
+    """Decode `v1:<seed>:<size>:<hex>` / `v2:<seed>:<size>:<hex>` (or legacy comma-int) into `(seed, size, tape)` or `None`."""
     if not isinstance(token, str):
         return None
-    m = _RE_V1_TOKEN.match(token.strip())
+    m = _RE_TAPE_TOKEN.match(token.strip())
     if not m:
         return None
-    seed = int(m.group(1))
-    size = int(m.group(2))
-    rest = m.group(3)
+    version = int(m.group(1))
+    seed = int(m.group(2))
+    size = int(m.group(3))
+    rest = m.group(4)
     if not rest:
         return seed, size, []
-    if "," in rest:
+    if version == 1 and "," in rest:
         tape: list[int] = []
         for part in rest.split(","):
             part = part.strip()
@@ -100,68 +111,25 @@ def decode_v1_token(token: str) -> tuple[int, int, list[int]] | None:
                 return None
             tape.append(int(part) & 0xFFFFFFFF)
         return seed, size, tape
-    if len(rest) % 8 != 0 or not all(ch in "0123456789abcdefABCDEF" for ch in rest):
+    width = 14 if version == 2 else 8
+    if len(rest) % width != 0 or not all(ch in "0123456789abcdefABCDEF" for ch in rest):
         return None
-    tape = [int(rest[i : i + 8], 16) for i in range(0, len(rest), 8)]
+    tape = [int(rest[i : i + width], 16) for i in range(0, len(rest), width)]
+    if version == 2 and any(v > 0x1FFFFFFFFFFFFF for v in tape):
+        return None
     return seed, size, tape
 
 
-def _toml_quote(text: str) -> str:
-    out: list[str] = ['"']
-    for ch in text:
-        if ch == "\\":
-            out.append("\\\\")
-        elif ch == '"':
-            out.append('\\"')
-        elif ch == "\b":
-            out.append("\\b")
-        elif ch == "\t":
-            out.append("\\t")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\f":
-            out.append("\\f")
-        elif ch == "\r":
-            out.append("\\r")
-        elif ord(ch) < 0x20:
-            out.append(f"\\u{ord(ch):04x}")
-        else:
-            out.append(ch)
-    out.append('"')
-    return "".join(out)
-
-
-def _read_regression_rows(root: Path) -> list[tuple[str, str, str]]:
-    path = Path(root) / REGRESSIONS_REL
-    if not path.is_file():
-        return []
-    try:
-        parsed = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as err:
-        raise SertError(f"fuzz: invalid {REGRESSIONS_REL}: {err}") from err
-    raw_rows = parsed.get("regression", ())
-    if not isinstance(raw_rows, list):
-        return []
-    rows: list[tuple[str, str, str]] = []
-    for item in raw_rows:
-        if not isinstance(item, dict):
-            continue
-        test = str(item.get("test") or "").strip()
-        spec_file = str(item.get("file") or "").strip()
-        token = str(item.get("token") or "").strip()
-        if test and token:
-            rows.append((test, spec_file, token))
-    return rows
+def decode_v1_token(token: str) -> tuple[int, int, list[int]] | None:
+    """Decode `v1:<seed>:<size>:<hex>` (or legacy comma-u32) into `(seed, size, tape)` or `None`."""
+    if not isinstance(token, str) or not _RE_V1_TOKEN.match(token.strip()):
+        return None
+    return decode_tape_token(token)
 
 
 def load_regressions_toml(root: Path) -> dict[str, list[str]]:
     """Load `test/.sert-regressions.toml` returning `{ test_name: [token, ...] }`."""
-    grouped: dict[str, list[str]] = {}
-    for test, _spec_file, token in _read_regression_rows(Path(root)):
-        bucket = grouped.setdefault(test, [])
-        if token not in bucket:
-            bucket.append(token)
-    return grouped
+    return run_mod.load_regressions_by_test(Path(root))
 
 
 def save_regression_token(root: Path, test_name: str, spec_file: str, token: str) -> bool:
@@ -171,59 +139,15 @@ def save_regression_token(root: Path, test_name: str, spec_file: str, token: str
     tok = str(token or "").strip()
     if not test or not tok:
         return False
-    norm_file = coverage_mod.norm(str(spec_file), root_path) if spec_file else ""
-    existing = _read_regression_rows(root_path)
-
-    dedup: dict[tuple[str, str], str] = {}
-    already_present = False
-    for ex_test, ex_file, ex_tok in existing:
-        if ex_test == test and ex_tok == tok:
-            already_present = True
-        ex_norm = coverage_mod.norm(ex_file, root_path) if ex_file else ""
-        key = (ex_test, ex_tok)
-        if key not in dedup or (not dedup[key] and ex_norm):
-            dedup[key] = ex_norm
-
-    if already_present and (not norm_file or dedup.get((test, tok), "") == norm_file):
-        return False
-
-    dedup[(test, tok)] = norm_file or dedup.get((test, tok), "")
-    rows = sorted((t, f, tk) for (t, tk), f in dedup.items())
-
-    lines: list[str] = [
-        "# Generated by `sert` — property regression replay tokens (commit to version control).",
-        "",
-    ]
-    for r_test, r_file, r_tok in rows:
-        lines.append("[[regression]]")
-        lines.append(f"test = {_toml_quote(r_test)}")
-        lines.append(f"file = {_toml_quote(r_file)}")
-        lines.append(f"token = {_toml_quote(r_tok)}")
-        lines.append("")
-
-    target = root_path / REGRESSIONS_REL
-    target.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(target, "\n".join(lines).encode("utf-8"))
-    return not already_present
+    added = run_mod.save_regression_tokens(
+        root_path,
+        [{"test": test, "file": str(spec_file or ""), "token": tok}],
+    )
+    return len(added) > 0
 
 
 def _parse_luau_number(raw: str) -> int | float | None:
-    cleaned = raw.replace("_", "")
-    if not cleaned:
-        return None
-    try:
-        if cleaned.startswith(("0x", "0X")):
-            return int(cleaned, 16)
-        if cleaned.startswith(("0b", "0B")):
-            return int(cleaned, 2)
-        if "." not in cleaned and "e" not in cleaned and "E" not in cleaned:
-            return int(cleaned, 10)
-        val = float(cleaned)
-        if val != val or val in (float("inf"), float("-inf")):
-            return None
-        return val
-    except ValueError:
-        return None
+    return luau_lex.parse_number(raw)
 
 
 def _is_unary_minus_prefix(tokens: list[luau_lex.Token], in_type: list[bool], k: int) -> bool:
@@ -781,7 +705,7 @@ def _load_corpus(corpus_dir: Path) -> dict[str, list[dict[str, Any]]]:
                 continue
             prop_name = str(data.get("prop") or "").strip()
             tok = str(data.get("token") or "").strip()
-            decoded = decode_v1_token(tok)
+            decoded = decode_tape_token(tok)
             if prop_name and decoded is not None:
                 seed, size, tape = decoded
                 out.setdefault(prop_name, []).append({"seed": seed, "size": size, "tape": tape, "token": tok})
@@ -792,7 +716,7 @@ def _load_corpus(corpus_dir: Path) -> dict[str, list[dict[str, Any]]]:
                 continue
             for line in lines:
                 tok = line.strip()
-                decoded = decode_v1_token(tok)
+                decoded = decode_tape_token(tok)
                 if decoded is not None:
                     seed, size, tape = decoded
                     out.setdefault(entry.parent.name, []).append({"seed": seed, "size": size, "tape": tape, "token": tok})
@@ -872,14 +796,23 @@ def _norm_spec_key(path: str) -> str:
     return clean.lower()
 
 
+def _normalize_greps(grep: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if not grep:
+        return []
+    if isinstance(grep, str):
+        return [grep]
+    return [str(g) for g in grep if str(g)]
+
+
 def _estimate_prop_count(
     root: Path,
     rels: list[str],
     *,
     files: list[str],
     filt: str | None,
-    grep: str | None,
+    grep: str | list[str] | tuple[str, ...] | None,
 ) -> int:
+    greps = _normalize_greps(grep)
     wanted = [_norm_spec_key(f) for f in files if f.strip()]
     matched_rels: list[str] = []
     for rel in rels:
@@ -920,14 +853,24 @@ def _estimate_prop_count(
             if name_val is not None:
                 if filt and filt.lower() not in name_val.lower():
                     continue
-                if grep:
-                    try:
-                        lua_pat = re.sub(r"%([a-zA-Z])", lambda m: "\\" + m.group(1).lower() if m.group(1) in "dsSwW" else m.group(1), grep)
-                        if grep.lower() not in name_val.lower() and re.search(lua_pat, name_val) is None:
-                            continue
-                    except re.error:
-                        if grep.lower() not in name_val.lower():
-                            continue
+                if greps:
+                    matched_any = False
+                    for gpat in greps:
+                        try:
+                            lua_pat = re.sub(
+                                r"%([a-zA-Z])",
+                                lambda m: "\\" + m.group(1).lower() if m.group(1) in "dsSwW" else m.group(1),
+                                gpat,
+                            )
+                            if gpat.lower() in name_val.lower() or re.search(lua_pat, name_val) is not None:
+                                matched_any = True
+                                break
+                        except re.error:
+                            if gpat.lower() in name_val.lower():
+                                matched_any = True
+                                break
+                    if not matched_any:
+                        continue
             count += 1
     return max(1, count)
 
@@ -939,7 +882,7 @@ def _render_fuzz_config(
     max_runs: int | None,
     prop_count_hint: int,
     filt: str | None,
-    grep: str | None,
+    grep: str | list[str] | tuple[str, ...] | None,
     files: list[str],
     dict_strings: list[str],
     dict_numbers: list[int | float],
@@ -949,13 +892,15 @@ def _render_fuzz_config(
     spec_requires: list[tuple[str, str]],
     entry_requires: list[tuple[str, str]],
 ) -> str:
+    greps = _normalize_greps(grep)
     lines = ["--!nonstrict", "-- Auto-generated by `sert fuzz`; do not edit.", "return {"]
     lines.append(f"\tseed = {seed},")
     lines.append(f"\tbudget = {budget_sec:.6f},")
     lines.append(f"\tmaxRuns = {str(max_runs) if max_runs is not None else 'nil'},")
     lines.append(f"\tpropCountHint = {max(1, int(prop_count_hint))},")
     lines.append(f"\tfilter = {luau_string(filt) if filt else 'nil'},")
-    lines.append(f"\tgrep = {luau_string(grep) if grep else 'nil'},")
+    lines.append(f"\tgrep = {luau_string(greps[0]) if len(greps) == 1 else 'nil'},")
+    lines.append("\tgreps = { " + ", ".join(luau_string(g) for g in greps) + " },")
     lines.append("\tfiles = { " + ", ".join(luau_string(f) for f in files) + " },")
     lines.append("\tdictStrings = { " + ", ".join(luau_string(s) for s in dict_strings) + " },")
     lines.append("\tdictNumbers = { " + ", ".join(_luau_number_literal(n) for n in dict_numbers) + " },")
@@ -1021,7 +966,7 @@ def add_parser(subparsers) -> None:
     parser = subparsers.add_parser("fuzz")
     parser.add_argument("specs", nargs="*", help="optional spec files or directories to fuzz")
     parser.add_argument("--filter", metavar="SUBSTR", help="only run properties whose name contains SUBSTR or matches Lua pattern")
-    parser.add_argument("-g", "--grep", metavar="PAT", help="only run properties matching PAT")
+    parser.add_argument("-g", "--grep", action="append", default=[], metavar="PAT", help="only run properties matching Luau pattern PAT (repeatable)")
     parser.add_argument("--file", action="append", default=[], metavar="FILE", help="restrict fuzzing to specs matching FILE")
     parser.add_argument("--budget", type=float, default=5.0, metavar="SEC", help="total wall-clock fuzzing budget in seconds (default: 5.0)")
     parser.add_argument("--runs", type=int, default=None, metavar="N", help="fixed trial count per property instead of time budget")

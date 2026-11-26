@@ -798,6 +798,272 @@ class InitSkillAndFormattingTest(helpers.Case):
         self.assertEqual(code_c, 0, out_chk.getvalue())
         self.assertIn("OK checks=3 passed=3 failed=0", out_chk.getvalue())
 
+        # `check --format json` preserves exact exit codes 2 (infra) and 3 (timeout).
+        with (
+            mock.patch.object(check.lint, "cmd_lint", return_value=2),
+            mock.patch.object(check.run, "cmd_run", return_value=0),
+        ):
+            out_j2 = io.StringIO()
+            with contextlib.redirect_stdout(out_j2):
+                code_j2 = cli.main(["check", "--root", str(self.root), "--format", "json"])
+        self.assertEqual(code_j2, 2)
+        self.assertEqual(json.loads(out_j2.getvalue())["exit_code"], 2)
+
+        with (
+            mock.patch.object(check.lint, "cmd_lint", return_value=0),
+            mock.patch.object(check.run, "cmd_run", return_value=3),
+        ):
+            out_j3 = io.StringIO()
+            with contextlib.redirect_stdout(out_j3):
+                code_j3 = cli.main(["check", "--root", str(self.root), "--format", "json"])
+        self.assertEqual(code_j3, 3)
+        self.assertEqual(json.loads(out_j3.getvalue())["exit_code"], 3)
+
+    def test_check_context_dedup_and_watch_loop(self) -> None:
+        from sert import coverage, mutate
+
+        _init_project(self.root)
+        (self.root / "src/a.luau").write_text("local M = {}\nfunction M.f(x: number)\n\treturn x + 1\nend\nreturn M\n", encoding="utf-8")
+        (self.root / "test/a.spec.luau").write_text('local M = require("../src/a")\nreturn function() end\n', encoding="utf-8")
+        (self.root / "sert.toml").write_text(
+            '[test]\nspecs = ["test/*.spec.luau"]\n[coverage]\ninclude = ["src"]\nmin = 50\n[mutate]\ninclude = ["src"]\n',
+            encoding="utf-8",
+        )
+        (self.root / "coverage.out").write_text(
+            "SF:src/a.luau\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,1\nDA:5,1\nend_of_record\n",
+            encoding="utf-8",
+        )
+        cfg = cli.config_mod.load(self.root) if hasattr(cli, "config_mod") else __import__("sert.config", fromlist=["load"]).load(self.root)
+
+        raw_out = '[sert-test] {"name":"t","file":"test/a.spec.luau","status":"pass","ms":1}\n[sert-done] {"passed":1,"failed":0,"skipped":0,"total":1}\n'
+        parsed_res = markers.parse(raw_out)
+        fake_res = run.RunResult(status=0, entries=[run.EntryRun("test/a.spec.luau", 0, 0.01, output=raw_out)], tests=parsed_res.tests)
+
+        with (
+            mock.patch("sert.fetch.refresh_overrides") as spy_ref,
+            mock.patch("sert.fetch.ensure_fetched") as spy_fetch,
+            mock.patch("sert.coverage.git_diff_lines", return_value={"src/a.luau": {3}}) as spy_diff,
+            mock.patch("sert.graph.build_graph", wraps=graph.build_graph) as spy_graph,
+            mock.patch("sert.coverage.parse", wraps=coverage.parse) as spy_parse,
+            mock.patch.object(check.lint, "cmd_lint_streams", return_value=0),
+            mock.patch.object(check.run, "resolve_entries", return_value=["test/a.spec.luau"]),
+            mock.patch.object(check.run, "run_entries", return_value=fake_res),
+            mock.patch.object(mutate, "main", return_value=0) as spy_mutate,
+        ):
+            args = cli.build(["check"]).parse_args(["check", "--root", str(self.root), "--changed", "HEAD", "--no-studio", "--agent"])
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf):
+                rc = check.cmd_check(args, self.root, cfg)
+        self.assertEqual(rc, 0, out_buf.getvalue())
+        self.assertEqual(spy_ref.call_count, 1)
+        self.assertEqual(spy_fetch.call_count, 1)
+        self.assertEqual(spy_diff.call_count, 1)
+        self.assertEqual(spy_graph.call_count, 1)
+        self.assertEqual(spy_parse.call_count, 1)
+        self.assertEqual(spy_mutate.call_count, 1)
+
+        # `sert check --watch` detects edit and runs another cycle with trigger banner
+        cycles = [0]
+
+        def fake_sleep(_iv):
+            cycles[0] += 1
+            if cycles[0] == 1:
+                p = self.root / "src/a.luau"
+                st = p.stat()
+                p.write_text("local M = {}\nfunction M.f(x: number)\n\treturn x + 2\nend\nreturn M\n", encoding="utf-8")
+                os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+
+        seen_watches: list[bool] = []
+        w_out, w_err = io.StringIO(), io.StringIO()
+        w_args = cli.build(["check"]).parse_args(["check", "--root", str(self.root), "--watch", "--agent"])
+        with (
+            mock.patch.object(check, "cmd_check", side_effect=lambda a, r, c: (seen_watches.append(bool(a.watch)), 0)[1]),
+            mock.patch("sert.check.time.sleep", side_effect=fake_sleep),
+        ):
+            rc_w = check.watch_check_loop(w_args, self.root, cfg, max_cycles=2, out=w_out, err=w_err)
+        self.assertEqual((rc_w, seen_watches), (0, [False, False]))
+        self.assertIn("changed: src/a.luau", w_err.getvalue())
+
+        # `watch_check_loop` survives transient malformed `sert.toml` and recovers cleanly next cycle
+        saved_toml = (self.root / "sert.toml").read_text(encoding="utf-8")
+        tr_cycle = [0]
+
+        def transient_sleep(_iv):
+            tr_cycle[0] += 1
+            toml_p = self.root / "sert.toml"
+            st = toml_p.stat()
+            if tr_cycle[0] == 1:
+                toml_p.write_text("[broken\n", encoding="utf-8")
+                os.utime(toml_p, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+            elif tr_cycle[0] == 2:
+                toml_p.write_text(saved_toml, encoding="utf-8")
+                os.utime(toml_p, ns=(st.st_atime_ns, st.st_mtime_ns + 4_000_000))
+
+        tr_out, tr_err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(check, "cmd_check", return_value=0) as mock_chk,
+            mock.patch("sert.check.time.sleep", side_effect=transient_sleep),
+        ):
+            rc_tr = check.watch_check_loop(w_args, self.root, cfg, max_cycles=3, out=tr_out, err=tr_err)
+        self.assertEqual((rc_tr, mock_chk.call_count), (0, 2))
+        self.assertIn("error:", tr_err.getvalue())
+
+        # `sert check --diff <rev> --audit` (without `--changed`) still scopes static audit scanning to diff-affected specs
+        _git(self.root, "init")
+        (self.root / "test/untouched.spec.luau").write_text("sert.eq(1, 1)\nreturn nil\n", encoding="utf-8")
+        _git(self.root, "add", ".")
+        _git(self.root, "commit", "-m", "baseline")
+        (self.root / "test/a.spec.luau").write_text('local M = require("../src/a")\nsert.eq(M.f(1), 2)\nreturn nil\n', encoding="utf-8")
+        captured_audit_specs: list[object] = []
+        orig_run_audit = audit.run_audit
+
+        def fake_audit(r, c, **kw):
+            captured_audit_specs.append(kw.get("specs"))
+            return orig_run_audit(r, c, **kw)
+
+        diff_args = cli.build(["check"]).parse_args(["check", "--root", str(self.root), "--diff", "HEAD", "--audit", "--agent"])
+        with (
+            mock.patch("sert.fetch.refresh_overrides"),
+            mock.patch("sert.fetch.ensure_fetched"),
+            mock.patch.object(check.lint, "cmd_lint_streams", return_value=0),
+            mock.patch.object(check.run, "resolve_entries", return_value=["test/a.spec.luau"]),
+            mock.patch.object(check.run, "run_entries", return_value=fake_res),
+            mock.patch.object(audit, "run_audit", side_effect=fake_audit),
+        ):
+            out_da = io.StringIO()
+            with contextlib.redirect_stdout(out_da):
+                rc_da = check.cmd_check(diff_args, self.root, cli.config_mod.load(self.root) if hasattr(cli, "config_mod") else __import__("sert.config", fromlist=["load"]).load(self.root))
+        self.assertEqual(rc_da, 0, out_da.getvalue())
+        self.assertEqual(captured_audit_specs, [None])
+
+    def test_audit_and_coverage_github_annotations(self) -> None:
+        _init_project(self.root)
+        (self.root / "src/a.luau").write_text(
+            "local M = {}\nfunction M.f(x: number)\n\treturn x + 1\nend\nfunction M.g()\n\treturn 2\nend\nreturn M\n",
+            encoding="utf-8",
+        )
+        (self.root / "test/a.spec.luau").write_text('sert.eq(1, 1)\nreturn nil\n', encoding="utf-8")
+        (self.root / "sert.toml").write_text(
+            '[test]\nspecs = ["test/*.spec.luau"]\n[coverage]\ninclude = ["src"]\nmin = 95\n[mutate]\ninclude = ["src"]\n',
+            encoding="utf-8",
+        )
+        (self.root / "coverage.out").write_text(
+            "SF:src/a.luau\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,1\nDA:5,0\nDA:6,0\nDA:7,0\nDA:8,1\nend_of_record\n",
+            encoding="utf-8",
+        )
+        (self.root / "run.txt").write_text('[sert-done] {"passed":1,"failed":0,"skipped":0,"total":1}\n', encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+            out_ah = io.StringIO()
+            with contextlib.redirect_stdout(out_ah):
+                rc_ah = cli.main(["audit", "--root", str(self.root), "--run-output", "run.txt"])
+            self.assertEqual(rc_ah, 1)
+            self.assertIn("::error file=test/a.spec.luau,line=1,title=sert audit::", out_ah.getvalue())
+
+            out_aj = io.StringIO()
+            with contextlib.redirect_stdout(out_aj):
+                rc_aj = cli.main(["audit", "--root", str(self.root), "--run-output", "run.txt", "--format", "json"])
+            self.assertEqual(rc_aj, 1)
+            self.assertNotIn("::error", out_aj.getvalue())
+            json.loads(out_aj.getvalue())
+
+            out_ch, err_ch = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_ch), contextlib.redirect_stderr(err_ch):
+                rc_ch = cli.main(["coverage", "--root", str(self.root)])
+            self.assertEqual(rc_ch, 1)
+            self.assertIn("::error title=sert coverage::", out_ch.getvalue())
+            self.assertIn("::error file=src/a.luau,line=5,title=sert coverage::", out_ch.getvalue())
+
+            out_cj, err_cj = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_cj), contextlib.redirect_stderr(err_cj):
+                rc_cj = cli.main(["coverage", "--root", str(self.root), "--format", "json"])
+            self.assertEqual(rc_cj, 1)
+            self.assertNotIn("::error", out_cj.getvalue())
+            json.loads(out_cj.getvalue())
+
+    def test_m6_stricter_tautologies_diff_covering_specs_remotes_single_line_fn_and_strict_skips(self) -> None:
+        _init_project(self.root)
+        _git(self.root, "init")
+        (self.root / "src/svc.luau").write_text(
+            "local M = {}\nfunction M.live(x) return x + 1 end\nfunction M.dead(x) return x + 2 end\nreturn M\n",
+            encoding="utf-8",
+        )
+        (self.root / "test/svc.spec.luau").write_text(
+            'local M = require("../src/svc")\n'
+            "local c = { pop = function() return 1 end }\n"
+            "local function nextId() return 1 end\n"
+            "sert.ok(1)\n"
+            'sert.ok("always")\n'
+            "sert.eq(1, 1.0)\n"
+            "sert.doesNotThrow(function() end)\n"
+            "sert.eq(nextId(), nextId())\n"
+            "sert.eq(c:pop(), c:pop())\n"
+            "sert.eq(M.live(1), 2)\n",
+            encoding="utf-8",
+        )
+        _git(self.root, "add", ".")
+        _git(self.root, "commit", "-m", "init")
+
+        # 1. Static tautologies catch `ok(1)`, `ok("always")`, `eq(1, 1.0)`, `doesNotThrow(function() end)`,
+        #    while NOT false-positiving on impure `nextId()` / `c:pop()`!
+        tauts = audit.scan_spec_tautologies([self.root / "test/svc.spec.luau"], self.root)
+        self.assertEqual(
+            [t["kind"] for t in tauts],
+            ["tautology-ok", "tautology-ok", "tautology-eq", "tautology-does-not-throw"],
+            tauts,
+        )
+
+        # 2. `--diff` when ONLY `src/svc.luau` changed STILL scans covering `test/svc.spec.luau` for tautologies!
+        (self.root / "src/svc.luau").write_text(
+            "local M = {}\nfunction M.live(x) return x + 2 end\nfunction M.dead(x) return x + 2 end\nreturn M\n",
+            encoding="utf-8",
+        )
+        code_d, rep_d = audit.run_audit(self.root, diff="HEAD", skip_run=True)
+        self.assertEqual(code_d, 1)
+        self.assertGreaterEqual(len(rep_d["tautologies"]), 4)
+
+        # 3. Per-handler remote check: multi-handler file fails when only `attackRemote` is fuzzed; 1-handler invoke rejects FireServer
+        (self.root / "test/svc.spec.luau").write_text('sert.roblox.fuzzRemote("attackRemote", function() end)\n', encoding="utf-8")
+        (self.root / "src/Combat.luau").write_text(
+            "local M = {}\nfunction M.init(attackRemote, buyFunc)\n\tattackRemote.OnServerEvent:Connect(function() end)\n\tbuyFunc.OnServerInvoke = function() return true end\nend\nreturn M\n",
+            encoding="utf-8",
+        )
+        rem_findings = audit.scan_remote_handlers(self.root, None)
+        self.assertEqual([r["remote"] for r in rem_findings], ["buyFunc"], rem_findings)
+
+        (self.root / "src/Combat.luau").write_text(
+            "local M = {}\nfunction M.init(onlyRpc)\n\tonlyRpc.OnServerInvoke = function() return true end\nend\nreturn M\n",
+            encoding="utf-8",
+        )
+        (self.root / "test/svc.spec.luau").write_text('onlyRpc:FireServer("hi")\n', encoding="utf-8")
+        rem_invoke = audit.scan_remote_handlers(self.root, None)
+        self.assertEqual([r["remote"] for r in rem_invoke], ["onlyRpc"], rem_invoke)
+
+        # 4. Single-line never-called exported function caught via LCOV FN:/FNDA: records from real `luau --coverage`
+        if util.which("luau", helpers.REPO) is not None:
+            (self.root / "src/Combat.luau").unlink()
+            (self.root / "test/svc.spec.luau").write_text(
+                'local M = require("../src/svc")\nassert(M.live(1) == 3)\n', encoding="utf-8"
+            )
+            subprocess.run(["luau", "--coverage", "test/svc.spec.luau"], cwd=self.root, check=True, capture_output=True)
+            cov_f = __import__("sert.coverage", fromlist=["parse"]).parse(self.root / "coverage.out", root=self.root)
+            fn_h = __import__("sert.coverage", fromlist=["parse_function_hits"]).parse_function_hits(
+                self.root / "coverage.out", root=self.root
+            )
+            uncov = audit.find_uncovered_exports(self.root, None, cov_f, fn_hits=fn_h)
+            self.assertEqual([u.name for u in uncov], ["M.dead"], uncov)
+
+        # 5. `--strict` fails on `explicit` skips (`sert.test.skip`), while allowing `roblox`-only skips
+        clean_roblox_skip = '[sert-done] {"passed":1,"failed":0,"skipped":1,"total":2,"skippedByReason":{"explicit":0,"roblox":1,"server":0,"client":0}}\n'
+        (self.root / "src/svc.luau").unlink()
+        (self.root / "test/svc.spec.luau").write_text("local x = 1\nassert(x == 1)\n", encoding="utf-8")
+        c_r, _ = audit.run_audit(self.root, strict=True, run_output=clean_roblox_skip)
+        self.assertEqual(c_r, 0)
+        explicit_skip_out = '[sert-done] {"passed":1,"failed":0,"skipped":1,"total":2,"skippedByReason":{"explicit":1,"roblox":0,"server":0,"client":0}}\n'
+        c_e, rep_e = audit.run_audit(self.root, strict=True, run_output=explicit_skip_out)
+        self.assertEqual(c_e, 1)
+        self.assertTrue(any(i.get("kind") == "explicit-skip" for i in rep_e["issues"]))
+
 
 if __name__ == "__main__":
     unittest.main()

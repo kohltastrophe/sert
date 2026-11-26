@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import threading
 import tomllib
 import unittest
@@ -60,7 +61,24 @@ class FetchAndHttpTest(Case):
 
         # Offline fetch into an empty cache fails cleanly
         self.setenv("SERT_CACHE", str(self.tmp / "empty-cache"))
-        self.assertEqual(self.sert("fetch", "--root", root, "--offline")[0], 2)
+        code_empty, _, err_empty = self.sert("fetch", "--root", root, "--offline")
+        self.assertEqual((code_empty, "populate cache" in err_empty), (2, True), err_empty)
+
+        # SSL / HTTP error formatting gives actionable diagnostics
+        import io
+        import ssl
+        import urllib.error
+        ssl_msg = fetch._format_fetch_error(
+            "https://github.com/a/b",
+            urllib.error.URLError(ssl.SSLCertVerificationError("unable to get local issuer certificate")),
+        )
+        self.assertIn("SSL_CERT_FILE", ssl_msg)
+        http_err = urllib.error.HTTPError("https://github.com/a/b", 404, "Not Found", {}, io.BytesIO(b""))
+        try:
+            http_msg = fetch._format_fetch_error("https://github.com/a/b", http_err)
+        finally:
+            http_err.close()
+        self.assertIn("GITHUB_TOKEN", http_msg)
 
     def test_tamper_rejection_in_fetch(self):
         # Tamper with sert-0.1.0.zip on the server so it disagrees with SHA256SUMS
@@ -271,6 +289,23 @@ class InitTest(Case):
         code, out, err = self.sert("run", "--root", root)
         self.assertEqual(code, 0, out + err)
         self.assertIn("2 passed · 0 failed", out)
+        bin_shim = root / ".sert" / "bin" / "sert"
+        cmd_shim = root / ".sert" / "bin" / "sert.cmd"
+        self.assertTrue(bin_shim.is_file() and cmd_shim.is_file())
+        cmd_text = cmd_shim.read_text(encoding="utf-8")
+        self.assertIn("goto :run_stub", cmd_text)
+        self.assertIn("exit /b %ERRORLEVEL%", cmd_text)
+        self.assertNotIn("if exist \"%ROOT%\\tools\\sert.py\" (", cmd_text)
+        if os.name != "nt":
+            self.assertTrue(os.access(bin_shim, os.X_OK))
+            shim_done = subprocess.run(
+                [str(bin_shim), "--version"],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, SERT_SOURCE=str(REPO)),
+            )
+            self.assertEqual(shim_done.returncode, 0, shim_done.stderr)
+            self.assertIn(VERSION, shim_done.stdout)
 
 
 if __name__ == "__main__":

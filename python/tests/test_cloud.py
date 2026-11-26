@@ -280,6 +280,63 @@ class CloudServerTest(unittest.TestCase):
         self.assertIn("Runner.runOnce", emitted_luau)
         self.assertIn("__sert_config", emitted_luau)
 
+        # 5. `--format json`, `--agent`, `--junit`, `--dry-run --format json`, missing-env JSON, and GHA annotations
+        junit_out = os.path.join(self.tmp.name, "cloud-junit.xml")
+        code_j, out_j, _ = self.run_cloud(
+            "-- PARALLEL_CHECK FAILTEST SCRIPTERROR\nreturn nil\n",
+            {"shards": SHARDS},
+            format="json",
+            junit=junit_out,
+        )
+        self.assertEqual(code_j, 1)
+        env = json.loads(out_j)
+        self.assertEqual((env["command"], env["exit_code"], env["summary"]["tasks"], env["summary"]["failed"]), ("cloud", 1, 3, 2))
+        self.assertEqual(len(env["data"]["tasks"]), 3)
+        self.assertTrue(os.path.isfile(junit_out))
+        junit_xml_text = pathlib.Path(junit_out).read_text(encoding="utf-8")
+        self.assertIn("<testsuite", junit_xml_text)
+        self.assertIn("FAILED, SCRIPT_ERROR", junit_xml_text)
+
+        code_a, out_a, _ = self.run_cloud("-- PARALLEL_CHECK FAILTEST\nreturn nil\n", {"shards": SHARDS}, agent=True)
+        self.assertEqual(code_a, 1)
+        self.assertTrue(out_a.startswith("FAIL cloud tasks=3 failed=1"), out_a)
+
+        code_dry, out_dry, _ = self.run_cloud(
+            "-- dry\nreturn nil\n", {"shards": SHARDS}, dry_run=True, place_version=7, format="json"
+        )
+        self.assertEqual(code_dry, 0)
+        dry_env = json.loads(out_dry)
+        self.assertEqual((dry_env["command"], dry_env["summary"]["dry_run"], dry_env["summary"]["tasks"]), ("cloud", True, 3))
+
+        # Missing env under --format json emits clean JSON envelope
+        bad_opts = types.SimpleNamespace(
+            project=None,
+            script="spec.luau",
+            place="place.rbxl",
+            place_version=None,
+            output=None,
+            shard=[],
+            json_out=None,
+            format="json",
+        )
+        out_missing = io.StringIO()
+        with contextlib.redirect_stdout(out_missing):
+            rc_missing = cloud.execute(self.tmp.name, {}, bad_opts, {})
+        self.assertEqual(rc_missing, util.INFRA)
+        missing_env = json.loads(out_missing.getvalue())
+        self.assertEqual((missing_env["command"], missing_env["exit_code"]), ("cloud", util.INFRA))
+        self.assertIn("missing environment", missing_env["errors"][0])
+
+        # GHA annotations in human mode, suppressed in json mode
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+            code_gha, out_gha, _ = self.run_cloud("-- FAILTEST\nreturn nil\n", {"shards": SHARDS})
+            self.assertEqual(code_gha, 1)
+            self.assertIn("::error title=sert cloud (store)::", out_gha)
+            code_gha_j, out_gha_j, _ = self.run_cloud("-- FAILTEST\nreturn nil\n", {"shards": SHARDS}, format="json")
+            self.assertEqual(code_gha_j, 1)
+            self.assertNotIn("::error", out_gha_j)
+            json.loads(out_gha_j)
+
 
 if __name__ == "__main__":
     unittest.main()

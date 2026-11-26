@@ -21,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from sert import config as sert_config, markers, util
+from sert import agent, config as sert_config, markers, util
 from sert.util import (
     FAILED,
     INFRA,
@@ -352,7 +352,7 @@ class Client:
         return result
 
 
-def upload_place(client: Client, universe: str, place: str, path: str) -> int:
+def upload_place(client: Client, universe: str, place: str, path: str, *, quiet: bool = False) -> int:
     extension = os.path.splitext(path)[1].lower()
     if extension not in PLACE_CONTENT_TYPES:
         raise SertError(f"the place must be a .rbxl or .rbxlx file: {path}")
@@ -368,7 +368,8 @@ def upload_place(client: Client, universe: str, place: str, path: str) -> int:
     version = response.get("versionNumber")
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         raise ApiError("the upload response did not include a versionNumber")
-    print(f"uploaded {len(body)} bytes as saved version {version}", flush=True)
+    if not quiet:
+        print(f"uploaded {len(body)} bytes as saved version {version}", flush=True)
     return version
 
 
@@ -503,9 +504,76 @@ def classify(task: dict, lines: list[str]) -> tuple[int, str]:
     )
 
 
+def _clean_verdict(verdict: dict) -> dict:
+    return {k: v for k, v in verdict.items() if not k.startswith("_")}
+
+
+def _write_cloud_junit(root: str, junit_arg: str | None, verdicts: list[dict]) -> None:
+    if not junit_arg:
+        return
+    from sert import run as run_mod
+
+    entries: list[run_mod.EntryRun] = []
+    tests: list[dict] = []
+    for item in verdicts:
+        label = str(item.get("label") or "cloud")
+        raw_output = str(item.get("_output") or "")
+        verdict_str = str(item.get("verdict") or "")
+        output = raw_output
+        code = int(item.get("exit") or 0)
+        if code != 0 and verdict_str and verdict_str not in output:
+            output = f"{output}\n{verdict_str}".strip()
+        elif not output:
+            output = verdict_str
+        seconds = float(item.get("seconds") or 0.0)
+        parsed = markers.parse(raw_output) if raw_output else markers.parse("")
+        for test in parsed.tests:
+            copied = dict(test)
+            copied.setdefault("file", label)
+            copied.setdefault("entry", label)
+            tests.append(copied)
+        entries.append(
+            run_mod.EntryRun(
+                entry=label,
+                code=code,
+                seconds=seconds,
+                output=output,
+                timed_out=(code == TIMEOUT),
+            )
+        )
+    res = run_mod.RunResult(status=worst([e.code for e in entries]) if entries else 0, entries=entries, tests=tests)
+    run_mod.write_junit_file(root, junit_arg, res)
+
+
+def _annotate_cloud_failures(verdicts: list[dict]) -> None:
+    if not util.on_github_actions():
+        return
+    for item in verdicts:
+        label = str(item.get("label") or "cloud")
+        output = str(item.get("_output") or "")
+        parsed = markers.parse(output)
+        fallback = str(item.get("verdict") or f"exit {item.get('exit')}") if item.get("exit") else None
+        util.annotate_test_failures(
+            parsed.tests,
+            title=f"sert cloud ({label})",
+            fallback_msg=fallback,
+        )
+
+
+def _emit_cloud_error(fmt: str, code: int, message: str) -> int:
+    if fmt == "json":
+        print(agent.json_dumps_compact(agent.json_envelope("cloud", code, errors=[message])), flush=True)
+    elif fmt == "agent":
+        print(f"FAIL cloud {message}", flush=True)
+    else:
+        note(f"sert cloud: {message}")
+    return code
+
+
 def run_task(client: Client, universe: str, place: str, version: int | None, source: str, label: str) -> dict:
     out = _out_stream()
     err_out = _err_stream()
+    fmt = getattr(_TLS, "fmt", "human")
     limit_sec = _task_limit()
     task = create_task(client, universe, place, version, source, timeout=limit_sec)
     path = task["path"]
@@ -518,7 +586,7 @@ def run_task(client: Client, universe: str, place: str, version: int | None, sou
             finished = task.get("state") in FINAL_STATES
         except GiveUp as err:
             note(f"[{label}] {err}", err=err_out)
-            return {"label": label, "exit": TIMEOUT, "verdict": str(err), "seconds": None, "path": path}
+            return {"label": label, "exit": TIMEOUT, "verdict": str(err), "seconds": None, "path": path, "_output": ""}
     finally:
         if not finished:
             cancel_task(client, path)
@@ -537,11 +605,11 @@ def run_task(client: Client, universe: str, place: str, version: int | None, sou
                 f"Luau task {label} took {seconds:.0f} s, over half its {limit_sec} s limit:"
                 " split its shard or speed it up before it times out"
             )
-            if not util.annotate("warning", slow, out=out):
-                print(f"warning: {slow}", file=out)
+            if fmt != "human" or not util.annotate("warning", slow, out=out):
+                print(f"warning: {slow}", file=err_out if fmt != "human" else out)
     code, verdict = classify(task, lines)
     print(f"[{label}] {verdict}", file=err_out if code else out, flush=True)
-    return {"label": label, "exit": code, "verdict": verdict, "seconds": seconds, "path": path}
+    return {"label": label, "exit": code, "verdict": verdict, "seconds": seconds, "path": path, "_output": "\n".join(lines)}
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -571,6 +639,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help=f"per-task Open Cloud timeout in seconds (default [cloud].timeout or {TASK_LIMIT})",
     )
     parser.add_argument("--json-out", metavar="FILE", help="write the tasks' verdicts as JSON")
+    parser.add_argument("--junit", metavar="FILE", help="write a JUnit XML report (relative to the root)")
+    parser.add_argument("--agent", action="store_true", help="token-minimal summary for AI agents")
+    parser.add_argument(
+        "--format",
+        choices=("human", "agent", "json"),
+        default=None,
+        help="output format (default: human; or agent when SERT_AGENT=1)",
+    )
     parser.add_argument("--unsharded", action="store_true", help="run the script once, unchanged, ignoring [cloud].shards")
     parser.add_argument(
         "--dry-run",
@@ -589,6 +665,7 @@ def add_parser(subparsers) -> argparse.ArgumentParser:
 
 def main(args, env=None) -> int:
     env = os.environ if env is None else env
+    fmt = agent.output_format(args, env=env)
     root = str(sert_config.find_root(getattr(args, "root", None)))
     try:
         cfg = sert_config.load(root)
@@ -598,8 +675,7 @@ def main(args, env=None) -> int:
         fetch.ensure_fetched(cfg)
         return execute(root, cfg.get("cloud") or {}, args, env)
     except SertError as err:
-        note(f"sert cloud: {redact(err, env.get('ROBLOX_API_KEY'))}")
-        return err.code
+        return _emit_cloud_error(fmt, err.code, redact(err, env.get("ROBLOX_API_KEY")))
 
 
 def _discover_cloud_specs(root: str, conf: dict) -> list[str]:
@@ -666,18 +742,29 @@ def dry_run(
     shards: list[dict],
     limit: float,
     synthesized_specs: list[str] | None = None,
+    *,
+    fmt: str = "human",
 ) -> int:
     if args.place_version is None and not args.place:
-        built = built_place(root, conf, args, synthesized_specs=synthesized_specs)
+        err_buf = io.StringIO()
+        if fmt != "human":
+            old_stderr = sys.stderr
+            sys.stderr = err_buf
+        try:
+            built = built_place(root, conf, args, synthesized_specs=synthesized_specs)
+        finally:
+            if fmt != "human":
+                sys.stderr = old_stderr
         if isinstance(built, int):
-            return built
+            msg = err_buf.getvalue().strip() or "build place failed"
+            return _emit_cloud_error(fmt, built, msg.removeprefix("sert cloud: ")) if fmt != "human" else built
         place_file, temporary = built
-        print(f"built {os.path.getsize(place_file)} bytes; not uploaded (--dry-run)", flush=True)
+        if fmt == "human":
+            print(f"built {os.path.getsize(place_file)} bytes; not uploaded (--dry-run)", flush=True)
         if temporary:
             shutil.rmtree(temporary, ignore_errors=True)
     if len(source.encode("utf-8")) > MAX_SCRIPT_BYTES:
-        note(f"sert cloud: the script is larger than the 4 MB limit ({MAX_SCRIPT_BYTES} bytes)")
-        return INFRA
+        return _emit_cloud_error(fmt, INFRA, f"the script is larger than the 4 MB limit ({MAX_SCRIPT_BYTES} bytes)")
     tasks = (
         [(os.path.basename(script_path), None, source)]
         if not shards
@@ -687,15 +774,17 @@ def dry_run(
             if not args.shard or shard["name"] in args.shard
         ]
     )
-    emit_dir = os.path.join(root, args.emit) if args.emit else None
+    emit_arg = getattr(args, "emit", None)
+    emit_dir = os.path.join(root, emit_arg) if emit_arg else None
     if emit_dir:
         os.makedirs(emit_dir, exist_ok=True)
     for label, info, text in tasks:
-        print(
-            f"[{label}] runs unchanged (no [cloud].shards)"
-            if info is None
-            else f"[{label}] {shard_statement(info).rstrip()}"
-        )
+        if fmt == "human":
+            print(
+                f"[{label}] runs unchanged (no [cloud].shards)"
+                if info is None
+                else f"[{label}] {shard_statement(info).rstrip()}"
+            )
         if emit_dir:
             name = label if label.endswith(".luau") else f"{label}.luau"
             with open(os.path.join(emit_dir, name), "w", encoding="utf-8") as handle:
@@ -710,6 +799,20 @@ def dry_run(
                 indent=1,
             )
             handle.write("\n")
+    if fmt == "json":
+        print(
+            agent.json_dumps_compact(
+                agent.json_envelope(
+                    "cloud",
+                    OK,
+                    summary={"dry_run": True, "tasks": len(tasks)},
+                    data={"dry_run": True, "tasks": [{"label": label, "shard": info} for label, info, _ in tasks]},
+                )
+            ),
+            flush=True,
+        )
+    elif fmt == "agent":
+        print(f"OK cloud dry_run=true tasks={len(tasks)}", flush=True)
     return OK
 
 
@@ -759,12 +862,20 @@ def _run_tasks_parallel(
     key: str,
     jobs: int,
     task_timeout: int,
+    fmt: str = "human",
 ) -> list[dict]:
     if len(tasks) <= 1 or jobs <= 1:
         verdicts = []
         rate_limited = None
         old_timeout = getattr(_TLS, "task_timeout", None)
+        old_out = getattr(_TLS, "out", None)
+        old_err = getattr(_TLS, "err", None)
+        old_fmt = getattr(_TLS, "fmt", None)
         _TLS.task_timeout = task_timeout
+        _TLS.fmt = fmt
+        if fmt != "human":
+            _TLS.out = io.StringIO()
+            _TLS.err = io.StringIO()
         try:
             for label, text in tasks:
                 if rate_limited is not None:
@@ -775,6 +886,7 @@ def _run_tasks_parallel(
                             "verdict": f"not run: {rate_limited} was rate limited",
                             "seconds": None,
                             "path": None,
+                            "_output": "",
                         }
                     )
                     continue
@@ -782,14 +894,18 @@ def _run_tasks_parallel(
                     verdicts.append(run_task(client, universe, place, version, text, label))
                 except SertError as err:
                     message = redact(err, key)
-                    note(f"sert cloud: [{label}] {message}")
+                    if fmt == "human":
+                        note(f"sert cloud: [{label}] {message}")
                     verdicts.append(
-                        {"label": label, "exit": err.code, "verdict": message, "seconds": None, "path": None}
+                        {"label": label, "exit": err.code, "verdict": message, "seconds": None, "path": None, "_output": ""}
                     )
                     if isinstance(err, ApiError) and err.status == 429:
                         rate_limited = label
         finally:
             _TLS.task_timeout = old_timeout
+            _TLS.out = old_out
+            _TLS.err = old_err
+            _TLS.fmt = old_fmt if old_fmt is not None else "human"
         return verdicts
 
     workers = min(max(1, jobs), len(tasks), MAX_PARALLEL_SHARDS)
@@ -805,7 +921,7 @@ def _run_tasks_parallel(
                 cond.wait()
             if interrupted:
                 return (
-                    {"label": label, "exit": INTERRUPTED, "verdict": "interrupted", "seconds": None, "path": None},
+                    {"label": label, "exit": INTERRUPTED, "verdict": "interrupted", "seconds": None, "path": None, "_output": ""},
                     "",
                     "",
                 )
@@ -817,6 +933,7 @@ def _run_tasks_parallel(
                         "verdict": f"not run: {rate_limited_by} was rate limited",
                         "seconds": None,
                         "path": None,
+                        "_output": "",
                     },
                     "",
                     "",
@@ -835,6 +952,7 @@ def _run_tasks_parallel(
         out_buf, err_buf = io.StringIO(), io.StringIO()
         _TLS.out = out_buf
         _TLS.err = err_buf
+        _TLS.fmt = fmt
         _TLS.task_timeout = task_timeout
         _TLS.on_created = mark_created
         try:
@@ -849,7 +967,7 @@ def _run_tasks_parallel(
                         rate_limited_by = label
                     cond.notify_all()
             return (
-                {"label": label, "exit": err.code, "verdict": message, "seconds": None, "path": None},
+                {"label": label, "exit": err.code, "verdict": message, "seconds": None, "path": None, "_output": ""},
                 out_buf.getvalue(),
                 err_buf.getvalue(),
             )
@@ -857,6 +975,7 @@ def _run_tasks_parallel(
             mark_created()
             _TLS.out = None
             _TLS.err = None
+            _TLS.fmt = "human"
             _TLS.task_timeout = None
             _TLS.on_created = None
 
@@ -879,56 +998,68 @@ def _run_tasks_parallel(
 
     verdicts: list[dict] = []
     for verdict, out_str, err_str in results:
-        if out_str:
-            sys.stdout.write(out_str)
-            sys.stdout.flush()
-        if err_str:
-            sys.stderr.write(err_str)
-            sys.stderr.flush()
+        if fmt == "human":
+            if out_str:
+                sys.stdout.write(out_str)
+                sys.stdout.flush()
+            if err_str:
+                sys.stderr.write(err_str)
+                sys.stderr.flush()
         verdicts.append(verdict)
     return verdicts
 
 
 def execute(root: str, conf: dict, args, env) -> int:
+    fmt = agent.output_format(args, env=env)
     raw_jobs = getattr(args, "jobs", None)
     cfg_jobs = conf.get("jobs") if conf.get("jobs") is not None else conf.get("max_workers", DEFAULT_JOBS)
     jobs = int(raw_jobs if raw_jobs is not None else cfg_jobs)
     if jobs < 1:
-        note("sert cloud: --jobs must be at least 1")
-        return INFRA
+        return _emit_cloud_error(fmt, INFRA, "--jobs must be at least 1")
     raw_timeout = getattr(args, "timeout", None)
     task_timeout = int(raw_timeout if raw_timeout is not None else conf.get("timeout", TASK_LIMIT))
     if task_timeout < 1:
-        note("sert cloud: --timeout must be at least 1")
-        return INFRA
+        return _emit_cloud_error(fmt, INFRA, "--timeout must be at least 1")
+
+    def _prepare_checked():
+        err_buf = io.StringIO()
+        old_stderr = sys.stderr
+        if fmt != "human":
+            sys.stderr = err_buf
+        try:
+            res = prepare(root, conf, args)
+        finally:
+            if fmt != "human":
+                sys.stderr = old_stderr
+        if isinstance(res, int) and fmt != "human":
+            msg = err_buf.getvalue().strip().removeprefix("sert cloud: ") or "prepare failed"
+            return _emit_cloud_error(fmt, res, msg), True
+        return res, isinstance(res, int)
 
     if getattr(args, "dry_run", False):
-        prepared = prepare(root, conf, args)
-        return (
-            prepared
-            if isinstance(prepared, int)
-            else dry_run(
-                root,
-                conf,
-                args,
-                prepared[1],
-                prepared[0],
-                prepared[2],
-                prepared[3],
-                synthesized_specs=prepared[4],
-            )
+        prepared, is_err = _prepare_checked()
+        if is_err:
+            return prepared
+        return dry_run(
+            root,
+            conf,
+            args,
+            prepared[1],
+            prepared[0],
+            prepared[2],
+            prepared[3],
+            synthesized_specs=prepared[4],
+            fmt=fmt,
         )
     if getattr(args, "emit", None):
-        note("sert cloud: --emit needs --dry-run")
-        return INFRA
+        return _emit_cloud_error(fmt, INFRA, "--emit needs --dry-run")
     resolved = [next((env.get(alias) for alias in aliases if env.get(alias)), None) for aliases in ENV]
     if missing := [aliases[0] for aliases, val in zip(ENV, resolved) if not val]:
-        note(f"sert cloud: missing environment: {', '.join(missing)}")
-        return INFRA
+        return _emit_cloud_error(fmt, INFRA, f"missing environment: {', '.join(missing)}")
     key, universe, place = resolved
     client = Client(key, env.get("ROBLOX_CLOUD_BASE_URL") or DEFAULT_BASE_URL)
-    prepared = prepare(root, conf, args)
-    if isinstance(prepared, int):
+    prepared, is_err = _prepare_checked()
+    if is_err:
         return prepared
     script_path, source, shards, limit, synthesized_specs = prepared
 
@@ -936,12 +1067,23 @@ def execute(root: str, conf: dict, args, env) -> int:
     if version is None:
         place_file, temporary = (os.path.join(root, args.place), None) if args.place else (None, None)
         if place_file is None:
-            built = built_place(root, conf, args, synthesized_specs=synthesized_specs)
+            err_buf = io.StringIO()
+            old_stderr = sys.stderr
+            if fmt != "human":
+                sys.stderr = err_buf
+            try:
+                built = built_place(root, conf, args, synthesized_specs=synthesized_specs)
+            finally:
+                if fmt != "human":
+                    sys.stderr = old_stderr
             if isinstance(built, int):
+                if fmt != "human":
+                    msg = err_buf.getvalue().strip().removeprefix("sert cloud: ") or "build place failed"
+                    return _emit_cloud_error(fmt, built, msg)
                 return built
             place_file, temporary = built
         try:
-            version = upload_place(client, universe, place, place_file)
+            version = upload_place(client, universe, place, place_file, quiet=(fmt != "human"))
         finally:
             if temporary:
                 shutil.rmtree(temporary, ignore_errors=True)
@@ -965,18 +1107,59 @@ def execute(root: str, conf: dict, args, env) -> int:
             key=key,
             jobs=jobs,
             task_timeout=task_timeout,
+            fmt=fmt,
         )
     except KeyboardInterrupt:
+        if fmt == "json":
+            return _emit_cloud_error(fmt, INTERRUPTED, "interrupted")
+        if fmt == "agent":
+            return _emit_cloud_error(fmt, INTERRUPTED, "interrupted")
         note("sert cloud: interrupted")
         return INTERRUPTED
 
-    if shards and (failed := [v["label"] for v in verdicts if v["exit"]]):
-        note(f"failed shards: {', '.join(failed)}")
-    code = worst([v["exit"] for v in verdicts])
+    clean_verdicts = [_clean_verdict(v) for v in verdicts]
+    failed_shards = [v["label"] for v in clean_verdicts if v["exit"]]
+    code = worst([v["exit"] for v in clean_verdicts])
+    _write_cloud_junit(root, getattr(args, "junit", None), verdicts)
     if args.json_out:
         json_path = os.path.join(root, args.json_out)
         os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
         with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump({"exitCode": code, "version": version, "tasks": verdicts}, handle, indent=1)
+            json.dump({"exitCode": code, "version": version, "tasks": clean_verdicts}, handle, indent=1)
             handle.write("\n")
+
+    if fmt == "json":
+        passed_shards = len(clean_verdicts) - len(failed_shards)
+        errors = [f"[{v['label']}] {v['verdict']}" for v in clean_verdicts if v["exit"] != 0]
+        envelope = agent.json_envelope(
+            "cloud",
+            code,
+            summary={
+                "tasks": len(clean_verdicts),
+                "passed": passed_shards,
+                "failed": len(failed_shards),
+                **({"version": version} if version is not None else {}),
+            },
+            errors=errors,
+            data={"version": version, "tasks": clean_verdicts},
+        )
+        print(agent.json_dumps_compact(envelope), flush=True)
+    elif fmt == "agent":
+        head_status = "FAIL" if code != 0 else "OK"
+        ver_tag = f" version={version}" if version is not None else ""
+        out_lines = [f"{head_status} cloud tasks={len(clean_verdicts)} failed={len(failed_shards)}{ver_tag}"]
+        for v in verdicts:
+            if v["exit"] == 0:
+                continue
+            out_lines.append(f"FAIL shard {v['label']}: {v['verdict']}")
+            parsed = markers.parse(str(v.get("_output") or ""))
+            if parsed.tests:
+                detail = agent.format_run_agent(parsed, root=Path(root))
+                for ln in detail.splitlines()[1:]:
+                    out_lines.append(f"  {ln}")
+        print("\n".join(out_lines), flush=True)
+    else:
+        if shards and failed_shards:
+            note(f"failed shards: {', '.join(failed_shards)}")
+        _annotate_cloud_failures(verdicts)
     return code

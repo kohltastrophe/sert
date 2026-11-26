@@ -51,6 +51,13 @@ class LockAndPackTest(Case):
                 self.assertEqual(info.external_attr, 0o100644 << 16)
             self.assertIn("src/init.luau", names)
             self.assertIn("default.project.json", names)
+            self.assertIn("wally.toml", names)
+            self.assertIn("pesde.toml", names)
+            self.assertFalse(any(n.endswith(".py") for n in names))
+            import tomllib
+            wally = tomllib.loads(zf.read("wally.toml").decode("utf-8"))
+            pesde = tomllib.loads(zf.read("pesde.toml").decode("utf-8"))
+            self.assertEqual((wally["package"]["version"], pesde["version"]), (VERSION, VERSION))
 
         with zipfile.ZipFile(out1 / pyz_name) as zf:
             self.assertEqual(zf.read(pack.STUB_ENTRY), (REPO / "tools" / "sert.py").read_bytes())

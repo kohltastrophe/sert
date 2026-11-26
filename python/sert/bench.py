@@ -228,12 +228,9 @@ def run_bench(
     bench_args = run_mod.make_run_args(
         specs=list(getattr(args, "specs", None) or []),
         filter=getattr(args, "filter", None),
-        grep=getattr(args, "grep", None),
-        tag=list(getattr(args, "tag", None) or []),
-        exclude_tag=list(getattr(args, "exclude_tag", None) or []),
+        grep=list(getattr(args, "grep", None) or []),
         file=list(getattr(args, "file", None) or []),
         timeout=getattr(args, "timeout", None),
-        seed=getattr(args, "seed", None),
         jobs=getattr(args, "jobs", None),
         codegen=True,
         bench=True,
@@ -317,7 +314,8 @@ def add_parser(subparsers) -> argparse.ArgumentParser:
     )
     parser.add_argument("specs", nargs="*", help="optional benchmark spec files or directories")
     parser.add_argument("--filter", default=None, help="only run tests matching substring/pattern")
-    parser.add_argument("-g", "--grep", default=None, help="regex filter on full test name")
+    parser.add_argument("-g", "--grep", action="append", default=[], metavar="PATTERN", help="Luau pattern filter on full test name (repeatable)")
+    parser.add_argument("--file", action="append", default=[], metavar="FILE", help="restrict benchmarks to matching spec file (repeatable)")
     parser.add_argument("--save", metavar="NAME", default=None, help="save benchmark results under .sert/bench/NAME.json")
     parser.add_argument("--compare", metavar="NAME", default=None, help="compare against .sert/bench/NAME.json")
     parser.add_argument(
@@ -329,8 +327,10 @@ def add_parser(subparsers) -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=float, default=None, help="per-entry timeout in seconds")
     parser.add_argument("-j", "--jobs", type=int, default=None, help="max parallel entries")
+    parser.add_argument("--ci", action="store_true", help="enable strict CI checks")
     parser.add_argument("--agent", action="store_true", help="compact AI-agent-friendly benchmark output")
     parser.add_argument("--format", choices=("human", "agent", "json"), default=None, help="output format")
+    parser.add_argument("-a", dest="program_args", nargs=argparse.REMAINDER, default=[], help="extra flags forwarded to every entry")
     parser.set_defaults(func=cmd_bench)
     return parser
 

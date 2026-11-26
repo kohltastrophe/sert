@@ -20,7 +20,7 @@ import threading
 import time
 
 from sert import VERSION, agent, config as config_mod, coverage as coverage_mod, fetch, graph, luau_lex, run as run_mod
-from sert.util import FAILED, SertError, as_list, interrupt, load_json, strip_jsonc, step_summary, write_atomic
+from sert.util import FAILED, SertError, annotate, as_list, interrupt, load_json, on_github_actions, strip_jsonc, step_summary, write_atomic
 
 LONG_OPEN = re.compile(r"\[(=*)\[")
 
@@ -46,7 +46,7 @@ MUTANT_PREAMBLE = (
 DETECTED = ("KILLED",)
 BATCH_TIMEOUT_FACTOR = 16.0
 
-_FLIP_MAP = {"<=": ">=", ">=": "<=", "<": ">", ">": "<", "==": "~=", "~=": "=="}
+_FLIP_MAP = {"<=": "<", ">=": ">", "<": ">", ">": "<", "==": "~=", "~=": "=="}
 _ARITH_MAP = {"+": "-", "-": "+", "*": "/", "/": "*", "//": "*", "%": "*"}
 _COMPOUND_FLIP_MAP = {"+=": "-=", "-=": "+=", "*=": "/=", "/=": "*=", "//=": "*=", "%=": "*="}
 _COMPOUND_OPS = frozenset({"+=", "-=", "*=", "/=", "//=", "%=", "^=", "..="})
@@ -543,6 +543,111 @@ def _find_nil_guard_rhs_end(tokens: list[luau_lex.Token], in_type: list[bool], r
     return hi - 1
 
 
+def _is_defensive_len_nonneg(tokens: list[luau_lex.Token], in_type: list[bool], k: int, lo: int, hi: int) -> bool:
+    """Return True for defensive `#expr >= 0` or `0 <= #expr` length non-negativity checks."""
+    val = tokens[k].value
+    if val not in (">=", "<=") or k <= lo or k + 1 >= hi:
+        return False
+
+    def _lhs_tokens() -> list[luau_lex.Token]:
+        out: list[luau_lex.Token] = []
+        depth = 0
+        pos = k - 1
+        while pos >= lo:
+            if not in_type[pos]:
+                tk = tokens[pos]
+                if tk.kind == "OP" and not tk.is_type_angle:
+                    if tk.value in (")", "]", "}"):
+                        depth += 1
+                    elif tk.value in ("(", "[", "{"):
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif depth == 0 and tk.value in (",", "=", ";"):
+                        break
+                elif tk.kind == "KEYWORD" and depth == 0 and tk.value in (
+                    "if", "elseif", "then", "else", "while", "until", "do", "return", "and", "or", "not"
+                ):
+                    break
+                out.append(tk)
+            pos -= 1
+        out.reverse()
+        return out
+
+    def _rhs_tokens() -> list[luau_lex.Token]:
+        out: list[luau_lex.Token] = []
+        depth = 0
+        pos = k + 1
+        while pos < hi:
+            if not in_type[pos]:
+                tk = tokens[pos]
+                if tk.kind == "OP" and not tk.is_type_angle:
+                    if tk.value in ("(", "[", "{"):
+                        depth += 1
+                    elif tk.value in (")", "]", "}"):
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif depth == 0 and tk.value in (",", ";"):
+                        break
+                elif tk.kind == "KEYWORD" and depth == 0 and tk.value in (
+                    "then", "else", "elseif", "do", "end", "and", "or"
+                ):
+                    break
+                out.append(tk)
+            pos += 1
+        return out
+
+    lhs, rhs = _lhs_tokens(), _rhs_tokens()
+    if val == ">=":
+        return bool(lhs) and lhs[0].kind == "OP" and lhs[0].value == "#" and len(rhs) == 1 and rhs[0].kind == "NUMBER" and rhs[0].value in ("0", "0.0")
+    return len(lhs) == 1 and lhs[0].kind == "NUMBER" and lhs[0].value in ("0", "0.0") and bool(rhs) and rhs[0].kind == "OP" and rhs[0].value == "#"
+
+
+def _is_trivial_nil_guard_rhs(tokens: list[luau_lex.Token], in_type: list[bool], rhs_lo: int, rhs_hi: int) -> bool:
+    """Return True when `or <rhs>` falls back only to literal `nil` or `false`."""
+    clean = [tokens[idx] for idx in range(rhs_lo, rhs_hi + 1) if not in_type[idx]]
+    while len(clean) >= 2 and clean[0].kind == "OP" and clean[0].value == "(":
+        close = luau_lex.matching_close(clean, 0)
+        if close == len(clean) - 1:
+            clean = clean[1:-1]
+        else:
+            break
+    return len(clean) == 1 and clean[0].kind == "KEYWORD" and clean[0].value in ("nil", "false")
+
+
+def _is_balanced_if_expr(tokens: list[luau_lex.Token], in_type: list[bool], lo: int, hi: int) -> bool:
+    """Return True when every Luau `if ... then ... else ...` expression in `[lo, hi)` closes cleanly."""
+    fn_depth = 0
+    if_depth = 0
+    for k in range(lo, hi):
+        if in_type[k]:
+            continue
+        tk = tokens[k]
+        if tk.kind != "KEYWORD":
+            continue
+        if tk.value == "function":
+            fn_depth += 1
+        elif tk.value == "end":
+            if fn_depth > 0:
+                fn_depth -= 1
+            else:
+                return False
+        elif fn_depth == 0:
+            if tk.value == "if":
+                if_depth += 1
+            elif tk.value == "then":
+                if if_depth <= 0:
+                    return False
+            elif tk.value == "else":
+                if if_depth <= 0:
+                    return False
+                if_depth -= 1
+            elif tk.value in ("do", "repeat", "until"):
+                return False
+    return if_depth == 0 and fn_depth == 0
+
+
 def _expr_mutants(
     tokens: list[luau_lex.Token],
     in_type: list[bool],
@@ -577,6 +682,7 @@ def _expr_mutants(
                 has_logic = True
 
     rel_muts: list[tuple[str, str]] = []
+    cond_muts: list[tuple[str, str]] = []
     arith_muts: list[tuple[str, str]] = []
     logic_muts: list[tuple[str, str]] = []
     math_muts: list[tuple[str, str]] = []
@@ -617,13 +723,43 @@ def _expr_mutants(
             continue
         if tok.kind == "KEYWORD":
             if tok.value in ("if", "elseif"):
+                if "cond_inv" in ops and k + 1 < hi:
+                    t_idx = k + 1
+                    sub_fn = 0
+                    sub_if = 0
+                    found_then = -1
+                    while t_idx < hi:
+                        if not in_type[t_idx]:
+                            ttk = tokens[t_idx]
+                            if ttk.kind == "KEYWORD":
+                                if ttk.value == "function":
+                                    sub_fn += 1
+                                elif ttk.value == "end" and sub_fn > 0:
+                                    sub_fn -= 1
+                                elif sub_fn == 0:
+                                    if ttk.value == "if":
+                                        sub_if += 1
+                                    elif ttk.value == "else" and sub_if > 0:
+                                        sub_if -= 1
+                                    elif ttk.value == "then" and sub_if == 0:
+                                        found_then = t_idx
+                                        break
+                        t_idx += 1
+                    if found_then > k + 1:
+                        c_start = tokens[k + 1].start
+                        c_end = tokens[found_then - 1].end
+                        c_txt = source[c_start:c_end].strip()
+                        if c_txt not in ("true", "false"):
+                            cond_muts.append(("cond_inv", replace_span(c_start, c_end, f"not ({c_txt})")))
                 ternary_cond_depth += 1
             elif tok.value == "then" and ternary_cond_depth > 0:
                 ternary_cond_depth -= 1
 
-        # 1. Relational flip (`rel_flip`) — never touches `tok.is_type_angle`!
+        # 1. Relational flip (`rel_flip`) — never touches `tok.is_type_angle` or defensive `#len >= 0`!
         if "rel_flip" in ops and tok.kind == "OP" and not tok.is_type_angle and tok.value in _FLIP_MAP:
-            if not (skip_simple_eq and not has_logic and tok.value in ("==", "~=")):
+            if not (skip_simple_eq and not has_logic and tok.value in ("==", "~=")) and not _is_defensive_len_nonneg(
+                tokens, in_type, k, lo, hi
+            ):
                 rel_muts.append(("rel_flip", replace_span(tok.start, tok.end, _FLIP_MAP[tok.value])))
 
         # 2. Arithmetic flip (`arith_op`) — distinguishes binary `-` from unary `-`!
@@ -734,7 +870,7 @@ def _expr_mutants(
             and k + 1 < hi
         ):
             rhs_last = _find_nil_guard_rhs_end(tokens, in_type, k + 1, hi)
-            if rhs_last >= k + 1:
+            if rhs_last >= k + 1 and not _is_trivial_nil_guard_rhs(tokens, in_type, k + 1, rhs_last):
                 nil_guard_muts.append(("nil_guard", replace_span(tokens[k - 1].end, tokens[rhs_last].end, "")))
 
         # 7. Remote handler runtime type guard removal (`remote_guard`)
@@ -801,7 +937,7 @@ def _expr_mutants(
                     rep = "true" if tokens[k + 1].value == "==" else "false"
                     remote_guard_muts.append(("remote_guard", replace_span(tok.start, tokens[after_p - 1].end, rep)))
 
-    return rel_muts + arith_muts + logic_muts + math_muts + off_by_one_muts + nil_guard_muts + remote_guard_muts
+    return rel_muts + cond_muts + arith_muts + logic_muts + math_muts + off_by_one_muts + nil_guard_muts + remote_guard_muts
 
 
 def _split_top_level_commas(tokens: list[luau_lex.Token], in_type: list[bool], lo: int, hi: int) -> list[tuple[int, int]]:
@@ -897,9 +1033,109 @@ def _mutate_token_slice(
             elif tk.value == ";" and depth == 0:
                 return None
 
-    # 1. `if <cond> then` / `elseif <cond> then` / `while <cond> do` / `until <cond>`
+    # 1. `if <cond> then` / `elseif <cond> then` / `while <cond> do` / `until <cond>` (+ single-line `... end`)
     if first.kind == "KEYWORD" and first.value in ("if", "elseif", "while", "until"):
         kw = first.value
+        if kw in ("if", "while") and last.kind == "KEYWORD" and last.value == "end" and hi - lo >= 5:
+            expected_end = "do" if kw == "while" else "then"
+            sep_idx = -1
+            c_depth = 0
+            if_expr_depth = 0
+            bad_single = False
+            for k in range(lo + 1, hi - 1):
+                if in_type[k]:
+                    continue
+                tk = tokens[k]
+                if tk.kind == "INTERP_BEGIN":
+                    c_depth += 1
+                elif tk.kind == "INTERP_END":
+                    c_depth = max(0, c_depth - 1)
+                elif tk.kind == "OP" and not tk.is_type_angle:
+                    if tk.value in ("(", "{", "["):
+                        c_depth += 1
+                    elif tk.value in (")", "}", "]"):
+                        c_depth = max(0, c_depth - 1)
+                elif tk.kind == "KEYWORD" and c_depth == 0:
+                    if tk.value == "if":
+                        if_expr_depth += 1
+                    elif tk.value == "else" and if_expr_depth > 0:
+                        if_expr_depth -= 1
+                    elif tk.value == expected_end and if_expr_depth == 0:
+                        sep_idx = k
+                        break
+                    elif tk.value in ("then", "elseif") and if_expr_depth > 0:
+                        continue
+                    elif tk.value in ("then", "elseif", "else", "do", "end", "repeat", "function"):
+                        bad_single = True
+                        break
+            body_lo = sep_idx + 1
+            body_hi = hi - 1
+            if (
+                not bad_single
+                and if_expr_depth == 0
+                and c_depth == 0
+                and sep_idx > lo + 1
+                and body_lo < body_hi
+                and not _has_block_statements(tokens, in_type, body_lo, body_hi)
+            ):
+                # Reject nested `else` / `elseif` inside the single-line body outside ternary expressions.
+                has_top_branch = not _is_balanced_if_expr(tokens, in_type, body_lo, body_hi)
+                if not has_top_branch:
+                    cond_lo, cond_hi = lo + 1, sep_idx
+                    cond_src = source[tokens[cond_lo].start : tokens[cond_hi - 1].end]
+                    body_src = source[tokens[body_lo].start : tokens[body_hi - 1].end]
+                    cond_muts: list[tuple[str, str, str]] = []
+                    has_cond_inv = False
+                    is_trivial_loop_const = kw == "while" and cond_src.strip() in ("true", "false")
+                    if "cond_inv" in ops and not is_trivial_loop_const and room(len(cond_muts)):
+                        has_cond_inv = True
+                        desc = f"{kw} not ({cond_src}) {expected_end} {body_src} end"
+                        cond_muts.append(("cond_inv", f"not ({cond_src})", desc))
+                    for op_name, mut_expr in _expr_mutants(
+                        tokens,
+                        in_type,
+                        cond_lo,
+                        cond_hi,
+                        source,
+                        ops,
+                        skip_simple_eq=has_cond_inv,
+                        in_remote=in_remote,
+                    ):
+                        if not room(len(cond_muts)):
+                            break
+                        desc = f"{kw} {mut_expr} {expected_end} {body_src} end"
+                        cond_muts.append((op_name, f"({mut_expr})", desc))
+
+                    cond_expr_out = cond_src
+                    if cond_muts:
+                        trace_key: int | None = None
+                        branches: list[str] = []
+                        for idx, (op_name, expr, desc) in enumerate(cond_muts):
+                            mid = add_mutant(op_name, stmt_src, desc, trace_key=trace_key)
+                            if trace_key is None:
+                                trace_key = mid
+                            branches.append(f"{'if' if idx == 0 else 'elseif'} {SWITCH} == {mid} then {expr}")
+                        cond_expr_out = f"({' '.join(branches)} elseif {SWITCH} == -1 and _SERT_M.h({trace_key}) then false else ({cond_src}))"
+
+                    body_repl = _mutate_token_slice(
+                        tokens,
+                        in_type,
+                        body_lo,
+                        body_hi,
+                        source,
+                        ops,
+                        room,
+                        add_mutant,
+                        extra_benign_res,
+                        extra_cosmetic_re,
+                        is_early_guard=(kw == "if"),
+                        in_remote=in_remote,
+                    )
+                    if not cond_muts and body_repl is None:
+                        return None
+                    return f"{kw} {cond_expr_out} {expected_end} {body_repl or body_src} end"
+            return None
+
         if kw in ("if", "elseif", "while"):
             expected_end = "do" if kw == "while" else "then"
             if last.kind != "KEYWORD" or last.value != expected_end or hi - lo < 3:
@@ -1032,8 +1268,8 @@ def _mutate_token_slice(
             assert trace_key is not None
             return _wrap_trace(trace_key, f"{' '.join(conds)} end return {rhs_full_src}")
 
-        # General single or multi-expression `return expr1, expr2, ...`
-        if tokens[lo + 1].kind == "KEYWORD" and tokens[lo + 1].value == "if":
+        # General single or multi-expression `return expr1, expr2, ...` (including inline `if ... then ... else ...`)
+        if tokens[lo + 1].kind == "KEYWORD" and tokens[lo + 1].value == "if" and not _is_balanced_if_expr(tokens, in_type, lo + 1, hi):
             return None
         # Skip `return function(...) ... end` (its inner statements are mutated instead!)
         if len(ret_segs) == 1 and tokens[lo + 1].kind == "KEYWORD" and tokens[lo + 1].value == "function":
@@ -1107,8 +1343,10 @@ def _mutate_token_slice(
             return None
         if _has_block_statements(tokens, in_type, eq_idx + 1, hi):
             return None
-        # Skip `local f = function(...)` when single-line or multi-line closure
-        if tokens[eq_idx + 1].kind == "KEYWORD" and tokens[eq_idx + 1].value in ("function", "if"):
+        # Skip `local f = function(...)` and unbalanced multi-line `local v = if ...` expressions
+        if tokens[eq_idx + 1].kind == "KEYWORD" and tokens[eq_idx + 1].value == "function":
+            return None
+        if tokens[eq_idx + 1].kind == "KEYWORD" and tokens[eq_idx + 1].value == "if" and not _is_balanced_if_expr(tokens, in_type, eq_idx + 1, hi):
             return None
 
         lhs_decl = source[first.start : tokens[eq_idx].start].rstrip()
@@ -1258,7 +1496,13 @@ def _mutate_token_slice(
     if assign_idx > lo and assign_idx + 1 < hi:
         if _has_block_statements(tokens, in_type, assign_idx + 1, hi):
             return None
-        if tokens[assign_idx + 1].kind == "KEYWORD" and tokens[assign_idx + 1].value in ("function", "if"):
+        if tokens[assign_idx + 1].kind == "KEYWORD" and tokens[assign_idx + 1].value == "function":
+            return None
+        if (
+            tokens[assign_idx + 1].kind == "KEYWORD"
+            and tokens[assign_idx + 1].value == "if"
+            and not _is_balanced_if_expr(tokens, in_type, assign_idx + 1, hi)
+        ):
             return None
         lhs_src = source[first.start : tokens[assign_idx].start].rstrip()
         rhs_lo, rhs_hi = assign_idx + 1, hi
@@ -1723,10 +1967,6 @@ def _check_staged_compile_err(luau_bin: str, staged_path: Path, runner: str = "l
     return False, f"{res.stderr or ''}\n{res.stdout or ''}"
 
 
-def _check_staged_compiles(luau_bin: str, staged_path: Path, runner: str = "luau") -> bool:
-    return _check_staged_compile_err(luau_bin, staged_path, runner=runner)[0]
-
-
 def _write_unlinked(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
@@ -1743,6 +1983,19 @@ def _extract_compile_err_lines(err: str) -> list[int]:
     return lines
 
 
+def _compile_check_source(src: str, original_source: str, wrap: bool) -> str:
+    if wrap:
+        return wrap_staged_source(src, original_source)
+    # Compile-check unwrapped modules inside an uncalled `return function(...)` wrapper on line 1 of code
+    # so Roblox globals / side effects do not execute during staging while preserving 1:1 error line numbers.
+    direct = _direct_source(src)
+    offset = luau_lex.first_code_offset(direct)
+    if offset >= len(direct):
+        sep = "" if not direct or direct.endswith("\n") else "\n"
+        return f"{direct}{sep}return function(...) end\n"
+    return f"{direct[:offset]}return function(...) {direct[offset:]}\nend\n"
+
+
 def compile_and_stage_file(
     luau_bin: str,
     original_source: str,
@@ -1753,11 +2006,14 @@ def compile_and_stage_file(
     wrap: bool = True,
     runner: str = "luau",
 ) -> list[Mutant]:
-    _write_unlinked(staged_path, wrap_staged_source(instrumented_source, original_source))
+    def _format_final(src: str) -> str:
+        return wrap_staged_source(src, original_source) if wrap else _direct_source(src)
+
+    _write_unlinked(staged_path, _compile_check_source(instrumented_source, original_source, wrap))
     ok, err = _check_staged_compile_err(luau_bin, staged_path, runner=runner)
     if ok:
         if not wrap:
-            _write_unlinked(staged_path, _direct_source(instrumented_source))
+            _write_unlinked(staged_path, _format_final(instrumented_source))
         return mutants
 
     orig_lines, inst_lines = original_source.split("\n"), instrumented_source.split("\n")
@@ -1779,12 +2035,12 @@ def compile_and_stage_file(
             break
         peel_lines[target_ln - 1] = orig_lines[target_ln - 1]
         active_lines.remove(target_ln)
-        _write_unlinked(staged_path, wrap_staged_source("\n".join(peel_lines), original_source))
+        _write_unlinked(staged_path, _compile_check_source("\n".join(peel_lines), original_source, wrap))
         ok, err = _check_staged_compile_err(luau_bin, staged_path, runner=runner)
 
     if ok:
         if not wrap:
-            _write_unlinked(staged_path, _direct_source("\n".join(peel_lines)))
+            _write_unlinked(staged_path, _format_final("\n".join(peel_lines)))
         return [m for m in mutants if m.line in active_lines]
 
     working_lines = list(orig_lines)
@@ -1796,8 +2052,8 @@ def compile_and_stage_file(
         saved = [working_lines[ln - 1] for ln in chunk]
         for ln in chunk:
             working_lines[ln - 1] = inst_lines[ln - 1]
-        _write_unlinked(staged_path, wrap_staged_source("\n".join(working_lines), original_source))
-        if _check_staged_compiles(luau_bin, staged_path, runner=runner):
+        _write_unlinked(staged_path, _compile_check_source("\n".join(working_lines), original_source, wrap))
+        if _check_staged_compile_err(luau_bin, staged_path, runner=runner)[0]:
             valid_lines.update(chunk)
             return
         for ln, orig_line in zip(chunk, saved):
@@ -1810,8 +2066,7 @@ def compile_and_stage_file(
 
     _bisect(sorted({m.line for m in mutants}))
 
-    final_source = "\n".join(working_lines)
-    _write_unlinked(staged_path, wrap_staged_source(final_source, original_source) if wrap else _direct_source(final_source))
+    _write_unlinked(staged_path, _format_final("\n".join(working_lines)))
     return [m for m in mutants if m.line in valid_lines]
 
 
@@ -2013,8 +2268,6 @@ def _evaluate_batch_on_entry(
         retry_on_timeout=not timed_out,
         mutant_tests=mutant_tests,
     )
-    if timed_out and head.status == "PENDING":
-        head.status = "TIMEOUT"
     tail = remaining[1:]
     if tail:
         _evaluate_batch_on_entry(
@@ -2036,18 +2289,19 @@ def _evaluate_mutant_batch(
 ) -> tuple[Mutant | None, list[Mutant]] | None:
     if not batch or not entries:
         return None, []
-    if len(batch) == 1:
-        batch[0].status = _evaluate_one_mutant(
-            batch[0],
-            root,
-            runner,
-            luau_bin,
-            entries,
-            timeout_sec,
-            codegen,
-            program_args,
-            mutant_tests=mutant_tests,
-        )
+    if len(batch) == 1 or any(m.top_level for m in batch):
+        for m in batch:
+            m.status = _evaluate_one_mutant(
+                m,
+                root,
+                runner,
+                luau_bin,
+                entries,
+                timeout_sec,
+                codegen,
+                program_args,
+                mutant_tests=mutant_tests,
+            )
         return None, []
 
     # Multi-entry batching: run `--mutants=...` on entry[0], then carry only SURVIVED mutants to entry[1], etc.
@@ -2474,6 +2728,7 @@ def _mutant_cache_key(
     version: str = VERSION,
     cache_mode: str = "scoped",
     extra: object = None,
+    env_hash: str | None = None,
 ) -> str:
     data: dict[str, object] = {
         "file_tokens": file_tokens_hash,
@@ -2487,7 +2742,74 @@ def _mutant_cache_key(
     }
     if extra is not None:
         data["extra"] = extra
+    if env_hash is not None:
+        data["env"] = env_hash
     payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _mutate_env_hash(
+    cfg: config_mod.Config,
+    runner: str,
+    codegen: bool,
+    program_args: list[str] | tuple[str, ...],
+    all_specs: list[str] | tuple[str, ...],
+    sha_memo: dict[str, str],
+) -> str:
+    root = cfg.root
+    candidates: set[str] = {"sert.toml", "sert.local.toml", ".luaurc", "test/.sert-regressions.toml"}
+    setup_val = cfg.table("test").get("setup")
+    if isinstance(setup_val, str):
+        candidates.add(setup_val.replace("\\", "/").lstrip("./"))
+    elif isinstance(setup_val, (list, tuple)):
+        for item in setup_val:
+            if item:
+                candidates.add(str(item).replace("\\", "/").lstrip("./"))
+
+    test_dir = root / "test"
+    if test_dir.is_dir():
+        for dirpath, dirnames, filenames in os.walk(test_dir):
+            dirnames[:] = [d for d in dirnames if d not in (".sert", ".git", "node_modules")]
+            dp = Path(dirpath)
+            for fname in filenames:
+                if fname in (".config.luau", "init.config.luau") or fname.endswith(".snap"):
+                    candidates.add((dp / fname).relative_to(root).as_posix())
+
+    for spec in all_specs:
+        sp = (root / spec).parent
+        while True:
+            for cfg_name in (".config.luau", "init.config.luau"):
+                cf = sp / cfg_name
+                if cf.is_file():
+                    candidates.add(cf.relative_to(root).as_posix())
+            for snap in sp.glob("*.snap"):
+                if snap.is_file():
+                    candidates.add(snap.relative_to(root).as_posix())
+            snap_dir = sp / "__snapshots__"
+            if snap_dir.is_dir():
+                for snap in snap_dir.glob("*.snap"):
+                    if snap.is_file():
+                        candidates.add(snap.relative_to(root).as_posix())
+            if sp == root or root not in sp.parents:
+                break
+            sp = sp.parent
+
+    env_files: list[tuple[str, str]] = []
+    for rel in sorted(candidates):
+        if rel.startswith(".sert/"):
+            continue
+        if (root / rel).is_file():
+            env_files.append((rel, _file_sha256_cached(root, rel, sha_memo)))
+    payload = json.dumps(
+        {
+            "runner": runner,
+            "codegen": bool(codegen),
+            "program_args": list(program_args),
+            "files": env_files,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -2878,8 +3200,32 @@ def _pack_adaptive_batches(
     return batches
 
 
-def main(args) -> int:
-    fmt = agent.output_format(args)
+@dataclass(slots=True)
+class _MutateSettings:
+    cfg: config_mod.Config
+    cache_mode: str
+    codegen: bool
+    benign_calls: list[str]
+    cosmetic_props: list[str]
+    operators: tuple[str, ...]
+    source_prefixes: list[str]
+    include: list[str]
+    exclude: list[str]
+    explicit_timeout: bool
+    timeout_sec: float
+    minimum: float | int | None
+    max_mutants: int | None
+    jobs: int
+    specs_map: dict[str, str]
+    program_args: list[str]
+    no_cache: bool
+
+
+def _is_verified_cov(entry: object) -> bool:
+    return isinstance(entry, dict) and entry.get("exact") is not False and "sha256" in entry
+
+
+def _resolve_mutate_settings(args) -> _MutateSettings:
     no_cache = bool(getattr(args, "no_cache", False))
     strict_cache = bool(getattr(args, "strict_cache", False))
     cfg = config_mod.from_args(args)
@@ -2916,870 +3262,847 @@ def main(args) -> int:
     jobs = int(args.jobs if args.jobs is not None else (table.get("jobs") or os.cpu_count() or 4))
     specs_map = table.get("specs") if isinstance(table.get("specs"), dict) else {}
     program_args = [str(arg) for arg in (getattr(args, "program_args", None) or [])]
+    return _MutateSettings(
+        cfg=cfg,
+        cache_mode=cache_mode,
+        codegen=codegen,
+        benign_calls=benign_calls,
+        cosmetic_props=cosmetic_props,
+        operators=operators,
+        source_prefixes=source_prefixes,
+        include=include,
+        exclude=exclude,
+        explicit_timeout=explicit_timeout,
+        timeout_sec=timeout_sec,
+        minimum=minimum,
+        max_mutants=max_mutants,
+        jobs=jobs,
+        specs_map=specs_map,
+        program_args=program_args,
+        no_cache=no_cache,
+    )
 
-    fetch.refresh_overrides(cfg)
-    fetch.ensure_fetched(cfg)
-    cov_path = cfg.root / str(args.coverage_file or "coverage.out")
-    if args.no_coverage_run and not cov_path.is_file():
-        raise SertError(f"mutate: cannot read {cov_path}: file not found")
-    need_cov_run = not cov_path.is_file() and not args.no_coverage_run
-    entries, runner = run_mod.resolve_entries(cfg), run_mod.runner_of(cfg, coverage=need_cov_run)
-    for entry in entries:
-        if not (cfg.root / entry).is_file():
-            raise SertError(f"[test].entries: {entry} not found")
-    stage_spec = cfg.get("test.stage")
-    if stage_spec:
-        run_mod.stage_project(cfg, str(stage_spec))
 
-    luau_bin = run_mod.luau_command(cfg.root, runner)
-    if os.sep in luau_bin or (os.altsep and os.altsep in luau_bin):
-        luau_bin = os.path.abspath(luau_bin)
-
+def _prepare_baseline_coverage(
+    settings: _MutateSettings,
+    args,
+    entries: list[str],
+    runner: str,
+    cov_files: dict[str, dict[int, int]] | None,
+) -> dict[str, dict[int, bool]]:
+    cfg = settings.cfg
+    cov_path = coverage_mod.output_path(cfg, cfg.root, args.coverage_file)
     if not cov_path.is_file():
         if args.no_coverage_run:
             raise SertError(f"mutate: cannot read {cov_path}: file not found")
         cov_path.parent.mkdir(parents=True, exist_ok=True)
-        coverage_out = cfg.root / "coverage.out"
-        prior_coverage = coverage_out.read_bytes() if (cov_path != coverage_out and coverage_out.is_file()) else None
+        run_cov_target = coverage_mod.output_path(cfg, cfg.root)
+        prior_cov = run_cov_target.read_bytes() if (cov_path != run_cov_target and run_cov_target.is_file()) else None
         try:
-            baseline = run_mod.run_entries(cfg, entries, runner=runner, coverage=True, echo=False, markers=False, program_args=program_args)
+            baseline = run_mod.run_entries(
+                cfg,
+                entries,
+                runner=runner,
+                coverage=True,
+                echo=False,
+                markers=False,
+                program_args=settings.program_args,
+            )
             if baseline.status != 0:
                 detail = "\n".join(run.output.strip() for run in baseline.entries if run.code != 0 and run.output.strip())
                 raise SertError(
                     f"mutate: the baseline `sert run --coverage` failed (status {baseline.status}); the unmutated suite must pass before mutants can be scored"
                     + (f"\n{detail[-4000:]}" if detail else "")
                 )
-            if cov_path != coverage_out and coverage_out.is_file():
-                cov_path.write_text(coverage_out.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+            if cov_path != run_cov_target and run_cov_target.is_file():
+                cov_path.write_text(run_cov_target.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
         finally:
-            if cov_path != coverage_out:
-                if prior_coverage is not None:
-                    coverage_out.write_bytes(prior_coverage)
-                elif coverage_out.is_file():
-                    coverage_out.unlink()
+            if cov_path != run_cov_target:
+                if prior_cov is not None:
+                    run_cov_target.write_bytes(prior_cov)
+                elif run_cov_target.is_file():
+                    run_cov_target.unlink()
         if not cov_path.is_file():
-            raise SertError("mutate: baseline `sert run --coverage` did not produce coverage.out")
+            raise SertError(f"mutate: baseline `sert run --coverage` did not produce {cov_path.name}")
 
+    if cov_files is not None:
+        return root_relative_coverage(cov_files, cfg.root)
     try:
-        cov_files = root_relative_coverage(coverage_mod.parse(cov_path), cfg.root)
+        return root_relative_coverage(coverage_mod.parse(cov_path), cfg.root)
     except OSError as err:
         raise SertError(f"mutate: cannot read {cov_path}: {err}")
 
-    diff_rev = getattr(args, "diff", None)
-    if diff_rev:
-        diff_lines = coverage_mod.git_diff_lines(cfg.root, str(diff_rev))
-        cov_files = coverage_mod.filter_diff_files(cov_files, diff_lines)
 
-    chosen = coverage_mod.chosen_files(cov_files, include, exclude)
-    target_files = [
-        rel
-        for rel in sorted(chosen)
-        if not rel.endswith("core/mutant.luau") and (cfg.root / rel).is_file() and any(chosen[rel].values())
-    ]
-    if not target_files:
-        if diff_rev:
-            if fmt == "json":
-                payload = agent.json_envelope(
-                    "mutate",
-                    "ok",
-                    summary={"score": 100.0, "total": 0, "killed": 0, "survived": 0, "timeout": 0, "cached": 0},
-                    data={"mutants": [], "skipped": True, "reason": "no covered lines modified in diff"},
-                    exit_code=0,
-                )
-                print(agent.json_dumps_compact(payload))
-            elif fmt == "agent":
-                print("OK mutation_score=100.0% killed=0 survived=0 timeout=0 uncovered=0 total=0")
-            else:
-                print("mutate: no covered lines modified in diff; skipping")
-            return 0
-        raise SertError(f"mutate: no covered files under {', '.join(include)}")
+def _resolve_trace_and_coverage_maps(
+    cfg: config_mod.Config,
+    work_root: Path,
+    luau_bin: str,
+    entries: list[str],
+    staged_tasks: list[tuple[Path, Path, str, str, list[Mutant]]],
+    all_mutants: list[Mutant],
+    pool: ThreadPoolExecutor,
+    *,
+    runner: str,
+    timeout_sec: float,
+    codegen: bool,
+    program_args: list[str],
+    dep_graph,
+):
+    all_specs = graph.discover_specs(cfg.root, cfg)
+    if dep_graph is None:
+        dep_graph = graph.build_graph(cfg.root, cfg)
+    cov_map = graph.load_coverage_map(cfg.root)
+    trace_path = cfg.root / TRACE_MAP_FILE
+    trace_map = _load_trace_map(trace_path)
+    spec_sha_memo: dict[str, str] = {}
+    all_specs_norm = [graph._norm_rel(s, cfg.root) for s in all_specs]
+    raw_specs_cov = cov_map.get("specs") if isinstance(cov_map.get("specs"), dict) else {}
+    specs_cov = {graph._norm_rel(k, cfg.root): v for k, v in raw_specs_cov.items() if isinstance(v, dict)}
+    raw_trace_specs = trace_map.get("specs") if isinstance(trace_map.get("specs"), dict) else {}
+    trace_specs = {graph._norm_rel(k, cfg.root): v for k, v in raw_trace_specs.items() if isinstance(v, dict)}
 
-    wrap_staged = bool(stage_spec)
-    all_mutants: list[Mutant] = []
-    next_id = 1
-    work_root = build_overlay(cfg.root, set(target_files))
-    stage_files_dir = (work_root / ".sert" / "stage" / "lexical") if stage_spec else work_root
-    prev_sigterm = signal.signal(signal.SIGTERM, interrupt) if threading.current_thread() is threading.main_thread() else None
+    tokens_digest_by_file: dict[str, str] = {
+        file_muts[0].file: _normalized_tokens_digest(source_text)
+        for _sp, _stp, source_text, _inst, file_muts in staged_tasks
+        if file_muts
+    }
+    instr_lines_by_norm: dict[str, set[int]] = {}
+    key_to_file_line: dict[int, tuple[str, int]] = {}
+    for m in all_mutants:
+        m_norm = graph._norm_rel(m.file, cfg.root)
+        instr_lines_by_norm.setdefault(m_norm, set()).add(m.line)
+        key_to_file_line[m.line_key] = (m_norm, m.line)
+    file_trace_sig_by_norm: dict[str, str] = {}
+    for _sp, _stp, _source_text, _inst, file_muts in staged_tasks:
+        if not file_muts:
+            continue
+        f_raw = file_muts[0].file
+        f_norm = graph._norm_rel(f_raw, cfg.root)
+        file_trace_sig_by_norm[f_norm] = _file_trace_sig(
+            tokens_digest_by_file[f_raw], instr_lines_by_norm.get(f_norm, set())
+        )
 
-    try:
-        staged_tasks: list[tuple[Path, Path, str, str, list[Mutant]]] = []
-        for rel_path in target_files:
-            src_path = _guard_inside(work_root, work_root / rel_path)
-            if max_mutants is not None and next_id - 1 >= max_mutants:
-                if not src_path.exists():
-                    _link_file(cfg.root / rel_path, src_path)
-                continue
-            staged_path = _guard_inside(work_root, stage_files_dir / rel_path)
-            source_text = (cfg.root / rel_path).read_text(encoding="utf-8", errors="replace")
-            remaining = (max_mutants - (next_id - 1)) if max_mutants is not None else None
-            instrumented, file_mutants = instrument_source(
-                source_text,
-                cov_files[rel_path],
-                file_path=rel_path,
-                start_id=next_id,
-                operators=operators,
-                max_mutants=remaining,
-                spec_filter=resolve_spec_filter(rel_path, specs_map),
-                benign_calls=benign_calls,
-                cosmetic_props=cosmetic_props,
-            )
-            if not file_mutants:
-                # Ensure unmutated target file still exists in overlay if skipped
-                if not src_path.exists():
-                    _link_file(cfg.root / rel_path, src_path)
-                continue
-            staged_tasks.append((src_path, staged_path, source_text, instrumented, file_mutants))
-            next_id = file_mutants[-1].id + 1
+    uses_file_override = any(
+        isinstance(m.spec_filter, str) and m.spec_filter.startswith("@file=")
+        for m in all_mutants
+    )
+    has_unfiltered = any(m.spec_filter is None for m in all_mutants)
+    has_sert_specs = bool(cfg.get("test.specs")) or any(".spec." in s for s in all_specs_norm)
+    should_probe = (
+        runner == "luau"
+        and len(all_specs_norm) >= 1
+        and (len(all_specs_norm) > 1 or has_sert_specs)
+        and (has_unfiltered or uses_file_override or len(all_specs_norm) == 1)
+    )
+    probed: dict[str, dict[str, object]] = {}
+    if should_probe:
+        map_specs = cov_map.setdefault("specs", {})
+        t_map_specs = trace_map.setdefault("specs", {})
+        stale_deleted = [k for k in list(map_specs) if not (cfg.root / graph._norm_rel(k, cfg.root)).is_file()]
+        for dead_key in stale_deleted:
+            del map_specs[dead_key]
+        t_deleted = [k for k in list(t_map_specs) if not (cfg.root / graph._norm_rel(k, cfg.root)).is_file()]
+        for dead_key in t_deleted:
+            del t_map_specs[dead_key]
+        if stale_deleted:
+            specs_cov = {graph._norm_rel(k, cfg.root): v for k, v in map_specs.items() if isinstance(v, dict)}
+        if t_deleted:
+            trace_specs = {graph._norm_rel(k, cfg.root): v for k, v in t_map_specs.items() if isinstance(v, dict)}
 
-        # Refresh `.luaurc` aliases in overlay now that mutated target paths exist or will be written
-        for src_path, _staged_path, source_text, _instrumented, _file_mutants in staged_tasks:
-            if not src_path.exists():
-                _write_unlinked(src_path, source_text)
-        retarget_luaurc_aliases(cfg.root, work_root)
-
-        pool = ThreadPoolExecutor(max_workers=max(1, jobs))
-        try:
-            extra_kw = {"runner": runner} if runner != "luau" else {}
-            if len(staged_tasks) == 1:
-                src_path, staged_path, source_text, instrumented, file_mutants = staged_tasks[0]
-                compiled_lists = [
-                    compile_and_stage_file(luau_bin, source_text, instrumented, file_mutants, staged_path, wrap=wrap_staged, **extra_kw)
-                ]
-            else:
-                stage_futs = [
-                    pool.submit(compile_and_stage_file, luau_bin, source_text, instrumented, file_mutants, staged_path, wrap=wrap_staged, **extra_kw)
-                    for _src_path, staged_path, source_text, instrumented, file_mutants in staged_tasks
-                ]
-                compiled_lists = [fut.result() for fut in stage_futs]
-
-            for (src_path, _staged_path, source_text, instrumented, file_mutants), valid_mutants in zip(staged_tasks, compiled_lists):
-                if wrap_staged and valid_mutants:
-                    if len(valid_mutants) == len(file_mutants):
-                        merged_source = instrumented
-                    else:
-                        valid_lines = {m.line for m in valid_mutants}
-                        orig_lines, inst_lines = source_text.split("\n"), instrumented.split("\n")
-                        merged_source = "\n".join(inst_lines[idx] if (idx + 1) in valid_lines else orig_lines[idx] for idx in range(len(orig_lines)))
-                    _write_unlinked(_guard_inside(work_root, src_path), _direct_source(merged_source))
-                all_mutants.extend(valid_mutants)
-
-            if not all_mutants:
-                raise SertError(f"mutate: no mutable covered statements found under {', '.join(include)}")
-
-            # Resolve 1-pass LCOV + `--trace-mutants` coverage per `(rel_path, line)` and test index.
-            all_specs = graph.discover_specs(cfg.root, cfg)
-            dep_graph = graph.build_graph(cfg.root, cfg)
-            cov_map = graph.load_coverage_map(cfg.root)
-            trace_path = cfg.root / TRACE_MAP_FILE
-            trace_map = _load_trace_map(trace_path)
-            spec_sha_memo: dict[str, str] = {}
-            all_specs_norm = [graph._norm_rel(s, cfg.root) for s in all_specs]
-            raw_specs_cov = cov_map.get("specs") if isinstance(cov_map.get("specs"), dict) else {}
-            specs_cov = {
-                graph._norm_rel(k, cfg.root): v
-                for k, v in raw_specs_cov.items()
-                if isinstance(v, dict)
-            }
-            raw_trace_specs = trace_map.get("specs") if isinstance(trace_map.get("specs"), dict) else {}
-            trace_specs = {
-                graph._norm_rel(k, cfg.root): v
-                for k, v in raw_trace_specs.items()
-                if isinstance(v, dict)
-            }
-
-            tokens_digest_by_file: dict[str, str] = {
-                file_muts[0].file: _normalized_tokens_digest(source_text)
-                for _sp, _stp, source_text, _inst, file_muts in staged_tasks
-                if file_muts
-            }
-            instr_lines_by_norm: dict[str, set[int]] = {}
-            key_to_file_line: dict[int, tuple[str, int]] = {}
-            for m in all_mutants:
-                m_norm = graph._norm_rel(m.file, cfg.root)
-                instr_lines_by_norm.setdefault(m_norm, set()).add(m.line)
-                key_to_file_line[m.line_key] = (m_norm, m.line)
-            file_trace_sig_by_norm: dict[str, str] = {}
-            for _sp, _stp, _source_text, _inst, file_muts in staged_tasks:
-                if not file_muts:
-                    continue
-                f_raw = file_muts[0].file
-                f_norm = graph._norm_rel(f_raw, cfg.root)
-                file_trace_sig_by_norm[f_norm] = _file_trace_sig(
-                    tokens_digest_by_file[f_raw], instr_lines_by_norm.get(f_norm, set())
-                )
-
-            uses_file_override = any(
-                isinstance(m.spec_filter, str) and m.spec_filter.startswith("@file=")
-                for m in all_mutants
-            )
-            has_unfiltered = any(m.spec_filter is None for m in all_mutants)
-            has_sert_specs = bool(cfg.get("test.specs")) or any(".spec." in s for s in all_specs_norm)
-            should_probe = (
-                runner == "luau"
-                and len(all_specs_norm) >= 1
-                and (len(all_specs_norm) > 1 or has_sert_specs)
-                and (has_unfiltered or uses_file_override or len(all_specs_norm) == 1)
-            )
-            probed: dict[str, dict[str, object]] = {}
-            if should_probe:
-                map_specs = cov_map.setdefault("specs", {})
-                t_map_specs = trace_map.setdefault("specs", {})
-                stale_deleted = [
-                    k for k in list(map_specs)
-                    if not (cfg.root / graph._norm_rel(k, cfg.root)).is_file()
-                ]
-                for dead_key in stale_deleted:
-                    del map_specs[dead_key]
-                t_deleted = [
-                    k for k in list(t_map_specs)
-                    if not (cfg.root / graph._norm_rel(k, cfg.root)).is_file()
-                ]
-                for dead_key in t_deleted:
-                    del t_map_specs[dead_key]
-                if stale_deleted:
-                    specs_cov = {
-                        graph._norm_rel(k, cfg.root): v
-                        for k, v in map_specs.items()
-                        if isinstance(v, dict)
-                    }
-                if t_deleted:
-                    trace_specs = {
-                        graph._norm_rel(k, cfg.root): v
-                        for k, v in t_map_specs.items()
-                        if isinstance(v, dict)
-                    }
-
-                if has_unfiltered or len(all_specs_norm) == 1:
-                    candidate_specs = all_specs_norm
-                else:
-                    cand_set: set[str] = set()
-                    for filt in {m.spec_filter for m in all_mutants if isinstance(m.spec_filter, str) and m.spec_filter.startswith("@file=")}:
-                        cand_set.update(_specs_for_file_filter(filt, all_specs_norm))
-                    candidate_specs = [s for s in all_specs_norm if s in cand_set] if cand_set else all_specs_norm
-
-                stale_specs: list[str] = []
-                for s in candidate_specs:
-                    c_entry = specs_cov.get(s)
-                    if _is_preseeded_exact(c_entry):
-                        continue
-                    cur_spec_sha = _file_sha256_cached(cfg.root, s, spec_sha_memo)
-                    if not isinstance(c_entry, dict) or c_entry.get("exact") is False or "sha256" not in c_entry:
-                        stale_specs.append(s)
-                        continue
-                    if c_entry.get("sha256") != cur_spec_sha:
-                        stale_specs.append(s)
-                        continue
-                    cur_deps_sha = _spec_deps_digest(cfg.root, s, c_entry.get("files"), dep_graph, spec_sha_memo)
-                    if c_entry.get("deps_sha256") != cur_deps_sha:
-                        stale_specs.append(s)
-                        continue
-                    t_entry = trace_specs.get(s)
-                    if (
-                        not isinstance(t_entry, dict)
-                        or t_entry.get("sha256") != cur_spec_sha
-                        or t_entry.get("deps_sha256") != cur_deps_sha
-                        or not isinstance(t_entry.get("files"), dict)
-                        or not isinstance(t_entry.get("tests"), list)
-                    ):
-                        stale_specs.append(s)
-                        continue
-                    c_files = c_entry.get("files")
-                    c_file_norms = {graph._norm_rel(raw_f, cfg.root) for raw_f in c_files} if isinstance(c_files, dict) else set()
-                    t_files = t_entry["files"]
-                    if any(t_norm in c_file_norms and t_files.get(t_norm) != t_sig for t_norm, t_sig in file_trace_sig_by_norm.items()):
-                        stale_specs.append(s)
-
-                if stale_specs:
-                    probed = _collect_per_spec_trace(
-                        cfg.root,
-                        work_root,
-                        luau_bin,
-                        entries,
-                        stale_specs,
-                        pool,
-                        timeout_sec,
-                        codegen,
-                        program_args,
-                        key_to_file_line,
-                    )
-                    for s, pdata in probed.items():
-                        ms = int(pdata["ms"])  # type: ignore[arg-type]
-                        cov_files_map = pdata["cov_files"]  # type: ignore[assignment]
-                        spec_sha = _file_sha256_cached(cfg.root, s, spec_sha_memo)
-                        deps_sha = _spec_deps_digest(cfg.root, s, cov_files_map, dep_graph, spec_sha_memo)
-                        map_specs[s] = {
-                            "ms": ms,
-                            "sha256": spec_sha,
-                            "deps_sha256": deps_sha,
-                            "files": cov_files_map,
-                        }
-                        old_t = trace_specs.get(s)
-                        new_tests = list(pdata["tests"])  # type: ignore[arg-type]
-                        if (
-                            isinstance(old_t, dict)
-                            and old_t.get("sha256") == spec_sha
-                            and old_t.get("deps_sha256") == deps_sha
-                            and isinstance(old_t.get("files"), dict)
-                            and isinstance(old_t.get("tests"), list)
-                        ):
-                            merged_files = dict(old_t["files"])
-                            merged_files.update(file_trace_sig_by_norm)
-                            old_by_key = {
-                                (t.get("idx"), t.get("name")): dict(t)
-                                for t in old_t["tests"]
-                                if isinstance(t, dict)
-                            }
-                            merged_tests: list[dict[str, object]] = []
-                            for nt in new_tests:
-                                key = (nt.get("idx"), nt.get("name"))
-                                prev_t = old_by_key.get(key)
-                                if prev_t and isinstance(prev_t.get("files"), dict):
-                                    combined_f = {
-                                        f_k: f_v
-                                        for f_k, f_v in prev_t["files"].items()
-                                        if f_k not in file_trace_sig_by_norm
-                                    }
-                                    combined_f.update(nt.get("files") or {})  # type: ignore[arg-type]
-                                    merged_tests.append({**nt, "files": combined_f})
-                                else:
-                                    merged_tests.append(nt)
-                        else:
-                            merged_files = dict(file_trace_sig_by_norm)
-                            merged_tests = new_tests
-                        t_map_specs[s] = {
-                            "ms": ms,
-                            "sha256": spec_sha,
-                            "deps_sha256": deps_sha,
-                            "files": merged_files,
-                            "tests": merged_tests,
-                        }
-                    specs_cov = {
-                        graph._norm_rel(k, cfg.root): v
-                        for k, v in map_specs.items()
-                        if isinstance(v, dict)
-                    }
-                    trace_specs = {
-                        graph._norm_rel(k, cfg.root): v
-                        for k, v in t_map_specs.items()
-                        if isinstance(v, dict)
-                    }
-                if probed or stale_deleted:
-                    graph.save_coverage_map(cfg.root, cov_map)
-                if probed or t_deleted:
-                    _save_trace_map(trace_path, trace_map)
-
-            def _is_verified_cov(entry: object) -> bool:
-                return isinstance(entry, dict) and entry.get("exact") is not False and "sha256" in entry
-
-            has_verified_exact = len(all_specs_norm) > 1 and all(_is_verified_cov(specs_cov.get(s)) for s in all_specs_norm)
-            exact_index: dict[tuple[str, int], list[str]] = {}
-            ordered_specs = sorted(
-                (s for s in all_specs_norm if _is_verified_cov(specs_cov.get(s))),
-                key=lambda s: (
-                    int(specs_cov[s]["ms"])
-                    if isinstance(specs_cov[s].get("ms"), (int, float))
-                    and not isinstance(specs_cov[s].get("ms"), bool)
-                    else sys.maxsize,
-                    s,
-                ),
-            )
-            for s in ordered_specs:
-                files_map = specs_cov[s].get("files")
-                if not isinstance(files_map, dict):
-                    continue
-                for raw_src, hit_lines in files_map.items():
-                    if not isinstance(hit_lines, list):
-                        continue
-                    src_norm = graph._norm_rel(raw_src, cfg.root)
-                    for ln in hit_lines:
-                        exact_index.setdefault((src_norm, ln), []).append(s)
-
-            trace_line_hits: dict[tuple[str, str, int], list[tuple[int, str, float]]] = {}
-            spec_test_counts: dict[str, int] = {}
-            for s, t_entry in trace_specs.items():
-                tests_list = t_entry.get("tests")
-                t_files = t_entry.get("files")
-                if not isinstance(tests_list, list) or not isinstance(t_files, dict):
-                    continue
-                traced_targets = {f for f, sig in file_trace_sig_by_norm.items() if t_files.get(f) == sig}
-                if not traced_targets:
-                    continue
-                spec_test_counts[s] = len(tests_list)
-                for t_rec in tests_list:
-                    if not isinstance(t_rec, dict) or not isinstance(t_rec.get("idx"), int):
-                        continue
-                    t_idx = int(t_rec["idx"])
-                    t_name = str(t_rec.get("name", ""))
-                    t_ms = float(t_rec.get("ms", 0.0) or 0.0)
-                    files_hit = t_rec.get("files")
-                    if not isinstance(files_hit, dict):
-                        continue
-                    for f_rel, hit_lines in files_hit.items():
-                        if f_rel not in traced_targets or not isinstance(hit_lines, list):
-                            continue
-                        for ln in hit_lines:
-                            trace_line_hits.setdefault((s, f_rel, int(ln)), []).append((t_idx, t_name, t_ms))
-
-            line_cov_cache: dict[tuple[str, int], tuple[str, ...]] = {}
-            allowed_specs_cache: dict[str, tuple[list[str], set[str], bool]] = {}
-            if all_specs:
-                for m in all_mutants:
-                    if m.spec_filter is None:
-                        ck = (m.file, m.line)
-                        if ck not in line_cov_cache:
-                            m_norm = graph._norm_rel(m.file, cfg.root)
-                            if has_verified_exact and (exact_hits := exact_index.get((m_norm, m.line))):
-                                line_cov_cache[ck] = tuple(exact_hits)
-                            else:
-                                line_cov_cache[ck] = tuple(
-                                    graph.covering_specs_for_line(
-                                        cfg.root,
-                                        cfg,
-                                        m.file,
-                                        m.line,
-                                        all_specs,
-                                        cov_map=cov_map,
-                                        dep_graph=dep_graph,
-                                    )
-                                )
-                        m.covering_specs = line_cov_cache[ck]
-                    elif m.spec_filter.startswith("@file="):
-                        allowed_tuple = allowed_specs_cache.get(m.spec_filter)
-                        if allowed_tuple is None:
-                            allowed_list = _specs_for_file_filter(m.spec_filter, all_specs_norm)
-                            allowed_verified = (
-                                len(all_specs_norm) > 1
-                                and bool(allowed_list)
-                                and all(_is_verified_cov(specs_cov.get(s)) for s in allowed_list)
-                            )
-                            allowed_tuple = (allowed_list, set(allowed_list), allowed_verified)
-                            allowed_specs_cache[m.spec_filter] = allowed_tuple
-                        allowed_list, allowed_set, allowed_verified = allowed_tuple
-                        if allowed_verified and allowed_list:
-                            m_norm = graph._norm_rel(m.file, cfg.root)
-                            exact_hits = exact_index.get((m_norm, m.line)) or []
-                            intersected = [s for s in exact_hits if s in allowed_set]
-                            m.covering_specs = tuple(intersected) if intersected else tuple(allowed_list)
-                            m.spec_filter = None
-
-            # Check incremental mutant cache (`.sert/mutate/cache.json`)
-            cache_path = cfg.root / CACHE_FILE
-            cache_entries = _load_mutant_cache(cache_path)
-            dep_refs_memo: dict[tuple[str, tuple[str, ...], str], list[str]] = {}
-            cache_keys: dict[int, str] = {}
-            uncached_mutants: list[Mutant] = []
-            cached_count = 0
-            fallback_specs = sorted(all_specs) if all_specs else list(entries)
-            for m in all_mutants:
-                m_norm = graph._norm_rel(m.file, cfg.root)
-                if m.covering_specs:
-                    base_refs = list(m.covering_specs)
-                elif matched := _specs_for_file_filter(m.spec_filter, all_specs_norm):
-                    base_refs = matched
-                else:
-                    base_refs = fallback_specs
-                memo_key = (m.file, tuple(base_refs), cache_mode)
-                spec_refs = dep_refs_memo.get(memo_key)
-                if spec_refs is None:
-                    refs_set: set[str] = set(base_refs)
-                    for s in base_refs:
-                        s_norm = graph._norm_rel(s, cfg.root)
-                        if cache_mode == "strict":
-                            for dep in dep_graph.dependencies(s_norm, transitive=True):
-                                if dep != m_norm and (cfg.root / dep).is_file():
-                                    refs_set.add(dep)
-                            spec_entry = specs_cov.get(s_norm)
-                            files_map = spec_entry.get("files") if isinstance(spec_entry, dict) else None
-                            if isinstance(files_map, dict):
-                                for raw_src in files_map:
-                                    src_norm = graph._norm_rel(raw_src, cfg.root)
-                                    if src_norm != m_norm and (cfg.root / src_norm).is_file():
-                                        refs_set.add(src_norm)
-                        else:
-                            refs_set.update(_test_only_deps(s_norm, dep_graph, source_prefixes, exclude, cfg.root))
-                    if cache_mode != "strict":
-                        for dep in dep_graph.forward.get(m_norm, ()):
-                            if dep != m_norm and not dep.startswith(".sert/") and (cfg.root / dep).is_file():
-                                refs_set.add(dep)
-                    refs_set.discard(m_norm)
-                    spec_refs = sorted(refs_set)
-                    dep_refs_memo[memo_key] = spec_refs
-                spec_hashes = [(s, _file_sha256_cached(cfg.root, s, spec_sha_memo)) for s in spec_refs]
-                extra_trace: list[tuple[str, list[str]]] | None = None
-                if not m.top_level:
-                    traced_pairs: list[tuple[str, list[str]]] = []
-                    for s_norm in sorted({graph._norm_rel(r, cfg.root) for r in base_refs}):
-                        hits = trace_line_hits.get((s_norm, m_norm, m.line))
-                        if hits:
-                            traced_pairs.append((s_norm, sorted({name for _idx, name, _ms in hits})))
-                    if traced_pairs:
-                        extra_trace = traced_pairs
-                ckey = _mutant_cache_key(
-                    tokens_digest_by_file[m.file],
-                    m,
-                    spec_hashes,
-                    VERSION,
-                    cache_mode=cache_mode,
-                    extra=extra_trace,
-                )
-                cache_keys[m.id] = ckey
-                cached_status = None if no_cache else cache_entries.get(ckey)
-                if cached_status in ("KILLED", "SURVIVED"):
-                    m.status = cached_status
-                    cached_count += 1
-                elif (
-                    isinstance(cached_status, str)
-                    and (cached_t := _parse_cached_timeout(cached_status)) is not None
-                    and ((not explicit_timeout and cached_t > 0) or cached_t >= timeout_sec - 1e-6)
-                ):
-                    m.status = "TIMEOUT"
-                    cached_count += 1
-                else:
-                    uncached_mutants.append(m)
-
-            if uncached_mutants:
-                baseline_cache: dict[tuple[str, str], float] = {}
-                if not explicit_timeout:
-                    for s, pdata in probed.items():
-                        if not pdata.get("ok"):
-                            continue
-                        elapsed_s = (float(pdata.get("ms", 0) or 0) / 1000.0) * COV_OVERHEAD_FACTOR
-                        if s in entries:
-                            baseline_cache[("", s)] = elapsed_s
-                        else:
-                            filt_s = f"@file={s}"
-                            for e in entries:
-                                baseline_cache[(filt_s, e)] = elapsed_s
-                    for s, s_entry in specs_cov.items():
-                        if not _is_verified_cov(s_entry):
-                            continue
-                        ms_val = s_entry.get("ms")
-                        if not isinstance(ms_val, (int, float)) or isinstance(ms_val, bool):
-                            continue
-                        elapsed_s = (float(ms_val) / 1000.0) * COV_OVERHEAD_FACTOR
-                        if s in entries:
-                            baseline_cache.setdefault(("", s), elapsed_s)
-                        else:
-                            filt_s = f"@file={s}"
-                            for e in entries:
-                                baseline_cache.setdefault((filt_s, e), elapsed_s)
-
-                def ensure_baselines(filter_entries_pairs: set[tuple[str, str]]) -> None:
-                    missing = [
-                        (filt, entry)
-                        for filt, entry in sorted(filter_entries_pairs)
-                        if (filt, entry) not in baseline_cache
-                    ]
-                    if missing:
-                        futs = {
-                            (filt, entry): pool.submit(
-                                baseline_run,
-                                runner,
-                                luau_bin,
-                                entry,
-                                filt or None,
-                                work_root,
-                                timeout_sec,
-                                codegen,
-                                program_args,
-                                enforce_limit=explicit_timeout,
-                            )
-                            for filt, entry in missing
-                        }
-                        for key, fut in futs.items():
-                            baseline_cache[key] = fut.result()
-
-                mutant_floor = timeout_sec if explicit_timeout else min(timeout_sec, MIN_MUTANT_TIMEOUT)
-                worker_count = max(1, jobs)
-
-                def timeout_for(filt: str, stage_entries: tuple[str, ...] | list[str]) -> float:
-                    max_elapsed = max((baseline_cache.get((filt, e), 0.0) for e in stage_entries), default=0.0)
-                    return max(mutant_floor, BASELINE_FACTOR * max_elapsed)
-
-                RouteKey = tuple[str, tuple[str, ...], str | None]
-                orig_spec_filter: dict[int, str | None] = {m.id: m.spec_filter for m in uncached_mutants}
-                stages_by_id: dict[int, list[RouteKey]] = {}
-                single_spec_cache: dict[str, str | None] = {}
-                for m in uncached_mutants:
-                    if m.spec_filter is not None or not m.covering_specs:
-                        filt = m.spec_filter or ""
-                        if filt not in single_spec_cache:
-                            if m.spec_filter is None and len(all_specs_norm) == 1:
-                                single_spec_cache[filt] = all_specs_norm[0]
-                            elif filt.startswith("@file="):
-                                matched = _specs_for_file_filter(filt, all_specs_norm)
-                                single_spec_cache[filt] = matched[0] if len(matched) == 1 else None
-                            else:
-                                single_spec_cache[filt] = None
-                        stages_by_id[m.id] = [(filt, tuple(entries), single_spec_cache[filt])]
-                    else:
-                        plan = _prioritize_route_specs(
-                            m.file, m.covering_specs, dep_graph, cfg.root, specs_cov=specs_cov
-                        )
-                        if len(plan) > 2 and trace_line_hits:
-                            m_norm = graph._norm_rel(m.file, cfg.root)
-
-                            def _spec_cost(spec: str) -> float:
-                                if not m.top_level:
-                                    hits = trace_line_hits.get((spec, m_norm, m.line))
-                                    if hits:
-                                        seen_t: set[int] = set()
-                                        cost = 0.0
-                                        for t_idx, _t_nm, t_ms in hits:
-                                            if t_idx not in seen_t:
-                                                seen_t.add(t_idx)
-                                                cost += max(1.0, t_ms)
-                                        return cost
-                                s_entry = specs_cov.get(spec)
-                                return float(s_entry.get("ms", 1e9) or 1e9) if isinstance(s_entry, dict) else 1e9
-
-                            plan = (plan[0],) + tuple(
-                                spec for _cost, _i, spec in sorted((_spec_cost(s), i, s) for i, s in enumerate(plan[1:]))
-                            )
-                        plan_traced = any(s in spec_test_counts for s in plan)
-                        max_ind = MAX_TRACE_INDIVIDUAL_STAGES if plan_traced else MAX_INDIVIDUAL_ROUTE_STAGES
-                        m_stages: list[RouteKey] = []
-                        for spec in plan[:max_ind]:
-                            s_entries = (spec,) if spec in entries else tuple(entries)
-                            s_filter = "" if spec in entries else f"@file={spec}"
-                            m_stages.append((s_filter, s_entries, spec))
-                        if len(plan) > max_ind:
-                            tail = plan[max_ind:]
-                            if len(tail) == 1:
-                                spec = tail[0]
-                                s_entries = (spec,) if spec in entries else tuple(entries)
-                                s_filter = "" if spec in entries else f"@file={spec}"
-                                m_stages.append((s_filter, s_entries, spec))
-                            elif all(s in entries for s in tail):
-                                m_stages.append(("", tuple(tail), None))
-                            elif not any(s in entries for s in tail):
-                                s_filter = "" if (len(tail) >= 8 and len(tail) * 2 >= len(all_specs)) else f"@file={','.join(tail)}"
-                                m_stages.append((s_filter, tuple(entries), None))
-                            else:
-                                m_stages.append(("", tuple(entries), None))
-                        stages_by_id[m.id] = m_stages
-
-                def tests_for_stage(m: Mutant, single_spec: str | None) -> tuple[tuple[int, ...] | None, float]:
-                    if single_spec is None:
-                        return None, 0.0
-                    s_entry = specs_cov.get(single_spec)
-                    fallback_ms = float(s_entry.get("ms", 10.0) or 10.0) if isinstance(s_entry, dict) else 10.0
-                    if m.top_level:
-                        return None, max(1.0, fallback_ms)
-                    m_norm = graph._norm_rel(m.file, cfg.root)
-                    hits = trace_line_hits.get((single_spec, m_norm, m.line))
-                    if not hits:
-                        return None, max(1.0, fallback_ms)
-                    seen_idx: set[int] = set()
-                    ordered_idx: list[int] = []
-                    est_ms = 0.0
-                    for t_idx, _t_name, t_ms in sorted(hits, key=lambda item: (item[2], item[0])):
-                        if t_idx not in seen_idx:
-                            seen_idx.add(t_idx)
-                            ordered_idx.append(t_idx)
-                            est_ms += max(1.0, t_ms)
-                    total_tests = spec_test_counts.get(single_spec, 0)
-                    if total_tests <= 1 and len(ordered_idx) <= 1:
-                        return None, max(1.0, est_ms)
-                    return tuple(ordered_idx), max(1.0, est_ms)
-
-                stage_of_id: dict[int, int] = {m.id: 0 for m in uncached_mutants}
-                ready_by_route: dict[RouteKey, list[Mutant]] = {}
-                for m in uncached_mutants:
-                    ready_by_route.setdefault(stages_by_id[m.id][0], []).append(m)
-
-                pending: dict[object, tuple] = {}
-                max_in_flight = 1 if worker_count == 1 else worker_count * 2
-
-                def advance_mutant(m: Mutant) -> None:
-                    m.spec_filter = orig_spec_filter[m.id]
-                    if m.status == "SURVIVED":
-                        nxt = stage_of_id[m.id] + 1
-                        m_stages = stages_by_id[m.id]
-                        if nxt < len(m_stages):
-                            stage_of_id[m.id] = nxt
-                            ready_by_route.setdefault(m_stages[nxt], []).append(m)
-
-                def submit_ready() -> None:
-                    slots = max_in_flight - len(pending)
-                    if slots <= 0 or not ready_by_route:
-                        return
-                    needed_pairs = {
-                        (rk[0], e)
-                        for rk in ready_by_route
-                        for e in rk[1]
-                    }
-                    ensure_baselines(needed_pairs)
-                    total_ready = sum(len(ms) for ms in ready_by_route.values())
-                    candidate_chunks: list[tuple[float, int, RouteKey, list[Mutant], dict[int, tuple[int, ...]] | None, dict[int, float]]] = []
-                    for rk, muts in ready_by_route.items():
-                        s_filter, s_entries, single_spec = rk
-                        est_ms_map: dict[int, float] = {}
-                        mt_all: dict[int, tuple[int, ...]] = {}
-                        default_ms = max(10.0, (timeout_for(s_filter, s_entries) / BASELINE_FACTOR) * 1000.0)
-                        for m in muts:
-                            t_idxs, est_ms = tests_for_stage(m, single_spec)
-                            est_ms_map[m.id] = est_ms if est_ms > 0.0 else default_ms
-                            if t_idxs is not None:
-                                mt_all[m.id] = t_idxs
-                        weight_map = {
-                            m.id: (EXPECTED_SURVIVAL_WEIGHT if stage_of_id[m.id] == 0 else LATE_STAGE_SURVIVAL_WEIGHT)
-                            for m in muts
-                        }
-                        for chunk, chunk_ms in _pack_adaptive_batches(
-                            muts, est_ms_map, worker_count, total_ready, weight_by_id=weight_map
-                        ):
-                            chunk_mt = {m.id: mt_all[m.id] for m in chunk if m.id in mt_all} or None
-                            candidate_chunks.append((chunk_ms, len(chunk), rk, chunk, chunk_mt, est_ms_map))
-
-                    candidate_chunks.sort(key=lambda item: (-item[0], -item[1], item[2]))
-                    to_submit = candidate_chunks[:slots]
-                    submitted_ids: dict[RouteKey, set[int]] = {}
-                    for _cms, _clen, rk, chunk, chunk_mt, est_ms_map in to_submit:
-                        s_filter, s_entries, _single_spec = rk
-                        spec_timeout = timeout_for(s_filter, s_entries)
-                        if not explicit_timeout and chunk_mt and len(chunk_mt) == len(chunk):
-                            max_chunk_est_s = max(est_ms_map[m.id] for m in chunk) / 1000.0
-                            filt_timeout = max(mutant_floor, min(spec_timeout, BASELINE_FACTOR * max_chunk_est_s * COV_OVERHEAD_FACTOR))
-                        else:
-                            filt_timeout = spec_timeout
-                        use_defer = len(s_entries) == 1
-                        for m in chunk:
-                            m.spec_filter = s_filter or None
-                        submitted_ids.setdefault(rk, set()).update(m.id for m in chunk)
-                        kw = {"mutant_tests": chunk_mt} if chunk_mt else {}
-                        fut = pool.submit(
-                            _evaluate_mutant_batch,
-                            chunk,
-                            work_root,
-                            runner,
-                            luau_bin,
-                            list(s_entries),
-                            filt_timeout,
-                            codegen,
-                            program_args,
-                            use_defer,
-                            **kw,
-                        )
-                        pending[fut] = ("batch", chunk, rk, filt_timeout, use_defer, chunk_mt)
-                    for rk, ids_done in submitted_ids.items():
-                        rem = [m for m in ready_by_route[rk] if m.id not in ids_done]
-                        if rem:
-                            ready_by_route[rk] = rem
-                        else:
-                            del ready_by_route[rk]
-
-                try:
-                    submit_ready()
-                    while pending:
-                        done_set, _ = wait(pending, return_when=FIRST_COMPLETED)
-                        for done_fut in done_set:
-                            task = pending.pop(done_fut)
-                            kind = task[0]
-                            if kind == "single":
-                                _kind, single_m, _rk = task[:3]
-                                done_fut.result()
-                                advance_mutant(single_m)
-                            else:
-                                _kind, batch, rk, filt_timeout, use_defer, batch_mt = task
-                                res = done_fut.result()
-                                head, tail = res if isinstance(res, tuple) and len(res) == 2 else (None, [])
-                                deferred_ids = ({head.id} if head is not None else set()) | {tm.id for tm in tail}
-                                for m in batch:
-                                    if m.id not in deferred_ids:
-                                        advance_mutant(m)
-                                s_filter, s_entries, _single_spec = rk
-                                s_entries_list = list(s_entries)
-                                if head is not None:
-                                    head.spec_filter = s_filter or None
-                                    head_mt = {head.id: batch_mt[head.id]} if batch_mt and head.id in batch_mt else None
-                                    hkw = {"retry_on_timeout": False, **({"mutant_tests": head_mt} if head_mt else {})}
-                                    pending[
-                                        pool.submit(
-                                            _evaluate_single_mutant,
-                                            head,
-                                            work_root,
-                                            runner,
-                                            luau_bin,
-                                            s_entries_list,
-                                            filt_timeout,
-                                            codegen,
-                                            program_args,
-                                            **hkw,
-                                        )
-                                    ] = ("single", head, rk)
-                                if len(tail) == 1:
-                                    t0 = tail[0]
-                                    t0.spec_filter = s_filter or None
-                                    t0_mt = {t0.id: batch_mt[t0.id]} if batch_mt and t0.id in batch_mt else None
-                                    tkw = {"mutant_tests": t0_mt} if t0_mt else {}
-                                    pending[
-                                        pool.submit(
-                                            _evaluate_single_mutant,
-                                            t0,
-                                            work_root,
-                                            runner,
-                                            luau_bin,
-                                            s_entries_list,
-                                            filt_timeout,
-                                            codegen,
-                                            program_args,
-                                            **tkw,
-                                        )
-                                    ] = ("single", t0, rk)
-                                elif len(tail) > 1:
-                                    for tm in tail:
-                                        tm.spec_filter = s_filter or None
-                                    t_mt = (
-                                        {tm.id: batch_mt[tm.id] for tm in tail if batch_mt and tm.id in batch_mt} or None
-                                    )
-                                    tkw = {"mutant_tests": t_mt} if t_mt else {}
-                                    pending[
-                                        pool.submit(
-                                            _evaluate_mutant_batch,
-                                            tail,
-                                            work_root,
-                                            runner,
-                                            luau_bin,
-                                            s_entries_list,
-                                            filt_timeout,
-                                            codegen,
-                                            program_args,
-                                            use_defer,
-                                            **tkw,
-                                        )
-                                    ] = ("batch", tail, rk, filt_timeout, use_defer, t_mt)
-                        submit_ready()
-                finally:
-                    for m in uncached_mutants:
-                        m.spec_filter = orig_spec_filter[m.id]
-
-                for m in uncached_mutants:
-                    if m.id not in cache_keys:
-                        continue
-                    if m.status in ("KILLED", "SURVIVED"):
-                        cache_entries[cache_keys[m.id]] = m.status
-                    elif m.status == "TIMEOUT":
-                        cache_entries[cache_keys[m.id]] = f"TIMEOUT:{timeout_sec:.2f}"
-                _save_mutant_cache(cache_path, cache_entries)
-        except BaseException:
-            _kill_active_procs()
-            pool.shutdown(wait=True, cancel_futures=True)
-            raise
+        if has_unfiltered or len(all_specs_norm) == 1:
+            candidate_specs = all_specs_norm
         else:
-            pool.shutdown(wait=True)
-    finally:
-        if prev_sigterm is not None:
-            signal.signal(signal.SIGTERM, prev_sigterm)
-        shutil.rmtree(work_root, ignore_errors=True)
+            cand_set: set[str] = set()
+            for filt in {
+                m.spec_filter
+                for m in all_mutants
+                if isinstance(m.spec_filter, str) and m.spec_filter.startswith("@file=")
+            }:
+                cand_set.update(_specs_for_file_filter(filt, all_specs_norm))
+            candidate_specs = [s for s in all_specs_norm if s in cand_set] if cand_set else all_specs_norm
 
+        stale_specs: list[str] = []
+        for s in candidate_specs:
+            c_entry = specs_cov.get(s)
+            if _is_preseeded_exact(c_entry):
+                continue
+            cur_spec_sha = _file_sha256_cached(cfg.root, s, spec_sha_memo)
+            if not isinstance(c_entry, dict) or c_entry.get("exact") is False or "sha256" not in c_entry:
+                stale_specs.append(s)
+                continue
+            if c_entry.get("sha256") != cur_spec_sha:
+                stale_specs.append(s)
+                continue
+            cur_deps_sha = _spec_deps_digest(cfg.root, s, c_entry.get("files"), dep_graph, spec_sha_memo)
+            if c_entry.get("deps_sha256") != cur_deps_sha:
+                stale_specs.append(s)
+                continue
+            t_entry = trace_specs.get(s)
+            if (
+                not isinstance(t_entry, dict)
+                or t_entry.get("sha256") != cur_spec_sha
+                or t_entry.get("deps_sha256") != cur_deps_sha
+                or not isinstance(t_entry.get("files"), dict)
+                or not isinstance(t_entry.get("tests"), list)
+            ):
+                stale_specs.append(s)
+                continue
+            c_files = c_entry.get("files")
+            c_file_norms = {graph._norm_rel(raw_f, cfg.root) for raw_f in c_files} if isinstance(c_files, dict) else set()
+            t_files = t_entry["files"]
+            if any(t_norm in c_file_norms and t_files.get(t_norm) != t_sig for t_norm, t_sig in file_trace_sig_by_norm.items()):
+                stale_specs.append(s)
+
+        if stale_specs:
+            probed = _collect_per_spec_trace(
+                cfg.root,
+                work_root,
+                luau_bin,
+                entries,
+                stale_specs,
+                pool,
+                timeout_sec,
+                codegen,
+                program_args,
+                key_to_file_line,
+            )
+            for s, pdata in probed.items():
+                ms = int(pdata["ms"])  # type: ignore[arg-type]
+                cov_files_map = pdata["cov_files"]  # type: ignore[assignment]
+                spec_sha = _file_sha256_cached(cfg.root, s, spec_sha_memo)
+                deps_sha = _spec_deps_digest(cfg.root, s, cov_files_map, dep_graph, spec_sha_memo)
+                map_specs[s] = {"ms": ms, "sha256": spec_sha, "deps_sha256": deps_sha, "files": cov_files_map}
+                old_t = trace_specs.get(s)
+                new_tests = list(pdata["tests"])  # type: ignore[arg-type]
+                if (
+                    isinstance(old_t, dict)
+                    and old_t.get("sha256") == spec_sha
+                    and old_t.get("deps_sha256") == deps_sha
+                    and isinstance(old_t.get("files"), dict)
+                    and isinstance(old_t.get("tests"), list)
+                ):
+                    merged_files = dict(old_t["files"])
+                    merged_files.update(file_trace_sig_by_norm)
+                    old_by_key = {
+                        (t.get("idx"), t.get("name")): dict(t) for t in old_t["tests"] if isinstance(t, dict)
+                    }
+                    merged_tests: list[dict[str, object]] = []
+                    for nt in new_tests:
+                        prev_t = old_by_key.get((nt.get("idx"), nt.get("name")))
+                        if prev_t and isinstance(prev_t.get("files"), dict):
+                            combined_f = {
+                                f_k: f_v for f_k, f_v in prev_t["files"].items() if f_k not in file_trace_sig_by_norm
+                            }
+                            combined_f.update(nt.get("files") or {})  # type: ignore[arg-type]
+                            merged_tests.append({**nt, "files": combined_f})
+                        else:
+                            merged_tests.append(nt)
+                else:
+                    merged_files = dict(file_trace_sig_by_norm)
+                    merged_tests = new_tests
+                t_map_specs[s] = {
+                    "ms": ms,
+                    "sha256": spec_sha,
+                    "deps_sha256": deps_sha,
+                    "files": merged_files,
+                    "tests": merged_tests,
+                }
+            specs_cov = {graph._norm_rel(k, cfg.root): v for k, v in map_specs.items() if isinstance(v, dict)}
+            trace_specs = {graph._norm_rel(k, cfg.root): v for k, v in t_map_specs.items() if isinstance(v, dict)}
+        if probed or stale_deleted:
+            graph.save_coverage_map(cfg.root, cov_map)
+        if probed or t_deleted:
+            _save_trace_map(trace_path, trace_map)
+
+    has_verified_exact = len(all_specs_norm) > 1 and all(_is_verified_cov(specs_cov.get(s)) for s in all_specs_norm)
+    exact_index: dict[tuple[str, int], list[str]] = {}
+    ordered_specs = sorted(
+        (s for s in all_specs_norm if _is_verified_cov(specs_cov.get(s))),
+        key=lambda s: (
+            int(specs_cov[s]["ms"])
+            if isinstance(specs_cov[s].get("ms"), (int, float))
+            and not isinstance(specs_cov[s].get("ms"), bool)
+            else sys.maxsize,
+            s,
+        ),
+    )
+    for s in ordered_specs:
+        files_map = specs_cov[s].get("files")
+        if not isinstance(files_map, dict):
+            continue
+        for raw_src, hit_lines in files_map.items():
+            if isinstance(hit_lines, list):
+                src_norm = graph._norm_rel(raw_src, cfg.root)
+                for ln in hit_lines:
+                    exact_index.setdefault((src_norm, ln), []).append(s)
+
+    trace_line_hits: dict[tuple[str, str, int], list[tuple[int, str, float]]] = {}
+    spec_test_counts: dict[str, int] = {}
+    for s, t_entry in trace_specs.items():
+        tests_list = t_entry.get("tests")
+        t_files = t_entry.get("files")
+        if not isinstance(tests_list, list) or not isinstance(t_files, dict):
+            continue
+        traced_targets = {f for f, sig in file_trace_sig_by_norm.items() if t_files.get(f) == sig}
+        if not traced_targets:
+            continue
+        spec_test_counts[s] = len(tests_list)
+        for t_rec in tests_list:
+            if not isinstance(t_rec, dict) or not isinstance(t_rec.get("idx"), int):
+                continue
+            t_idx, t_name, t_ms = int(t_rec["idx"]), str(t_rec.get("name", "")), float(t_rec.get("ms", 0.0) or 0.0)
+            files_hit = t_rec.get("files")
+            if not isinstance(files_hit, dict):
+                continue
+            for f_rel, hit_lines in files_hit.items():
+                if f_rel in traced_targets and isinstance(hit_lines, list):
+                    for ln in hit_lines:
+                        trace_line_hits.setdefault((s, f_rel, int(ln)), []).append((t_idx, t_name, t_ms))
+
+    line_cov_cache: dict[tuple[str, int], tuple[str, ...]] = {}
+    allowed_specs_cache: dict[str, tuple[list[str], set[str], bool]] = {}
+    if all_specs:
+        for m in all_mutants:
+            if m.spec_filter is None:
+                ck = (m.file, m.line)
+                if ck not in line_cov_cache:
+                    m_norm = graph._norm_rel(m.file, cfg.root)
+                    if has_verified_exact and (exact_hits := exact_index.get((m_norm, m.line))):
+                        line_cov_cache[ck] = tuple(exact_hits)
+                    else:
+                        line_cov_cache[ck] = tuple(
+                            graph.covering_specs_for_line(
+                                cfg.root,
+                                cfg,
+                                m.file,
+                                m.line,
+                                all_specs,
+                                cov_map=cov_map,
+                                dep_graph=dep_graph,
+                            )
+                        )
+                m.covering_specs = line_cov_cache[ck]
+            elif m.spec_filter.startswith("@file="):
+                allowed_tuple = allowed_specs_cache.get(m.spec_filter)
+                if allowed_tuple is None:
+                    allowed_list = _specs_for_file_filter(m.spec_filter, all_specs_norm)
+                    allowed_verified = (
+                        len(all_specs_norm) > 1
+                        and bool(allowed_list)
+                        and all(_is_verified_cov(specs_cov.get(s)) for s in allowed_list)
+                    )
+                    allowed_tuple = (allowed_list, set(allowed_list), allowed_verified)
+                    allowed_specs_cache[m.spec_filter] = allowed_tuple
+                allowed_list, allowed_set, allowed_verified = allowed_tuple
+                if allowed_verified and allowed_list:
+                    m_norm = graph._norm_rel(m.file, cfg.root)
+                    exact_hits = exact_index.get((m_norm, m.line)) or []
+                    intersected = [s for s in exact_hits if s in allowed_set]
+                    m.covering_specs = (
+                        tuple(intersected)
+                        if intersected
+                        else (tuple(exact_hits) if exact_hits else tuple(allowed_list))
+                    )
+                    m.spec_filter = None
+
+    return (
+        all_specs,
+        all_specs_norm,
+        dep_graph,
+        specs_cov,
+        probed,
+        trace_line_hits,
+        spec_test_counts,
+        tokens_digest_by_file,
+        spec_sha_memo,
+    )
+
+
+def _filter_mutant_cache(
+    settings: _MutateSettings,
+    runner: str,
+    entries: list[str],
+    all_specs: list[str],
+    all_specs_norm: list[str],
+    dep_graph,
+    specs_cov: dict[str, dict],
+    trace_line_hits: dict[tuple[str, str, int], list[tuple[int, str, float]]],
+    tokens_digest_by_file: dict[str, str],
+    spec_sha_memo: dict[str, str],
+    all_mutants: list[Mutant],
+):
+    cfg = settings.cfg
+    cache_path = cfg.root / CACHE_FILE
+    cache_entries = _load_mutant_cache(cache_path)
+    dep_refs_memo: dict[tuple[str, tuple[str, ...], str], list[str]] = {}
+    cache_keys: dict[int, str] = {}
+    uncached_mutants: list[Mutant] = []
+    cached_count = 0
+    fallback_specs = sorted(all_specs) if all_specs else list(entries)
+    env_hash = _mutate_env_hash(cfg, runner, settings.codegen, settings.program_args, all_specs, spec_sha_memo)
+    mutant_floor = settings.timeout_sec if settings.explicit_timeout else min(settings.timeout_sec, MIN_MUTANT_TIMEOUT)
+
+    for m in all_mutants:
+        m_norm = graph._norm_rel(m.file, cfg.root)
+        if m.covering_specs:
+            base_refs = list(m.covering_specs)
+        elif matched := _specs_for_file_filter(m.spec_filter, all_specs_norm):
+            base_refs = matched
+        else:
+            base_refs = fallback_specs
+        memo_key = (m.file, tuple(base_refs), settings.cache_mode)
+        spec_refs = dep_refs_memo.get(memo_key)
+        if spec_refs is None:
+            refs_set: set[str] = set(base_refs)
+            for s in base_refs:
+                s_norm = graph._norm_rel(s, cfg.root)
+                if settings.cache_mode == "strict":
+                    for dep in dep_graph.dependencies(s_norm, transitive=True):
+                        if dep != m_norm and (cfg.root / dep).is_file():
+                            refs_set.add(dep)
+                    spec_entry = specs_cov.get(s_norm)
+                    files_map = spec_entry.get("files") if isinstance(spec_entry, dict) else None
+                    if isinstance(files_map, dict):
+                        for raw_src in files_map:
+                            src_norm = graph._norm_rel(raw_src, cfg.root)
+                            if src_norm != m_norm and (cfg.root / src_norm).is_file():
+                                refs_set.add(src_norm)
+                else:
+                    refs_set.update(_test_only_deps(s_norm, dep_graph, settings.source_prefixes, settings.exclude, cfg.root))
+            if settings.cache_mode != "strict":
+                for dep in dep_graph.dependencies(m_norm, transitive=True):
+                    if dep != m_norm and not dep.startswith(".sert/") and (cfg.root / dep).is_file():
+                        refs_set.add(dep)
+            refs_set.discard(m_norm)
+            spec_refs = sorted(refs_set)
+            dep_refs_memo[memo_key] = spec_refs
+        spec_hashes = [(s, _file_sha256_cached(cfg.root, s, spec_sha_memo)) for s in spec_refs]
+        extra_trace: list[tuple[str, list[str]]] | None = None
+        if not m.top_level:
+            traced_pairs: list[tuple[str, list[str]]] = []
+            for s_norm in sorted({graph._norm_rel(r, cfg.root) for r in base_refs}):
+                hits = trace_line_hits.get((s_norm, m_norm, m.line))
+                if hits:
+                    traced_pairs.append((s_norm, sorted({name for _idx, name, _ms in hits})))
+            if traced_pairs:
+                extra_trace = traced_pairs
+        ckey = _mutant_cache_key(
+            tokens_digest_by_file[m.file],
+            m,
+            spec_hashes,
+            VERSION,
+            cache_mode=settings.cache_mode,
+            extra=extra_trace,
+            env_hash=env_hash,
+        )
+        cache_keys[m.id] = ckey
+        cached_status = None if settings.no_cache else cache_entries.get(ckey)
+        if cached_status in ("KILLED", "SURVIVED"):
+            m.status = cached_status
+            cached_count += 1
+        elif (
+            isinstance(cached_status, str)
+            and (cached_t := _parse_cached_timeout(cached_status)) is not None
+            and (
+                (not settings.explicit_timeout and cached_t >= mutant_floor - 1e-6)
+                or cached_t >= settings.timeout_sec - 1e-6
+            )
+        ):
+            m.status = "TIMEOUT"
+            cached_count += 1
+        else:
+            uncached_mutants.append(m)
+
+    return cache_path, cache_entries, cache_keys, cached_count, uncached_mutants, mutant_floor
+
+
+_RouteKey = tuple[str, tuple[str, ...], str | None]
+
+
+def _spec_stage_cost(
+    spec: str,
+    mutant: Mutant,
+    m_norm: str,
+    specs_cov: dict[str, dict],
+    trace_line_hits: dict[tuple[str, str, int], list[tuple[int, str, float]]],
+) -> float:
+    if not mutant.top_level:
+        hits = trace_line_hits.get((spec, m_norm, mutant.line))
+        if hits:
+            seen_t: set[int] = set()
+            cost = 0.0
+            for t_idx, _t_nm, t_ms in hits:
+                if t_idx not in seen_t:
+                    seen_t.add(t_idx)
+                    cost += max(1.0, t_ms)
+            return cost
+    s_entry = specs_cov.get(spec)
+    return float(s_entry.get("ms", 1e9) or 1e9) if isinstance(s_entry, dict) else 1e9
+
+
+class _MutantBatchDispatcher:
+    def __init__(
+        self,
+        settings: _MutateSettings,
+        work_root: Path,
+        luau_bin: str,
+        runner: str,
+        entries: list[str],
+        all_specs: list[str],
+        all_specs_norm: list[str],
+        dep_graph,
+        specs_cov: dict[str, dict],
+        probed: dict[str, dict[str, object]],
+        trace_line_hits: dict[tuple[str, str, int], list[tuple[int, str, float]]],
+        spec_test_counts: dict[str, int],
+        uncached_mutants: list[Mutant],
+        mutant_floor: float,
+        pool: ThreadPoolExecutor,
+    ) -> None:
+        self.settings = settings
+        self.work_root = work_root
+        self.luau_bin = luau_bin
+        self.runner = runner
+        self.entries = entries
+        self.all_specs = all_specs
+        self.all_specs_norm = all_specs_norm
+        self.dep_graph = dep_graph
+        self.specs_cov = specs_cov
+        self.trace_line_hits = trace_line_hits
+        self.spec_test_counts = spec_test_counts
+        self.uncached_mutants = uncached_mutants
+        self.mutant_floor = mutant_floor
+        self.pool = pool
+        self.worker_count = max(1, settings.jobs)
+        self.max_in_flight = 1 if self.worker_count == 1 else self.worker_count * 2
+        self.baseline_cache: dict[tuple[str, str], float] = {}
+        self.eff_timeout_by_id: dict[int, float] = {}
+        self.orig_spec_filter: dict[int, str | None] = {m.id: m.spec_filter for m in uncached_mutants}
+        self.stages_by_id: dict[int, list[_RouteKey]] = {}
+        self.stage_of_id: dict[int, int] = {m.id: 0 for m in uncached_mutants}
+        self.ready_by_route: dict[_RouteKey, list[Mutant]] = {}
+        self.pending: dict[object, tuple] = {}
+
+        if not settings.explicit_timeout:
+            self._seed_baselines(probed)
+        self._build_stages()
+        for m in uncached_mutants:
+            self.ready_by_route.setdefault(self.stages_by_id[m.id][0], []).append(m)
+
+    def _seed_baselines(self, probed: dict[str, dict[str, object]]) -> None:
+        entries = self.entries
+        for s, pdata in probed.items():
+            if not pdata.get("ok"):
+                continue
+            elapsed_s = (float(pdata.get("ms", 0) or 0) / 1000.0) * COV_OVERHEAD_FACTOR
+            if s in entries:
+                self.baseline_cache[("", s)] = elapsed_s
+            else:
+                for e in entries:
+                    self.baseline_cache[(f"@file={s}", e)] = elapsed_s
+        for s, s_entry in self.specs_cov.items():
+            if not _is_verified_cov(s_entry):
+                continue
+            ms_val = s_entry.get("ms")
+            if not isinstance(ms_val, (int, float)) or isinstance(ms_val, bool):
+                continue
+            elapsed_s = (float(ms_val) / 1000.0) * COV_OVERHEAD_FACTOR
+            if s in entries:
+                self.baseline_cache.setdefault(("", s), elapsed_s)
+            else:
+                for e in entries:
+                    self.baseline_cache.setdefault((f"@file={s}", e), elapsed_s)
+
+    def ensure_baselines(self, filter_entries_pairs: set[tuple[str, str]]) -> None:
+        missing = sorted(pair for pair in filter_entries_pairs if pair not in self.baseline_cache)
+        if not missing:
+            return
+        cfg_t = self.settings
+        futs = {
+            (filt, entry): self.pool.submit(
+                baseline_run,
+                self.runner,
+                self.luau_bin,
+                entry,
+                filt or None,
+                self.work_root,
+                cfg_t.timeout_sec,
+                cfg_t.codegen,
+                cfg_t.program_args,
+                enforce_limit=cfg_t.explicit_timeout,
+            )
+            for filt, entry in missing
+        }
+        for key, fut in futs.items():
+            self.baseline_cache[key] = fut.result()
+
+    def timeout_for(self, filt: str, stage_entries: tuple[str, ...] | list[str]) -> float:
+        max_elapsed = max((self.baseline_cache.get((filt, e), 0.0) for e in stage_entries), default=0.0)
+        return max(self.mutant_floor, BASELINE_FACTOR * max_elapsed)
+
+    def _build_stages(self) -> None:
+        root = self.settings.cfg.root
+        entries_tuple = tuple(self.entries)
+        single_spec_cache: dict[str, str | None] = {}
+        for m in self.uncached_mutants:
+            if m.spec_filter is not None or not m.covering_specs:
+                filt = m.spec_filter or ""
+                if filt not in single_spec_cache:
+                    if m.spec_filter is None and len(self.all_specs_norm) == 1:
+                        single_spec_cache[filt] = self.all_specs_norm[0]
+                    elif filt.startswith("@file="):
+                        matched = _specs_for_file_filter(filt, self.all_specs_norm)
+                        single_spec_cache[filt] = matched[0] if len(matched) == 1 else None
+                    else:
+                        single_spec_cache[filt] = None
+                self.stages_by_id[m.id] = [(filt, entries_tuple, single_spec_cache[filt])]
+                continue
+
+            plan = _prioritize_route_specs(m.file, m.covering_specs, self.dep_graph, root, specs_cov=self.specs_cov)
+            if len(plan) > 2 and self.trace_line_hits:
+                m_norm = graph._norm_rel(m.file, root)
+                plan = (plan[0],) + tuple(
+                    spec
+                    for _cost, _i, spec in sorted(
+                        (_spec_stage_cost(s, m, m_norm, self.specs_cov, self.trace_line_hits), i, s)
+                        for i, s in enumerate(plan[1:])
+                    )
+                )
+            plan_traced = any(s in self.spec_test_counts for s in plan)
+            max_ind = MAX_TRACE_INDIVIDUAL_STAGES if plan_traced else MAX_INDIVIDUAL_ROUTE_STAGES
+            m_stages: list[_RouteKey] = []
+            for spec in plan[:max_ind]:
+                s_entries = (spec,) if spec in entries_tuple else entries_tuple
+                s_filter = "" if spec in entries_tuple else f"@file={spec}"
+                m_stages.append((s_filter, s_entries, spec))
+            if len(plan) > max_ind:
+                tail = plan[max_ind:]
+                if len(tail) == 1:
+                    spec = tail[0]
+                    s_entries = (spec,) if spec in entries_tuple else entries_tuple
+                    s_filter = "" if spec in entries_tuple else f"@file={spec}"
+                    m_stages.append((s_filter, s_entries, spec))
+                elif all(s in entries_tuple for s in tail):
+                    m_stages.append(("", tuple(tail), None))
+                elif not any(s in entries_tuple for s in tail):
+                    s_filter = "" if (len(tail) >= 8 and len(tail) * 2 >= len(self.all_specs)) else f"@file={','.join(tail)}"
+                    m_stages.append((s_filter, entries_tuple, None))
+                else:
+                    m_stages.append(("", entries_tuple, None))
+            self.stages_by_id[m.id] = m_stages
+
+    def _tests_for_stage(self, m: Mutant, single_spec: str | None) -> tuple[tuple[int, ...] | None, float]:
+        if single_spec is None:
+            return None, 0.0
+        s_entry = self.specs_cov.get(single_spec)
+        fallback_ms = float(s_entry.get("ms", 10.0) or 10.0) if isinstance(s_entry, dict) else 10.0
+        if m.top_level:
+            return None, max(1.0, fallback_ms)
+        m_norm = graph._norm_rel(m.file, self.settings.cfg.root)
+        hits = self.trace_line_hits.get((single_spec, m_norm, m.line))
+        if not hits:
+            return None, max(1.0, fallback_ms)
+        seen_idx: set[int] = set()
+        ordered_idx: list[int] = []
+        est_ms = 0.0
+        for t_idx, _t_name, t_ms in sorted(hits, key=lambda item: (item[2], item[0])):
+            if t_idx not in seen_idx:
+                seen_idx.add(t_idx)
+                ordered_idx.append(t_idx)
+                est_ms += max(1.0, t_ms)
+        if self.spec_test_counts.get(single_spec, 0) <= 1 and len(ordered_idx) <= 1:
+            return None, max(1.0, est_ms)
+        return tuple(ordered_idx), max(1.0, est_ms)
+
+    def _advance_mutant(self, m: Mutant) -> None:
+        m.spec_filter = self.orig_spec_filter[m.id]
+        if m.status == "SURVIVED":
+            nxt = self.stage_of_id[m.id] + 1
+            m_stages = self.stages_by_id[m.id]
+            if nxt < len(m_stages):
+                self.stage_of_id[m.id] = nxt
+                self.ready_by_route.setdefault(m_stages[nxt], []).append(m)
+
+    def _submit_ready(self) -> None:
+        slots = self.max_in_flight - len(self.pending)
+        if slots <= 0 or not self.ready_by_route:
+            return
+        self.ensure_baselines({(rk[0], e) for rk in self.ready_by_route for e in rk[1]})
+        total_ready = sum(len(ms) for ms in self.ready_by_route.values())
+        candidates: list[tuple[float, int, _RouteKey, list[Mutant], dict[int, tuple[int, ...]] | None, dict[int, float]]] = []
+        for rk, muts in self.ready_by_route.items():
+            s_filter, s_entries, single_spec = rk
+            est_ms_map: dict[int, float] = {}
+            mt_all: dict[int, tuple[int, ...]] = {}
+            default_ms = max(10.0, (self.timeout_for(s_filter, s_entries) / BASELINE_FACTOR) * 1000.0)
+            for m in muts:
+                t_idxs, est_ms = self._tests_for_stage(m, single_spec)
+                est_ms_map[m.id] = est_ms if est_ms > 0.0 else default_ms
+                if t_idxs is not None:
+                    mt_all[m.id] = t_idxs
+            for tm in (m for m in muts if m.top_level):
+                candidates.append((est_ms_map[tm.id], 1, rk, [tm], None, est_ms_map))
+            normal_muts = [m for m in muts if not m.top_level]
+            if normal_muts:
+                weight_map = {
+                    m.id: (EXPECTED_SURVIVAL_WEIGHT if self.stage_of_id[m.id] == 0 else LATE_STAGE_SURVIVAL_WEIGHT)
+                    for m in normal_muts
+                }
+                for chunk, chunk_ms in _pack_adaptive_batches(
+                    normal_muts, est_ms_map, self.worker_count, total_ready, weight_by_id=weight_map
+                ):
+                    chunk_mt = {m.id: mt_all[m.id] for m in chunk if m.id in mt_all} or None
+                    candidates.append((chunk_ms, len(chunk), rk, chunk, chunk_mt, est_ms_map))
+
+        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        submitted_ids: dict[_RouteKey, set[int]] = {}
+        for _cms, _clen, rk, chunk, chunk_mt, est_ms_map in candidates[:slots]:
+            s_filter, s_entries, _single_spec = rk
+            spec_timeout = self.timeout_for(s_filter, s_entries)
+            if not self.settings.explicit_timeout and chunk_mt and len(chunk_mt) == len(chunk):
+                max_chunk_est_s = max(est_ms_map[m.id] for m in chunk) / 1000.0
+                filt_timeout = max(self.mutant_floor, min(spec_timeout, BASELINE_FACTOR * max_chunk_est_s * COV_OVERHEAD_FACTOR))
+            else:
+                filt_timeout = spec_timeout
+            use_defer = len(s_entries) == 1
+            for m in chunk:
+                m.spec_filter = s_filter or None
+                self.eff_timeout_by_id[m.id] = filt_timeout
+            submitted_ids.setdefault(rk, set()).update(m.id for m in chunk)
+            kw = {"mutant_tests": chunk_mt} if chunk_mt else {}
+            fut = self.pool.submit(
+                _evaluate_mutant_batch,
+                chunk,
+                self.work_root,
+                self.runner,
+                self.luau_bin,
+                list(s_entries),
+                filt_timeout,
+                self.settings.codegen,
+                self.settings.program_args,
+                use_defer,
+                **kw,
+            )
+            self.pending[fut] = ("batch", chunk, rk, filt_timeout, use_defer, chunk_mt)
+        for rk, ids_done in submitted_ids.items():
+            rem = [m for m in self.ready_by_route[rk] if m.id not in ids_done]
+            if rem:
+                self.ready_by_route[rk] = rem
+            else:
+                del self.ready_by_route[rk]
+
+    def run(self) -> dict[int, float]:
+        try:
+            self._submit_ready()
+            while self.pending:
+                done_set, _ = wait(self.pending, return_when=FIRST_COMPLETED)
+                for done_fut in done_set:
+                    task = self.pending.pop(done_fut)
+                    if task[0] == "single":
+                        done_fut.result()
+                        self._advance_mutant(task[1])
+                        continue
+                    _kind, batch, rk, filt_timeout, use_defer, batch_mt = task
+                    res = done_fut.result()
+                    head, tail = res if isinstance(res, tuple) and len(res) == 2 else (None, [])
+                    deferred_ids = ({head.id} if head is not None else set()) | {tm.id for tm in tail}
+                    for m in batch:
+                        if m.id not in deferred_ids:
+                            self._advance_mutant(m)
+                    s_filter, s_entries, _single_spec = rk
+                    s_entries_list = list(s_entries)
+                    if head is not None:
+                        self._submit_single(head, rk, s_filter, s_entries_list, filt_timeout, batch_mt, retry_on_timeout=False)
+                    if len(tail) == 1:
+                        self._submit_single(tail[0], rk, s_filter, s_entries_list, filt_timeout, batch_mt)
+                    elif len(tail) > 1:
+                        for tm in tail:
+                            tm.spec_filter = s_filter or None
+                        t_mt = {tm.id: batch_mt[tm.id] for tm in tail if batch_mt and tm.id in batch_mt} or None
+                        tkw = {"mutant_tests": t_mt} if t_mt else {}
+                        self.pending[
+                            self.pool.submit(
+                                _evaluate_mutant_batch,
+                                tail,
+                                self.work_root,
+                                self.runner,
+                                self.luau_bin,
+                                s_entries_list,
+                                filt_timeout,
+                                self.settings.codegen,
+                                self.settings.program_args,
+                                use_defer,
+                                **tkw,
+                            )
+                        ] = ("batch", tail, rk, filt_timeout, use_defer, t_mt)
+                self._submit_ready()
+        finally:
+            for m in self.uncached_mutants:
+                m.spec_filter = self.orig_spec_filter[m.id]
+        return self.eff_timeout_by_id
+
+    def _submit_single(
+        self,
+        m: Mutant,
+        rk: _RouteKey,
+        s_filter: str,
+        s_entries_list: list[str],
+        filt_timeout: float,
+        batch_mt: dict[int, tuple[int, ...]] | None,
+        *,
+        retry_on_timeout: bool | None = None,
+    ) -> None:
+        m.spec_filter = s_filter or None
+        m_mt = {m.id: batch_mt[m.id]} if batch_mt and m.id in batch_mt else None
+        kw: dict = {}
+        if retry_on_timeout is not None:
+            kw["retry_on_timeout"] = retry_on_timeout
+        if m_mt:
+            kw["mutant_tests"] = m_mt
+        self.pending[
+            self.pool.submit(
+                _evaluate_single_mutant,
+                m,
+                self.work_root,
+                self.runner,
+                self.luau_bin,
+                s_entries_list,
+                filt_timeout,
+                self.settings.codegen,
+                self.settings.program_args,
+                **kw,
+            )
+        ] = ("single", m, rk)
+
+
+def _report_mutate_results(
+    settings: _MutateSettings,
+    all_mutants: list[Mutant],
+    cached_count: int,
+    fmt: str,
+) -> int:
+    cfg = settings.cfg
+    minimum = settings.minimum
     if fmt == "human":
         score = summarize(all_mutants, out=sys.stderr, root=cfg.root)
+        below_min = minimum is not None and score < float(minimum)
         print(f"{score:.1f}")
-        if minimum is not None and score < float(minimum):
+        if below_min:
             print(f"mutate: {score:.1f}% is below the {float(minimum):g}% floor", file=sys.stderr)
-            return FAILED
-        return 0
+        if on_github_actions():
+            survived_muts = [m for m in all_mutants if m.status == "SURVIVED"]
+            level = "error" if below_min else "warning"
+            for m in survived_muts[:25]:
+                annotate(
+                    level,
+                    f"[{m.op}] `{m.original}` -> `{m.mutated}` survived",
+                    file=m.file,
+                    line=m.line,
+                    title="sert mutate",
+                )
+            if below_min:
+                annotate("error", f"mutate: {score:.1f}% is below the {float(minimum):g}% floor", title="sert mutate")
+        return FAILED if below_min else 0
 
     score = summarize(all_mutants, out=io.StringIO(), root=cfg.root)
     below_min = minimum is not None and score < float(minimum)
@@ -3821,6 +4144,217 @@ def main(args) -> int:
         )
         print(agent.json_dumps_compact(payload))
     return exit_code
+
+
+def main(
+    args,
+    *,
+    skip_fetch: bool = False,
+    diff_lines: dict[str, set[int]] | None = None,
+    cov_files: dict[str, dict[int, int]] | None = None,
+    dep_graph=None,
+) -> int:
+    fmt = agent.output_format(args)
+    settings = _resolve_mutate_settings(args)
+    cfg = settings.cfg
+
+    if not skip_fetch:
+        fetch.refresh_overrides(cfg)
+        fetch.ensure_fetched(cfg)
+    cov_path = coverage_mod.output_path(cfg, cfg.root, args.coverage_file)
+    if args.no_coverage_run and not cov_path.is_file():
+        raise SertError(f"mutate: cannot read {cov_path}: file not found")
+    need_cov_run = not cov_path.is_file() and not args.no_coverage_run
+    entries, runner = run_mod.resolve_entries(cfg), run_mod.runner_of(cfg, coverage=need_cov_run)
+    for entry in entries:
+        if not (cfg.root / entry).is_file():
+            raise SertError(f"[test].entries: {entry} not found")
+    stage_spec = cfg.get("test.stage")
+    if stage_spec:
+        run_mod.stage_project(cfg, str(stage_spec))
+
+    luau_bin = run_mod.luau_command(cfg.root, runner)
+    if os.sep in luau_bin or (os.altsep and os.altsep in luau_bin):
+        luau_bin = os.path.abspath(luau_bin)
+
+    resolved_cov = _prepare_baseline_coverage(settings, args, entries, runner, cov_files)
+    diff_rev = getattr(args, "diff", None)
+    if diff_rev:
+        resolved_diff_lines = coverage_mod.git_diff_lines(cfg.root, str(diff_rev)) if diff_lines is None else diff_lines
+        resolved_cov = coverage_mod.filter_diff_files(resolved_cov, resolved_diff_lines)
+
+    chosen = coverage_mod.chosen_files(resolved_cov, settings.include, settings.exclude)
+    target_files = [
+        rel
+        for rel in sorted(chosen)
+        if not rel.endswith("core/mutant.luau") and (cfg.root / rel).is_file() and any(chosen[rel].values())
+    ]
+    if not target_files:
+        if diff_rev:
+            if fmt == "json":
+                payload = agent.json_envelope(
+                    "mutate",
+                    "ok",
+                    summary={"score": 100.0, "total": 0, "killed": 0, "survived": 0, "timeout": 0, "cached": 0},
+                    data={"mutants": [], "skipped": True, "reason": "no covered lines modified in diff"},
+                    exit_code=0,
+                )
+                print(agent.json_dumps_compact(payload))
+            elif fmt == "agent":
+                print("OK mutation_score=100.0% killed=0 survived=0 timeout=0 uncovered=0 total=0")
+            else:
+                print("mutate: no covered lines modified in diff; skipping")
+            return 0
+        raise SertError(f"mutate: no covered files under {', '.join(settings.include)}")
+
+    wrap_staged = bool(stage_spec)
+    all_mutants: list[Mutant] = []
+    next_id = 1
+    work_root = build_overlay(cfg.root, set(target_files))
+    stage_files_dir = (work_root / ".sert" / "stage" / "lexical") if stage_spec else work_root
+    prev_sigterm = signal.signal(signal.SIGTERM, interrupt) if threading.current_thread() is threading.main_thread() else None
+
+    try:
+        staged_tasks: list[tuple[Path, Path, str, str, list[Mutant]]] = []
+        for rel_path in target_files:
+            src_path = _guard_inside(work_root, work_root / rel_path)
+            if settings.max_mutants is not None and next_id - 1 >= settings.max_mutants:
+                if not src_path.exists():
+                    _link_file(cfg.root / rel_path, src_path)
+                continue
+            staged_path = _guard_inside(work_root, stage_files_dir / rel_path)
+            source_text = (cfg.root / rel_path).read_text(encoding="utf-8", errors="replace")
+            remaining = (settings.max_mutants - (next_id - 1)) if settings.max_mutants is not None else None
+            instrumented, file_mutants = instrument_source(
+                source_text,
+                resolved_cov[rel_path],
+                file_path=rel_path,
+                start_id=next_id,
+                operators=settings.operators,
+                max_mutants=remaining,
+                spec_filter=resolve_spec_filter(rel_path, settings.specs_map),
+                benign_calls=settings.benign_calls,
+                cosmetic_props=settings.cosmetic_props,
+            )
+            if not file_mutants:
+                if not src_path.exists():
+                    _link_file(cfg.root / rel_path, src_path)
+                continue
+            staged_tasks.append((src_path, staged_path, source_text, instrumented, file_mutants))
+            next_id = file_mutants[-1].id + 1
+
+        for src_path, _staged_path, source_text, _instrumented, _file_mutants in staged_tasks:
+            if not src_path.exists():
+                _write_unlinked(src_path, source_text)
+        retarget_luaurc_aliases(cfg.root, work_root)
+
+        pool = ThreadPoolExecutor(max_workers=max(1, settings.jobs))
+        try:
+            extra_kw = {"runner": runner} if runner != "luau" else {}
+            if len(staged_tasks) == 1:
+                src_path, staged_path, source_text, instrumented, file_mutants = staged_tasks[0]
+                compiled_lists = [
+                    compile_and_stage_file(luau_bin, source_text, instrumented, file_mutants, staged_path, wrap=wrap_staged, **extra_kw)
+                ]
+            else:
+                stage_futs = [
+                    pool.submit(compile_and_stage_file, luau_bin, source_text, instrumented, file_mutants, staged_path, wrap=wrap_staged, **extra_kw)
+                    for _src_path, staged_path, source_text, instrumented, file_mutants in staged_tasks
+                ]
+                compiled_lists = [fut.result() for fut in stage_futs]
+
+            for (src_path, _staged_path, source_text, instrumented, file_mutants), valid_mutants in zip(staged_tasks, compiled_lists):
+                if wrap_staged and valid_mutants:
+                    if len(valid_mutants) == len(file_mutants):
+                        merged_source = instrumented
+                    else:
+                        valid_lines = {m.line for m in valid_mutants}
+                        orig_lines, inst_lines = source_text.split("\n"), instrumented.split("\n")
+                        merged_source = "\n".join(inst_lines[idx] if (idx + 1) in valid_lines else orig_lines[idx] for idx in range(len(orig_lines)))
+                    _write_unlinked(_guard_inside(work_root, src_path), _direct_source(merged_source))
+                all_mutants.extend(valid_mutants)
+
+            if not all_mutants:
+                raise SertError(f"mutate: no mutable covered statements found under {', '.join(settings.include)}")
+
+            (
+                all_specs,
+                all_specs_norm,
+                dep_graph,
+                specs_cov,
+                probed,
+                trace_line_hits,
+                spec_test_counts,
+                tokens_digest_by_file,
+                spec_sha_memo,
+            ) = _resolve_trace_and_coverage_maps(
+                cfg,
+                work_root,
+                luau_bin,
+                entries,
+                staged_tasks,
+                all_mutants,
+                pool,
+                runner=runner,
+                timeout_sec=settings.timeout_sec,
+                codegen=settings.codegen,
+                program_args=settings.program_args,
+                dep_graph=dep_graph,
+            )
+
+            cache_path, cache_entries, cache_keys, cached_count, uncached_mutants, mutant_floor = _filter_mutant_cache(
+                settings,
+                runner,
+                entries,
+                all_specs,
+                all_specs_norm,
+                dep_graph,
+                specs_cov,
+                trace_line_hits,
+                tokens_digest_by_file,
+                spec_sha_memo,
+                all_mutants,
+            )
+
+            if uncached_mutants:
+                dispatcher = _MutantBatchDispatcher(
+                    settings=settings,
+                    work_root=work_root,
+                    luau_bin=luau_bin,
+                    runner=runner,
+                    entries=entries,
+                    all_specs=all_specs,
+                    all_specs_norm=all_specs_norm,
+                    dep_graph=dep_graph,
+                    specs_cov=specs_cov,
+                    probed=probed,
+                    trace_line_hits=trace_line_hits,
+                    spec_test_counts=spec_test_counts,
+                    uncached_mutants=uncached_mutants,
+                    mutant_floor=mutant_floor,
+                    pool=pool,
+                )
+                eff_timeout_by_id = dispatcher.run()
+                for m in uncached_mutants:
+                    if m.id not in cache_keys:
+                        continue
+                    if m.status in ("KILLED", "SURVIVED"):
+                        cache_entries[cache_keys[m.id]] = m.status
+                    elif m.status == "TIMEOUT":
+                        cache_entries[cache_keys[m.id]] = f"TIMEOUT:{eff_timeout_by_id.get(m.id, settings.timeout_sec):.2f}"
+                _save_mutant_cache(cache_path, cache_entries)
+        except BaseException:
+            _kill_active_procs()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+    finally:
+        if prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, prev_sigterm)
+        shutil.rmtree(work_root, ignore_errors=True)
+
+    return _report_mutate_results(settings, all_mutants, cached_count, fmt)
 
 
 cmd_mutate = main

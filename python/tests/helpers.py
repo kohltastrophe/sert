@@ -197,4 +197,7 @@ def copy_repo(dst: Path | str) -> Path:
         shutil.copytree(REPO / part, root / part, ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy2(REPO / "default.project.json", root)
     shutil.copy2(REPO / "LICENSE.txt", root)
+    for manifest in ("wally.toml", "pesde.toml"):
+        if (REPO / manifest).is_file():
+            shutil.copy2(REPO / manifest, root)
     return root

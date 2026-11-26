@@ -13,6 +13,7 @@ ITER = re.compile(r"^(\S+) (\d+) (begin|end(?: (.*))?)$")
 FRAME = re.compile(r"^(?:(\w+) )?(\d+(?:\.\d+)?)(?: ?ms)?$")
 FILE = re.compile(r"^([^|]*)\|(.*)\|(\d+)$")
 SEED_RUN = re.compile(r"^run (\d+)$")
+SEED_SHUFFLE = re.compile(r"^shuffle (\d+)$")
 SEED_TEST = re.compile(r"^(.*)\|(\d+)$")
 VERDICT = "[sert-verdict]"
 SKIP_REASONS = ("explicit", "roblox", "server", "client")
@@ -61,6 +62,7 @@ class Parsed:
         self.files: list[dict] = []
         self.tests: list[dict] = []
         self.run_seed: int | None = None
+        self.shuffle_seed: int | None = None
         self.seeds: dict[str, int] = {}
         self.phases: dict[str, int] = {}
         self.iterations: list[dict] = []
@@ -73,6 +75,7 @@ class Parsed:
         self.run_ids: list[str] = []
         self.skipped_by_reason: dict[str, int] = {reason: 0 for reason in SKIP_REASONS}
         self.zero_assertion_tests: list[str] = []
+        self.flaky_tests: list[str] = []
         self.tautologies: list[dict] = []
         self.snapshots: list[dict] = []
         self.regressions: list[dict] = []
@@ -174,9 +177,13 @@ def parse(output: str, on_marker=None) -> Parsed:
                 parsed.tests.append(test)
         elif kind == "seed":
             run_m = SEED_RUN.match(payload)
+            shuf_m = SEED_SHUFFLE.match(payload)
             if run_m:
                 if parsed.run_seed is None:
                     parsed.run_seed = int(run_m.group(1))
+            elif shuf_m:
+                if parsed.shuffle_seed is None:
+                    parsed.shuffle_seed = int(shuf_m.group(1))
             elif match := SEED_TEST.match(payload):
                 parsed.seeds[match.group(1)] = int(match.group(2))
         elif kind == "phase":
@@ -290,6 +297,13 @@ def _collect_quality_fields(parsed: Parsed, verdict: dict | None) -> None:
             for item in raw:
                 if isinstance(item, str):
                     parsed.zero_assertion_tests.append(item)
+
+    for src in sources_for("flakyTests"):
+        raw = _extract_outcome_field(src, "flakyTests")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    parsed.flaky_tests.append(item)
 
     for src in sources_for("tautologies"):
         raw = _extract_outcome_field(src, "tautologies")

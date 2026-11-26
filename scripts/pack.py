@@ -65,6 +65,10 @@ def build_luau_zip(root: Path) -> bytes:
         if not src.is_file():
             raise RuntimeError(f"missing required package file: {src}")
         entries[top] = src.read_bytes()
+    for opt in ("wally.toml", "pesde.toml"):
+        opt_path = root / opt
+        if opt_path.is_file():
+            entries[opt] = opt_path.read_bytes()
     src_dir = root / "src"
     if not src_dir.is_dir():
         raise RuntimeError(f"missing src directory: {src_dir}")

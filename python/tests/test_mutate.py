@@ -1404,6 +1404,341 @@ class MutateSchemaTest(Case):
         self.assertEqual([len(ch) for ch, _ms in stage0_chunks], [4])
         self.assertEqual([len(ch) for ch, _ms in late_chunks], [1, 1, 1, 1])
 
+    def test_compile_and_stage_file_wrap_false_probes_direct_source(self):
+        orig = "local M = {}\nfunction M.f(x: number)\n\treturn x + 1\nend\nreturn M"
+        inst = "local M = {}\nfunction M.f(x: number)\n\treturn _M(1)\nend\nreturn M"
+        muts = [mutate.Mutant(id=1, file="src/A.luau", line=3, op="arith_op", original="x + 1", mutated="x - 1")]
+        probed_wrappers: list[bool] = []
+        with tempfile.TemporaryDirectory() as td:
+            staged = Path(td) / "direct.luau"
+
+            def spy_err(_luau_bin, path, runner="luau"):
+                text = path.read_text(encoding="utf-8")
+                probed_wrappers.append("pcall(function()" in text and "_direct_source" not in text)
+                return True, ""
+
+            with mock.patch.object(mutate, "_check_staged_compile_err", side_effect=spy_err):
+                valid = mutate.compile_and_stage_file("luau", orig, inst, muts, staged, wrap=False)
+            self.assertEqual(len(valid), 1)
+            self.assertEqual(probed_wrappers, [False])
+            self.assertNotIn("pcall(function()", staged.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_top_level_isolation_transitive_scoped_cache_env_hash_and_timeout_soundness(self):
+        # 1. Top-level mutant isolation alongside function-body mutants
+        root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n',
+            name="m2_sound",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src").mkdir()
+        (root / "src/Leaf.luau").write_text("local L = {}\nL.BIAS = 10\nreturn L\n")
+        (root / "src/Mid.luau").write_text(
+            'local Leaf = require("./Leaf")\nlocal Mid = {}\nfunction Mid.get() return Leaf.BIAS end\nreturn Mid\n'
+        )
+        (root / "src/Top.luau").write_text(
+            'local Mid = require("./Mid")\nlocal score = Mid.get() + 5\nreturn { score = score }\n'
+        )
+        (root / "src/Math.luau").write_text(
+            "local M = {}\nfunction M.add(a: number, b: number): number\n\treturn a + b\nend\nreturn M\n"
+        )
+        (root / "test").mkdir()
+        (root / "test/Top.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local Top = require("@lib/Top")',
+                    'local Math = require("@lib/Math")',
+                    'sert.test("computes scaled bias", function()',
+                    "\tsert.eq(Math.add(Top.score, 1), 16)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "coverage.out").write_text(
+            "SF:src/Top.luau\nDA:2,1\nend_of_record\nSF:src/Math.luau\nDA:3,1\nend_of_record\n"
+        )
+
+        seen_batches: list[list[tuple[int, bool]]] = []
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def spy_eval_batch(batch, *args, **kwargs):
+            seen_batches.append([(m.line, m.top_level) for m in batch])
+            return orig_eval_batch(batch, *args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_eval_batch):
+            code1, out1, err1 = self.sert(
+                "mutate", "src/Top.luau", "src/Math.luau", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code1, out1.strip()), (0, "100.0"), err1)
+        # Top-level mutant (line 2) was submitted in its own 1-element batch, never bundled with function-body mutants.
+        self.assertTrue(any(len(b) == 1 and b[0][1] for b in seen_batches), seen_batches)
+        self.assertFalse(any(len(b) > 1 and any(tl for _ln, tl in b) for b in seen_batches), seen_batches)
+
+        # 2. Multi-hop transitive dep invalidates scoped cache (`Top -> Mid -> Leaf`)
+        (root / "src/Leaf.luau").write_text("local L = {}\nL.BIAS = 20\nreturn L\n")
+        (root / "test/Top.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local Top = require("@lib/Top")',
+                    'local Math = require("@lib/Math")',
+                    'sert.test("computes scaled bias", function()',
+                    "\tsert.eq(Math.add(Top.score, 1), 26)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        seen_batches.clear()
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_eval_batch):
+            code2, out2, err2 = self.sert(
+                "mutate", "src/Top.luau", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code2, out2.strip()), (0, "100.0"), err2)
+        self.assertGreater(len(seen_batches), 0)
+
+        # Revert Leaf change? No need — check `env_hash` invalidation when `.luaurc` changes on identical source!
+        # Next run hits cache (0 batches), then editing `.luaurc` whitespace-independently (`extra` field) invalidates cache.
+        seen_batches.clear()
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_eval_batch):
+            code3, out3, err3 = self.sert(
+                "mutate", "src/Top.luau", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code3, out3.strip(), len(seen_batches)), (0, "100.0", 0), err3)
+
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src", "unused": "./src"}}\n')
+        seen_batches.clear()
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_eval_batch):
+            code4, out4, err4 = self.sert(
+                "mutate", "src/Top.luau", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code4, out4.strip()), (0, "100.0"), err4)
+        self.assertGreater(len(seen_batches), 0)
+
+        # 3. Cache stores effective per-mutant `filt_timeout`, never global `--timeout` when filtered timeout is lower.
+        m_cfg = mutate.config_mod.load(root)
+        env_a = mutate._mutate_env_hash(m_cfg, "luau", False, (), ["test/Top.spec.luau"], {})
+        env_b = mutate._mutate_env_hash(m_cfg, "luau", True, (), ["test/Top.spec.luau"], {})
+        self.assertNotEqual(env_a, env_b)
+
+        # Simulate a mutant timing out under low `filt_timeout` (capped at mutant_floor=2.0 when --timeout 10 is implicit),
+        # and verify an explicit `--timeout 10` does NOT reuse the cached `TIMEOUT:2.00` entry.
+        to_root = self.project('[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n', name="m2_to")
+        copy_sert_src(to_root / ".sert/repo/src")
+        (to_root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (to_root / "src").mkdir()
+        (to_root / "src/A.luau").write_text("local A = {}\nfunction A.f(x: number)\n\treturn x + 1\nend\nreturn A\n")
+        (to_root / "test").mkdir()
+        (to_root / "test/A.spec.luau").write_text(
+            'local sert = require("@sert")\nlocal A = require("@lib/A")\nsert.test("t", function()\n\tsert.eq(A.f(1), 2)\nend)\nreturn {}\n'
+        )
+        (to_root / "coverage.out").write_text("SF:src/A.luau\nDA:3,1\nend_of_record\n")
+        trace_path = to_root / ".sert/mutate/trace-map.json"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        a_sha = mutate._file_sha256_cached(to_root, "src/A.luau", {})
+        s_sha = mutate._file_sha256_cached(to_root, "test/A.spec.luau", {})
+        trace_path.write_text(
+            json.dumps(
+                {
+                    "specs": {
+                        "test/A.spec.luau": {
+                            "ms": 50,
+                            "sha256": s_sha,
+                            "deps_sha256": a_sha,
+                            "files": {"src/A.luau": a_sha},
+                            "tests": [{"idx": 1, "name": "t", "ms": 50, "files": {"src/A.luau": [3]}}],
+                        }
+                    }
+                }
+            )
+        )
+
+        def timeout_batch(batch, *args, **kwargs):
+            for bm in batch:
+                bm.status = "TIMEOUT"
+            return None, []
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=timeout_batch):
+            code_t1, _out_t1, err_t1 = self.sert(
+                "mutate", "src/A.luau", "--root", to_root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual(code_t1, 0, err_t1)
+        cache_vals = list(mutate._load_mutant_cache(to_root / mutate.CACHE_FILE).values())
+        self.assertEqual(len(cache_vals), 1)
+        stored_t = mutate._parse_cached_timeout(cache_vals[0])
+        self.assertIsNotNone(stored_t)
+        self.assertLess(stored_t, 5.0)
+
+        re_evaluated = 0
+
+        def kill_on_re_eval(batch, *args, **kwargs):
+            nonlocal re_evaluated
+            re_evaluated += len(batch)
+            for bm in batch:
+                bm.status = "KILLED"
+            return None, []
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=kill_on_re_eval):
+            code_t2, out_t2, err_t2 = self.sert(
+                "mutate", "src/A.luau", "--root", to_root, "--no-coverage-run", "--operators", "arith_op", "--timeout", "10", "-j", "1"
+            )
+        self.assertEqual((code_t2, out_t2.strip(), re_evaluated), (0, "100.0", 1), err_t2)
+
+    def test_mutate_github_annotations_human_only(self):
+        m_root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\nmin = 90\n',
+            name="mut-gha",
+        )
+        copy_sert_src(m_root / ".sert/repo/src")
+        (m_root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n', encoding="utf-8")
+        (m_root / "src").mkdir()
+        (m_root / "src/A.luau").write_text("local M = {}\nfunction M.f(x)\n\treturn x + 1\nend\nreturn M\n", encoding="utf-8")
+        (m_root / "test").mkdir()
+        (m_root / "test/A.spec.luau").write_text('local A = require("@lib/A")\nreturn function() end\n', encoding="utf-8")
+        (m_root / "coverage.out").write_text(
+            "SF:src/A.luau\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,1\nDA:5,1\nend_of_record\n",
+            encoding="utf-8",
+        )
+
+        def survive_batch(batch, *args, **kwargs):
+            for bm in batch:
+                bm.status = "SURVIVED"
+            return None, []
+
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=survive_batch):
+            code_h, out_h, _err_h = self.sert("mutate", "src/A.luau", "--root", m_root, "--no-coverage-run", "--operators", "arith_op", "--no-cache", "-j", "1")
+            self.assertEqual(code_h, 1)
+            self.assertIn("::error file=src/A.luau,line=3,title=sert mutate::", out_h)
+            self.assertIn("::error title=sert mutate::", out_h)
+
+            code_j, out_j, _err_j = self.sert("mutate", "src/A.luau", "--root", m_root, "--no-coverage-run", "--operators", "arith_op", "--no-cache", "-j", "1", "--format", "json")
+            self.assertEqual(code_j, 1)
+            self.assertNotIn("::error", out_j)
+            env = json.loads(out_j)
+            self.assertEqual((env["command"], env["exit_code"], env["summary"]["survived"]), ("mutate", 1, 1))
+
+    def test_m6_equiv_pruning_ternary_single_line_if_while_and_batch_cov_map(self):
+        # 1. `nil_guard` skips `x or nil` / `x or false` while keeping `x or 10`; `rel_flip` uses `<`/`>` & skips `#items >= 0`
+        src = "\n".join(
+            [
+                "--!strict",
+                "local M = {}",
+                "function M.work(items: { number }, x: number, n: number, ok: boolean)",
+                "\tlocal a = x or nil",
+                "\tlocal b = ok or false",
+                "\tlocal c = x or 10",
+                "\tlocal d = #items >= 0",
+                "\tlocal e = 0 <= #items",
+                "\tlocal f = x <= 5",
+                "\tlocal g = x >= 2",
+                "\tlocal t1 = if x > 0 then x + 1 else 0",
+                "\tobjVal = if ok then 1 else 2",
+                "\tif x > 0 then return x + 1 end",
+                "\twhile n > 0 do n -= 1 end",
+                "\treturn if ok then t1 else c",
+                "end",
+                "return M",
+            ]
+        )
+        inst, muts = mutate.instrument_source(src, set(range(1, 20)), file_path="src/M6.luau")
+        self.assertEqual(len(inst.splitlines()), len(src.splitlines()))
+        by_line: dict[int, list[mutate.Mutant]] = {}
+        for m in muts:
+            by_line.setdefault(m.line, []).append(m)
+
+        # Lines 4 & 5 (`or nil`, `or false`) pruned; line 6 (`or 10`) kept
+        self.assertFalse(any(m.op == "nil_guard" for m in by_line.get(4, [])))
+        self.assertFalse(any(m.op == "nil_guard" for m in by_line.get(5, [])))
+        self.assertTrue(any(m.op == "nil_guard" and "local c = x" in m.mutated for m in by_line[6]))
+        # Defensive `#items >= 0` & `0 <= #items` pruned; boundary `<=` -> `<` & `>=` -> `>`
+        self.assertFalse(any(m.op == "rel_flip" for m in by_line.get(7, [])))
+        self.assertFalse(any(m.op == "rel_flip" for m in by_line.get(8, [])))
+        self.assertTrue(any(m.op == "rel_flip" and "x < 5" in m.mutated for m in by_line[9]))
+        self.assertTrue(any(m.op == "rel_flip" and "x > 2" in m.mutated for m in by_line[10]))
+        # Ternaries (`local`, assign, `return`) + single-line `if ... end` / `while ... end`
+        self.assertTrue(any(m.op == "cond_inv" for m in by_line[11]))
+        self.assertTrue(any(m.op == "arith_op" and "x - 1" in m.mutated for m in by_line[11]))
+        self.assertTrue(any(m.op == "cond_inv" for m in by_line[12]))
+        self.assertTrue(any(m.op == "cond_inv" for m in by_line[13]) and any(m.op == "arith_op" for m in by_line[13]))
+        self.assertTrue(any(m.op == "cond_inv" for m in by_line[14]) and any(m.op == "arith_op" for m in by_line[14]))
+        self.assertTrue(any(m.op == "cond_inv" for m in by_line[15]))
+
+        if have("luau"):
+            p = self.tmp / "m6_valid.luau"
+            p.write_text(mutate._direct_source(inst.replace("objVal", "local objVal")), encoding="utf-8")
+            cp = subprocess.run([shutil.which("luau") or "luau", str(p)], capture_output=True)
+            self.assertEqual(cp.returncode, 0, cp.stderr.decode("utf-8", errors="replace"))
+
+        # 2. Batch `record_specs_coverage` preserves existing exact=True entry on unchanged sha
+        root_cm = self.project("", name="cm-batch")
+        (root_cm / "test").mkdir()
+        (root_cm / "test/a.spec.luau").write_text("return nil\n")
+        (root_cm / "test/b.spec.luau").write_text("return nil\n")
+        graph.record_spec_coverage(root_cm, "test/a.spec.luau", {"src/A.luau": {2: True}}, ms=10, exact=True)
+        cm = graph.record_specs_coverage(
+            root_cm,
+            [
+                ("test/a.spec.luau", {"src/A.luau": {2: True, 3: True}}, 12, False),
+                ("test/b.spec.luau", {"src/B.luau": {4: True}}, 8, False),
+            ],
+        )
+        self.assertIsNot(cm["specs"]["test/a.spec.luau"].get("exact"), False)
+        self.assertEqual(cm["specs"]["test/a.spec.luau"]["files"], {"src/A.luau": [2]})
+        self.assertFalse(cm["specs"]["test/b.spec.luau"]["exact"])
+
+    @unittest.skipUnless(have("luau"), "luau not on PATH")
+    def test_compile_and_stage_wrap_false_does_not_execute_top_level_and_honors_coverage_file(self):
+        # Modules referencing Roblox globals or runner-only requires must pass `wrap=False` compile checking
+        # without executing top-level statements, leaving unwrapped `_direct_source` on disk afterward.
+        luau_bin = shutil.which("luau") or str(Path.home() / ".rokit/bin/luau")
+        mod_src = "\n".join(
+            [
+                "--!strict",
+                'local Players = game:GetService("Players")',
+                "local ORIGIN = Vector3.zero",
+                "local M = {}",
+                "function M.add(a: number, b: number): number",
+                "\treturn a + b",
+                "end",
+                "M.Players = Players",
+                "M.Origin = ORIGIN",
+                "return M",
+            ]
+        )
+        inst, muts = mutate.instrument_source(mod_src, {i: True for i in range(1, 12)}, file_path="src/Mod.luau")
+        self.assertGreaterEqual(len(muts), 2)
+        staged_path = self.tmp / "unwrapped_stage" / "Mod.luau"
+        valid = mutate.compile_and_stage_file(luau_bin, mod_src, inst, muts, staged_path, wrap=False)
+        self.assertEqual([m.id for m in valid], [m.id for m in muts])
+        on_disk = staged_path.read_text(encoding="utf-8")
+        self.assertIn(mutate.MUTANT_PREAMBLE.strip(), on_disk)
+        self.assertNotIn("return function(...)", on_disk)
+        self.assertTrue(on_disk.lstrip().startswith("--!strict"))
+
+        # `[coverage].file` is honored by `mutate.main` without `--coverage-file`
+        croot = self.project(
+            '[test]\nspecs = ["test/*.spec.luau"]\n[coverage]\ninclude = ["src"]\nfile = "build/custom.lcov"\n[mutate]\ninclude = ["src"]\n',
+            name="cov_file_mut",
+        )
+        copy_sert_src(croot / ".sert/sert/src")
+        (croot / ".luaurc").write_text('{"aliases": {"sert": "./.sert/sert/src"}}\n', encoding="utf-8")
+        (croot / "src").mkdir()
+        (croot / "test").mkdir()
+        (croot / "src/Math.luau").write_text("local M = {}\nfunction M.inc(x: number)\n\treturn x + 1\nend\nreturn M\n", encoding="utf-8")
+        (croot / "test/Math.spec.luau").write_text(
+            'local sert = require("@sert")\nlocal M = require("../src/Math")\nsert.test("inc", function() sert.eq(M.inc(2), 3) end)\n',
+            encoding="utf-8",
+        )
+        code, out, err = self.sert("mutate", "--root", croot, "--min", "100")
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue((croot / "build/custom.lcov").is_file())
+        self.assertFalse((croot / "coverage.out").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

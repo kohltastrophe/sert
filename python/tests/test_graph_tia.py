@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import unittest
@@ -365,6 +366,109 @@ class GraphTiaTest(helpers.Case):
         self.assertEqual(entry["deps_sha256"], "abc123")
         self.assertEqual(entry["files"], {"src/core/math.luau": [2, 3]})
         self.assertEqual(cfg.root, self.root)
+
+    def test_persistent_graph_cache_extends_env_chains_and_meta_snap_invalidation(self) -> None:
+        cfg = self._build_sample_repo()
+        # 1. Persistent `.sert/graph-cache.json`: second build skips `extract_requires` on unchanged files.
+        with mock.patch("sert.graph.extract_requires", wraps=graph.extract_requires) as spy_extract:
+            g1 = graph.build_graph(self.root, cfg)
+            first_calls = spy_extract.call_count
+        self.assertGreater(first_calls, 0)
+        self.assertTrue((self.root / ".sert/graph-cache.json").is_file())
+
+        with mock.patch("sert.graph.extract_requires", wraps=graph.extract_requires) as spy_extract2:
+            g2 = graph.build_graph(self.root, cfg)
+            self.assertEqual(spy_extract2.call_count, 0)
+        self.assertEqual(g1.forward, g2.forward)
+
+        # Edit one file -> only 1 file re-tokenized; delete a file -> pruned from cache
+        math_path = self.root / "src/core/math.luau"
+        st_before = math_path.stat()
+        _write(math_path, 'local Base = require("./base")\n-- modified body\nreturn Base\n')
+        os.utime(math_path, ns=(st_before.st_atime_ns, st_before.st_mtime_ns + 2_000_000))
+        _write(self.root / "src/temp_ephemeral.luau", "return 1\n")
+        graph.build_graph(self.root, cfg)
+        (self.root / "src/temp_ephemeral.luau").unlink()
+
+        with mock.patch("sert.graph.extract_requires", wraps=graph.extract_requires) as spy_extract3:
+            _write(math_path, 'local Base = require("./base")\n-- modified again\nreturn Base\n')
+            os.utime(math_path, ns=(st_before.st_atime_ns, st_before.st_mtime_ns + 4_000_000))
+            graph.build_graph(self.root, cfg)
+            self.assertEqual(spy_extract3.call_count, 1)
+        cache_data = json.loads((self.root / ".sert/graph-cache.json").read_text(encoding="utf-8"))
+        self.assertNotIn("src/temp_ephemeral.luau", cache_data["files"])
+
+        # 2. `.luaurc` `extends` inheritance (relative parent + cycle safety) + headless `env.*` require resolution
+        ext_root = self.tmp / "ext_repo"
+        ext_root.mkdir()
+        _write(ext_root / "base/.luaurc", json.dumps({"aliases": {"shared": "./lib", "overrideMe": "./lib"}}))
+        _write(
+            ext_root / ".luaurc",
+            json.dumps({"extends": "base/.luaurc", "aliases": {"overrideMe": "custom"}}),
+        )
+        _write(ext_root / "base/lib/util.luau", "return 1\n")
+        _write(ext_root / "custom/util.luau", "return 2\n")
+        loaded_aliases = graph.load_luaurc_aliases(ext_root)
+        self.assertEqual(loaded_aliases["shared"], (ext_root / "base/lib").resolve())
+        self.assertEqual(loaded_aliases["overrideMe"], (ext_root / "custom").resolve())
+
+        # Circular `extends` terminates cleanly
+        _write(ext_root / "cyc_a/.luaurc", json.dumps({"extends": "../cyc_b/.luaurc", "aliases": {"a": "."}}))
+        _write(ext_root / "cyc_b/.luaurc", json.dumps({"extends": "../cyc_a/.luaurc", "aliases": {"b": "."}}))
+        cyc_aliases = graph.load_luaurc_aliases(ext_root, ext_root / "cyc_a")
+        self.assertIn("a", cyc_aliases)
+        self.assertIn("b", cyc_aliases)
+
+        # Headless `env.game`, `env:getService(...)`, `env.workspace`, and `env:require(...)`
+        _write(self.root / "src/WorldMod.luau", "return { ok = true }\n")
+        _write(
+            self.root / "default.project.json",
+            json.dumps(
+                {
+                    "name": "Sample",
+                    "tree": {
+                        "$className": "DataModel",
+                        "ReplicatedStorage": {"Pkg": {"$path": "src"}},
+                        "Workspace": {"WorldMod": {"$path": "src/WorldMod.luau"}},
+                    },
+                }
+            ),
+        )
+        _write(
+            self.root / "test/headless_env.spec.luau",
+            "\n".join(
+                [
+                    "local env = sert.env.new()",
+                    'local RS = env.game:GetService("ReplicatedStorage")',
+                    'local M1 = env:require(RS:WaitForChild("Pkg").core.math)',
+                    'local M2 = require(env:getService("ReplicatedStorage"):WaitForChild("Pkg").core.base)',
+                    "local W1 = env:require(env.workspace.WorldMod)",
+                    "return { M1, M2, W1 }",
+                ]
+            )
+            + "\n",
+        )
+        g_env = graph.build_graph(self.root, cfg)
+        env_deps = g_env.dependencies("test/headless_env.spec.luau", transitive=False)
+        self.assertEqual(env_deps, {"src/core/math.luau", "src/core/base.luau", "src/WorldMod.luau"})
+
+        # 3. `.snap`, `Foo.meta.json`, `init.meta.json`, and `.sert-regressions.toml` invalidation
+        all_specs = graph.discover_specs(self.root, cfg)
+        snap_imp = graph.affected_specs_for_files(self.root, cfg, {"test/__snapshots__/fast.snap"}, all_specs=all_specs, dep_graph=g_env)
+        self.assertEqual(snap_imp, ["test/fast.spec.luau"])
+
+        meta_imp = graph.affected_specs_for_files(self.root, cfg, {"src/shared/types.meta.json"}, all_specs=all_specs, dep_graph=g_env)
+        self.assertEqual(
+            meta_imp,
+            ["test/fast.spec.luau", "test/headless_env.spec.luau", "test/nested.spec.luau", "test/slow.spec.luau"],
+        )
+
+        init_meta_imp = graph.affected_specs_for_files(self.root, cfg, {"src/core/init.meta.json"}, all_specs=all_specs, dep_graph=g_env)
+        self.assertIn("test/fast.spec.luau", init_meta_imp)
+        self.assertNotIn("test/isolated.spec.luau", init_meta_imp)
+
+        reg_imp = graph.affected_specs_for_files(self.root, cfg, {"test/.sert-regressions.toml"}, all_specs=all_specs, dep_graph=g_env)
+        self.assertEqual(reg_imp, sorted(all_specs))
 
 
 if __name__ == "__main__":

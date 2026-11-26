@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import math
 import re
 
 RESERVED_KEYWORDS = frozenset(
@@ -1186,3 +1187,23 @@ def mark_type_tokens(tokens: list[Token]) -> list[bool]:
 
         i += 1
     return in_type
+
+
+def parse_number(raw: str) -> int | float | None:
+    """Parse a Luau numeric literal (decimal, hex, binary, with `_` separators); return None if invalid or non-finite."""
+    cleaned = raw.replace("_", "")
+    if not cleaned:
+        return None
+    try:
+        if cleaned.startswith(("0x", "0X")):
+            return int(cleaned, 16)
+        if cleaned.startswith(("0b", "0B")):
+            return int(cleaned, 2)
+        if "." not in cleaned and "e" not in cleaned and "E" not in cleaned:
+            return int(cleaned, 10)
+        val = float(cleaned)
+        if not math.isfinite(val):
+            return None
+        return val
+    except ValueError:
+        return None

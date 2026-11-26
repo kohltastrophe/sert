@@ -14,8 +14,8 @@ import re
 import subprocess
 import sys
 
-from sert import config as config_mod
-from sert.util import FAILED, SertError, as_list, posix, step_summary, write_atomic
+from sert import config as config_mod, luau_lex
+from sert.util import FAILED, SertError, annotate, as_list, on_github_actions, step_summary, write_atomic
 
 STAGE_PREFIXES = (
     ".sert/stage/lexical/",
@@ -122,6 +122,49 @@ def filter_diff_files(files: dict[str, dict[int, bool]], diff_lines: dict[str, s
     return filtered
 
 
+_NON_EXEC_ONLY = frozenset({"end", "else", "do", "then", ")", "}", "]", ";", ","})
+
+
+def _executable_lines(source: str) -> set[int]:
+    tokens = luau_lex.tokenize(source, include_comments=False)
+    in_type = luau_lex.mark_type_tokens(tokens)
+    exec_lines: set[int] = set()
+    for idx, tok in enumerate(tokens):
+        if in_type[idx]:
+            continue
+        if tok.kind in ("KEYWORD", "OP") and tok.value in _NON_EXEC_ONLY:
+            continue
+        exec_lines.add(tok.line)
+    return exec_lines
+
+
+def inject_uncovered_diff_files(
+    filtered: dict[str, dict[int, bool]],
+    all_cov_files: dict[str, dict[int, bool]],
+    diff_lines: dict[str, set[int]],
+    root: Path,
+    include: list[str],
+    exclude: list[str] = (),
+) -> None:
+    excl = list(exclude)
+    for rel, mod_lines in diff_lines.items():
+        if rel in all_cov_files or not mod_lines or Path(rel).suffix not in (".luau", ".lua"):
+            continue
+        if not (included(rel, include) and not included(rel, excl)):
+            continue
+        target = root / rel
+        if not target.is_file():
+            continue
+        try:
+            source = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        exec_lns = _executable_lines(source)
+        uncovered = sorted(ln for ln in mod_lines if ln in exec_lns)
+        if uncovered:
+            filtered[rel] = {ln: False for ln in uncovered}
+
+
 def norm(name: str, root: Path | None = None, *, _resolved_root: Path | None = None) -> str:
     clean = name.replace("\\", "/")
     if (root is not None or _resolved_root is not None) and (
@@ -132,6 +175,21 @@ def norm(name: str, root: Path | None = None, *, _resolved_root: Path | None = N
             base = _resolved_root if _resolved_root is not None else Path(root).resolve()  # type: ignore[arg-type]
             if os.path.normcase(os.path.commonpath([resolved, base])) == os.path.normcase(str(base)):
                 clean = os.path.relpath(resolved, base).replace(os.sep, "/")
+        except (OSError, ValueError):
+            pass
+    elif (root is not None or _resolved_root is not None) and clean.startswith("../"):
+        try:
+            base = _resolved_root if _resolved_root is not None else Path(root).resolve()  # type: ignore[arg-type]
+            resolved = (base / clean).resolve()
+            if os.path.normcase(os.path.commonpath([resolved, base])) == os.path.normcase(str(base)):
+                clean = os.path.relpath(resolved, base).replace(os.sep, "/")
+            else:
+                cand = clean
+                while cand.startswith("../"):
+                    cand = cand[3:]
+                    if cand and (base / cand).is_file():
+                        clean = cand
+                        break
         except (OSError, ValueError):
             pass
     clean = clean.removeprefix("./")
@@ -175,6 +233,49 @@ def parse(path, root: Path | None = None) -> dict[str, dict[int, bool]]:
                 if current_max_line is not None and num > current_max_line:
                     continue
                 current[num] = current.get(num, False) or int(hits) > 0
+    return files
+
+
+def parse_function_hits(path, root: Path | None = None) -> dict[str, dict[int, bool]]:
+    """Parse LCOV ``FN:`` / ``FNDA:`` records into `{rel_file: {decl_line: called}}`."""
+    files: dict[str, dict[int, bool]] = {}
+    current_rel: str | None = None
+    fn_lines: dict[str, int] = {}
+    resolved_root = Path(root).resolve() if root is not None else None
+    norm_cache: dict[str, str] = {}
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("SF:"):
+                raw_sf = line[3:].strip()
+                norm_sf = norm_cache.get(raw_sf)
+                if norm_sf is None:
+                    norm_sf = norm(raw_sf, root, _resolved_root=resolved_root)
+                    norm_cache[raw_sf] = norm_sf
+                current_rel = norm_sf
+                fn_lines = {}
+            elif line.startswith("end_of_record"):
+                current_rel = None
+                fn_lines = {}
+            elif current_rel is None:
+                continue
+            elif line.startswith("FN:"):
+                raw_ln, _, raw_name = line[3:].rstrip("\r\n").partition(",")
+                if raw_name and raw_name != "<main>" and raw_ln.isdigit():
+                    ln = int(raw_ln)
+                    fn_lines[raw_name] = ln
+                    files.setdefault(current_rel, {}).setdefault(ln, False)
+            elif line.startswith("FNDA:"):
+                raw_hits, _, raw_name = line[5:].rstrip("\r\n").partition(",")
+                if raw_name and raw_name != "<main>":
+                    hits = int(raw_hits) if raw_hits.isdigit() else 0
+                    ln = fn_lines.get(raw_name)
+                    if ln is None and ":" in raw_name:
+                        tail = raw_name.rsplit(":", 1)[1]
+                        if tail.isdigit():
+                            ln = int(tail)
+                    if ln is not None:
+                        file_map = files.setdefault(current_rel, {})
+                        file_map[ln] = file_map.get(ln, False) or hits > 0
     return files
 
 
@@ -292,6 +393,16 @@ def _resolve_badge_path(root: Path, badge_arg, cfg_badge) -> Path | None:
     return path if path.is_absolute() else (root / path)
 
 
+def output_path(cfg, root: Path | None = None, file_arg: str | Path | None = None) -> Path:
+    """Resolve the active LCOV file path from an explicit arg, `[coverage].file`, or `coverage.out`."""
+    raw = file_arg or config_mod.section_table(cfg, "coverage").get("file") or "coverage.out"
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    base = Path(root) if root is not None else (Path(cfg.root) if getattr(cfg, "root", None) else Path("."))
+    return base / path
+
+
 def add_parser(subparsers) -> None:
     parser = subparsers.add_parser("coverage")
     parser.add_argument("file", nargs="?", help="LCOV file (default: <root>/coverage.out)")
@@ -323,7 +434,14 @@ def add_parser(subparsers) -> None:
     parser.set_defaults(func=main)
 
 
-def cmd_coverage(args, root: Path | None = None, cfg: config_mod.Config | dict | None = None) -> int:
+def cmd_coverage(
+    args,
+    root: Path | None = None,
+    cfg: config_mod.Config | dict | None = None,
+    *,
+    cov_files: dict[str, dict[int, int]] | None = None,
+    diff_lines: dict[str, set[int]] | None = None,
+) -> int:
     from sert import agent
 
     if cfg is None or not isinstance(cfg, config_mod.Config):
@@ -334,18 +452,23 @@ def cmd_coverage(args, root: Path | None = None, cfg: config_mod.Config | dict |
     exclude = [norm(str(p)).rstrip("/") for p in as_list(table.get("exclude"))]
     min_arg = getattr(args, "min", None)
     minimum = min_arg if min_arg is not None else table.get("min")
-    file_arg = getattr(args, "file", None)
-    path = root / (file_arg or "coverage.out")
-    if not path.is_file():
-        raise SertError(f"coverage: {path} not found: run `{config_mod.command('run --coverage')}` first")
-    try:
-        files = parse(path, root=root)
-    except OSError as err:
-        raise SertError(f"coverage: cannot read {path}: {err}")
+    path = output_path(cfg, root, getattr(args, "file", None))
+    if cov_files is not None:
+        files = {k: dict(v) for k, v in cov_files.items()}
+    else:
+        if not path.is_file():
+            raise SertError(f"coverage: {path} not found: run `{config_mod.command('run --coverage')}` first")
+        try:
+            files = parse(path, root=root)
+        except OSError as err:
+            raise SertError(f"coverage: cannot read {path}: {err}")
     fmt = agent.output_format(args)
     diff_rev = getattr(args, "diff", None)
     if diff_rev:
-        files = filter_diff_files(files, git_diff_lines(root, str(diff_rev)))
+        resolved_diff_lines = git_diff_lines(root, str(diff_rev)) if diff_lines is None else diff_lines
+        filtered = filter_diff_files(files, resolved_diff_lines)
+        inject_uncovered_diff_files(filtered, files, resolved_diff_lines, root, include, exclude)
+        files = filtered
         chosen = chosen_files(files, include, exclude)
         if sum(len(lines) for lines in chosen.values()) == 0:
             if fmt == "agent":
@@ -412,6 +535,24 @@ def cmd_coverage(args, root: Path | None = None, cfg: config_mod.Config | dict |
         print(f"{pct:.1f}")
         if exit_code:
             print(f"coverage: {pct:.1f}% is below the {min_float:g}% floor", file=sys.stderr)
+            if on_github_actions():
+                annotate("error", f"coverage {pct:.1f}% is below the {min_float:g}% floor", title="sert coverage")
+                emitted_files = 0
+                for rel, line_map in sorted(chosen.items()):
+                    missed = sorted(ln for ln, hit in line_map.items() if not hit)
+                    if not missed:
+                        continue
+                    ranges = _uncovered_ranges(line_map)
+                    annotate(
+                        "error",
+                        f"uncovered lines: {ranges}",
+                        file=rel,
+                        line=missed[0],
+                        title="sert coverage",
+                    )
+                    emitted_files += 1
+                    if emitted_files >= 20:
+                        break
     return exit_code
 
 

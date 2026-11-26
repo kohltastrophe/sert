@@ -146,6 +146,18 @@ class StubTest(Case):
         self.assertEqual(self.stub(bad_t, "--version").returncode, 2)
         self.assertEqual(self.stub(self.consumer('[sert]\nversion = "1.0.0"\n', "[override\n", name="bad_l"), "--version").returncode, 2)
 
+        # Missing sert.toml gives an init hint (while `init` itself bootstraps with DEFAULT_VERSION)
+        bare_consumer = self.tmp / "bare_consumer"
+        (bare_consumer / "tools").mkdir(parents=True)
+        shutil.copy(REPO / "tools/sert.py", bare_consumer / "tools/sert.py")
+        res_bare = self.stub(bare_consumer, "run")
+        self.assertEqual(res_bare.returncode, 2)
+        self.assertIn("init --fetch", res_bare.stderr)
+        http_env_init = self.http_release(sums=True)
+        res_init_ver = self.stub(bare_consumer, "init", "--stdout", env=http_env_init)
+        self.assertEqual(res_init_ver.returncode, 0, res_init_ver.stderr)
+        self.assertIn("# sert", res_init_ver.stdout)
+
     @unittest.skipIf(sys.platform == "win32", "process groups and POSIX signals")
     def test_signals_and_cwd_shadowing(self):
         checkout = self.tmp / "fake-sert"

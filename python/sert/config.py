@@ -34,12 +34,13 @@ def _git_toplevel(start: Path) -> Path | None:
 def root_of(path: str | os.PathLike | None = None) -> Path:
     where = Path(path or os.getcwd()).resolve()
     start = where if where.is_dir() else where.parent
-    if top := _git_toplevel(start):
-        return top
+    top = _git_toplevel(start)
     for parent in (start, *start.parents):
         if (parent / CONFIG).is_file():
             return parent
-    return where
+        if top is not None and parent == top:
+            break
+    return top if top is not None else where
 
 
 def find_root(explicit: str | os.PathLike | None = None) -> Path:
@@ -113,6 +114,7 @@ STUDIO_KEYS = {
     "clients": int,
     "warm": bool,
     "studio": str,
+    "bridge": str,
     "capture": (bool, str),
 }
 GROUP_KEYS = {"name", "paths", "ignore", "platform", "defs", "definitions", "sourcemap", "solvers"}
@@ -158,6 +160,7 @@ SCHEMA = {
     },
     "types": {"pass": (list, str), "fail": (list, str), "solvers": (list, str)},
     "coverage": {
+        "file": str,
         "include": (list, str),
         "exclude": (list, str),
         "min": (int, float),
@@ -167,6 +170,7 @@ SCHEMA = {
         "include": (list, str),
         "exclude": (list, str),
         "codegen": bool,
+        "cache": str,
         "timeout": (int, float),
         "min": (int, float),
         "max_mutants": int,
@@ -281,3 +285,14 @@ def load(root: str | os.PathLike | None = None, require: bool = False) -> Config
 
 def from_args(args, require: bool = False) -> Config:
     return load(getattr(args, "root", None), require=require)
+
+
+def section_table(cfg, section: str) -> dict:
+    """Return *section* as a dict from a `Config` or raw dict (or `{}` if missing/not a dict)."""
+    if hasattr(cfg, "table"):
+        val = cfg.table(section)
+        return val if isinstance(val, dict) else {}
+    if isinstance(cfg, dict):
+        val = cfg.get(section)
+        return val if isinstance(val, dict) else {}
+    return {}

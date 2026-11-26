@@ -219,6 +219,49 @@ class BenchTest(helpers.Case):
         loaded = bench.load_baseline(self.root, "base")
         self.assertEqual(loaded[0]["name"], "perf > table sum")
 
+    def test_bench_repeatable_grep_file_ci_and_no_dead_flags(self) -> None:
+        _init_bench_project(self.root)
+        baseline_benches = [
+            {
+                "name": "vector sum",
+                "file": "test/math.spec.luau",
+                "iterations": 100,
+                "samples": 3,
+                "medianNs": 500.0,
+                "iqrNs": 10.0,
+                "opsPerSec": 2_000_000.0,
+                "allocKb": 0.0,
+            }
+        ]
+        captured: list = []
+        with self._mock_bench_run(baseline_benches, captured_args=captured):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cli.main(
+                    [
+                        "bench",
+                        "--root",
+                        str(self.root),
+                        "-g",
+                        "alpha",
+                        "-g",
+                        "beta",
+                        "--file",
+                        "foo.spec.luau",
+                        "--ci",
+                        "-a",
+                        "--extra",
+                    ]
+                )
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(captured[0].grep, ["alpha", "beta"])
+        self.assertEqual(captured[0].file, ["foo.spec.luau"])
+        self.assertTrue(captured[0].ci)
+        self.assertEqual(captured[0].program_args, ["--extra"])
+        bench_parser = cli.build(["bench"])
+        bench_help = bench_parser.format_help()
+        self.assertNotIn("--exclude-tag", bench_help)
+
 
 if __name__ == "__main__":
     unittest.main()
