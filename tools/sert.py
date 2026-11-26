@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 
 REPO = "kohltastrophe/sert"
-DEFAULT_VERSION = "0.2.1"
+DEFAULT_VERSION = "0.3.0"
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 

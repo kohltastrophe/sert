@@ -177,7 +177,7 @@ Runs `sert lint` and `sert run --coverage` concurrently, enforces `sert coverage
 
 | Section | Key settings |
 | --- | --- |
-| `[sert]` | `version = "0.2.1"`, `repo = "kohltastrophe/sert"` |
+| `[sert]` | `version = "0.3.0"`, `repo = "kohltastrophe/sert"` |
 | `[test]` | `specs = ["test/**/*.spec.luau"]`, `entries = []`, `runner = "luau"`, `codegen = true`, `setup = ""`, `stage = ""`, `globals = ""`, `jobs = <CPU count>`, `timeout = 120`, `repeat = 1`, `slowest = <unset>`, `allow_focused = false` |
 | `[studio]` | `project = "default.project.json"`, `specs = [...]`, `mode = "play"`, `device = ""`, `clients = 1`, `warm = false`, `studio = ""`, `bridge = ""`, `capture = false`, `sides = [...]`, `timeout = 900`, `out = "build/sert"`, `hooks = ""`, `config = ""`, `runner = ""`, `[studio.suites.<name>]` |
 | `[cloud]` | `project = ""`, `specs = [...]`, `script = ""`, `shards = []`, `shard_limit = 0`, `jobs = 8`, `max_workers = 10`, `timeout = 300` |
