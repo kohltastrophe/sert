@@ -1,7 +1,9 @@
 --!strict
+local format = require("../src/core/format")
 local registerAggregator = require("./fixtures/aggregator")
 local registerOther = require("./fixtures/Other.spec")
 local registerSuite = require("./fixtures/suite")
+local propInternal = require("../src/prop/internal")
 local registry = require("../src/core/registry")
 local runner = require("../src/core/runner")
 local sert = require("../src")
@@ -467,6 +469,32 @@ sert.describe("CI focus gate, filtering, sharding, and parseCliArgs", function()
 		sert.eq(type(shortGrep.seed), "number")
 		sert.eq(shortGrep.replay, "tok_abc")
 
+		-- Multiple -g/--grep and --exclude flags promote cleanly without leaving single-value AND filters active
+		local multiOpts = sert.parseCliArgs({
+			"-g",
+			"alpha_%d+$",
+			"--grep",
+			"beta_%d+$",
+			"--exclude",
+			"alpha_9$",
+			"--exclude",
+			"beta_9$",
+		})
+		sert.eq(multiOpts.grep, nil)
+		sert.eq(multiOpts.greps, { "alpha_%d+$", "beta_%d+$" })
+		sert.eq(multiOpts.exclude, nil)
+		sert.eq(multiOpts.excludes, { "alpha_9$", "beta_9$" })
+		local ranMulti: { string } = {}
+		local multiRes = runIsolated(function()
+			sert.test("alpha_1", function() table.insert(ranMulti, "alpha_1") end)
+			sert.test("alpha_9", function() table.insert(ranMulti, "alpha_9") end)
+			sert.test("beta_2", function() table.insert(ranMulti, "beta_2") end)
+			sert.test("beta_9", function() table.insert(ranMulti, "beta_9") end)
+			sert.test("gamma_3", function() table.insert(ranMulti, "gamma_3") end)
+		end, multiOpts)
+		sert.eq(multiRes.passed, 2)
+		sert.eq(ranMulti, { "alpha_1", "beta_2" })
+
 		sert.throws(function() sert.parseCliArgs("--unknown-flag") end, "unknown flag")
 		sert.throws(function() sert.parseCliArgs("one", "two") end, "one filter only")
 		sert.throws(function() sert.parseCliArgs("--shard=5/3") end, "--shard")
@@ -904,28 +932,34 @@ sert.describe("runner teardown, yield driver, mutant batches, and prop shrinking
 		local slot = registry.mutant._slot
 		local prevLoad = registry.mutant.traceLoadHits
 		local prevMut = registry.mutant.get()
+		local prevSlotId, prevHits = slot.id, slot.hits
 		ctx:defer(function()
 			registry.mutant.traceLoadHits = prevLoad
-			registry.mutant.set(prevMut)
+			if prevSlotId < 0 then
+				registry.mutant.setTrace(true, prevHits)
+			else
+				registry.mutant.set(prevMut)
+			end
 		end)
 
+		registry.mutant.set(nil)
 		local observedInTrace: { any } = {}
 		local traceLines = sert.capture(function()
-			local loadHits: { [number]: boolean } = { [101] = true }
+			local loadHits: { [number]: boolean } = { [900101] = true }
 			registry.mutant.traceLoadHits = loadHits
 			local traceRes = runIsolated(function()
 				sert.describe("traced suite", function()
-					sert.beforeAll(function() slot.h(202) end)
+					sert.beforeAll(function() slot.h(900202) end)
 					sert.test("first throws after hit", function()
 						table.insert(observedInTrace, sert.mutant())
-						slot.h(303)
+						slot.h(900303)
 						error("boom inside traced test", 0)
 					end)
 					sert.test("second runs cleanly after error", function()
 						table.insert(observedInTrace, slot.id)
-						slot.h(404)
+						slot.h(900404)
 					end)
-					sert.afterAll(function() slot.h(999) end)
+					sert.afterAll(function() slot.h(900999) end)
 				end)
 			end, { traceMutants = true })
 			sert.eq(traceRes.passed, 1)
@@ -935,12 +969,31 @@ sert.describe("runner teardown, yield driver, mutant batches, and prop shrinking
 		sert.eq(registry.mutant.get(), nil)
 		sert.eq(slot.id, 0)
 
+		-- `--trace-mutants` via parseCliArgs restores outer trace/mutant state once `sert.run` completes
+		local traceCliOpts = sert.parseCliArgs({ "--trace-mutants" })
+		sert.eq(slot.id, -1)
+		local cliTraceRes = runIsolated(function()
+			sert.test("cli trace clean", function() sert.ok(slot.id < 0) end)
+		end, traceCliOpts)
+		sert.eq(cliTraceRes.passed, 1)
+		sert.eq(slot.id, 0)
+		sert.eq(registry.mutant.traceLoadHits, nil)
+
 		local traceText = table.concat(traceLines, "\n")
-		sert.contains(traceText, "[sert-trace] 1|")
-		sert.contains(traceText, "|101,202,303|")
-		sert.contains(traceText, "[sert-trace] 2|")
-		sert.contains(traceText, "|101,202,404|")
-		sert.eq(string.find(traceText, "999", 1, true), nil)
+		local csv1 = string.match(traceText, "%[sert%-trace%] 1|%d+|([^|]*)|")
+		local csv2 = string.match(traceText, "%[sert%-trace%] 2|%d+|([^|]*)|")
+		sert.ok(csv1 ~= nil and csv2 ~= nil)
+		local pad1 = `,{csv1},`
+		local pad2 = `,{csv2},`
+		sert.contains(pad1, ",900101,")
+		sert.contains(pad1, ",900202,")
+		sert.contains(pad1, ",900303,")
+		sert.eq(string.find(pad1, ",900404,", 1, true), nil)
+		sert.contains(pad2, ",900101,")
+		sert.contains(pad2, ",900202,")
+		sert.contains(pad2, ",900404,")
+		sert.eq(string.find(pad2, ",900303,", 1, true), nil)
+		sert.eq(string.find(traceText, "900999", 1, true), nil)
 
 		-- Batch `mutantTests` runs ONLY specified indices in exact order, skipping unrelated slow tests.
 		local ranByMutant: { [number]: { string } } = {}
@@ -959,24 +1012,24 @@ sert.describe("runner teardown, yield driver, mutant batches, and prop shrinking
 			sert.test("test 1", function() record("t1") end)
 			sert.test("test 2", function()
 				record("t2")
-				sert.ne(sert.mutant(), 12)
+				sert.ne(sert.mutant(), 900012)
 			end)
 			sert.test("test 3", function()
 				record("t3")
-				sert.ne(sert.mutant(), 11)
+				sert.ne(sert.mutant(), 900011)
 			end)
 		end, {
-			mutants = { 11, 12, 13 },
-			mutantTests = { [11] = { 3, 1 }, [12] = { 2 }, [13] = { 1 } },
+			mutants = { 900011, 900012, 900013 },
+			mutantTests = { [900011] = { 3, 1 }, [900012] = { 2 }, [900013] = { 1 } },
 		})
 		sert.eq(batchRes.mutants, {
-			{ id = 11, killed = true },
-			{ id = 12, killed = true },
-			{ id = 13, killed = false },
+			{ id = 900011, killed = true },
+			{ id = 900012, killed = true },
+			{ id = 900013, killed = false },
 		})
-		sert.eq(ranByMutant[11], { "t3" })
-		sert.eq(ranByMutant[12], { "t2" })
-		sert.eq(ranByMutant[13], { "t1" })
+		sert.eq(ranByMutant[900011], { "t3" })
+		sert.eq(ranByMutant[900012], { "t2" })
+		sert.eq(ranByMutant[900013], { "t1" })
 
 		-- Single `mutant` with `mutantTests` also restricts and orders selected tests.
 		local singleRan: { string } = {}
@@ -988,11 +1041,11 @@ sert.describe("runner teardown, yield driver, mutant batches, and prop shrinking
 				sert.fail("killed by s3")
 			end)
 		end, {
-			mutant = 77,
-			mutantTests = { [77] = { 2, 3 } },
+			mutant = 900077,
+			mutantTests = { [900077] = { 2, 3 } },
 		})
 		sert.eq(singleRes.failed, 1)
-		sert.eq(singleRan, { "s2:77", "s3:77" })
+		sert.eq(singleRan, { "s2:900077", "s3:900077" })
 	end)
 
 	sert.test("formats sert.prop shrinker reports, seeds/replay roundtrips, and exhaustive/budget edges", function()
@@ -1119,7 +1172,7 @@ sert.describe("runner teardown, yield driver, mutant batches, and prop shrinking
 			)
 			sert.prop(
 				"vacuous prop",
-				function(g: sert.GenContext) sert.prop.vacuous(g, "empty domain") end,
+				function(g: sert.GenContext) propInternal.vacuous(g, "empty domain") end,
 				{ runs = 3 }
 			)
 		end)
@@ -1128,4 +1181,216 @@ sert.describe("runner teardown, yield driver, mutant batches, and prop shrinking
 		sert.contains(regAndAssume.failures[2], "impossible precondition (discarded")
 		sert.contains(regAndAssume.failures[3], "empty domain in all 3 cases")
 	end)
+
+	sert.test(
+		"preserves helper stack traces, timeout culprit tracebacks, stage scrubbing, multi-grep, and filtered CI focus",
+		function(ctx)
+			local helpers: { innerFail: () -> (), outerHelper: () -> (), stalledHelper: () -> () } = {} :: any
+			function helpers.innerFail() sert.eq(1, 2) end
+			function helpers.outerHelper() helpers.innerFail() end
+			function helpers.stalledHelper() coroutine.yield() end
+			local stackRes = runIsolated(function()
+				sert.test("nested helper failure", function() helpers.outerHelper() end)
+			end)
+			sert.eq(stackRes.failed, 1)
+			sert.contains(stackRes.failures[1], "stack:")
+			sert.contains(stackRes.failures[1], "innerFail")
+			sert.contains(stackRes.failures[1], "outerHelper")
+			sert.eq(string.find(stackRes.failures[1], "core/assert", 1, true), nil)
+			sert.eq(string.find(stackRes.failures[1], "core/runner", 1, true), nil)
+
+			if not sert.isRoblox then
+				local prevDriver = registry.getYieldDriver()
+				ctx:defer(function() registry.setYieldDriver(prevDriver) end)
+				registry.setYieldDriver(
+					function(_thread: thread, _timeout: number): (boolean, any) return false, nil end
+				)
+				local toRes = runIsolated(function()
+					sert.test("timed out helper", function() helpers.stalledHelper() end, { timeout = 0.05 })
+				end)
+				sert.eq(toRes.failed, 1)
+				sert.contains(toRes.failures[1], "test timed out after 0.05 s")
+				sert.contains(toRes.failures[1], "stalledHelper")
+			end
+
+			sert.eq(format.errorText(".sert/stage/specs/test/Foo.spec.luau:12: boom"), "test/Foo.spec.luau:12: boom")
+
+			local grepRes = runIsolated(function()
+				sert.test("item_1", function() end)
+				sert.test("item_2", function() end)
+				sert.test("other_9", function() end)
+			end, { greps = { "item_%d$", "other_%d$" }, excludes = { "item_2$" } })
+			sert.eq(grepRes.passed, 2)
+
+			local filteredCiFocus = runIsolated(function()
+				sert.test.focus("focused one", function() end)
+				sert.test("other case", function() end)
+			end, { ci = true, filter = "other case" })
+			sert.eq(filteredCiFocus.passed, 0)
+			sert.eq(filteredCiFocus.failed, 0)
+
+			local ciFocused = runIsolated(function()
+				sert.test.focus("focused one", function() end)
+				sert.test("other case", function() end)
+			end, { ci = true, filter = "focused one" })
+			sert.eq(ciFocused.passed, 1)
+			sert.eq(ciFocused.failed, 1)
+
+			-- --shuffle with --seed produces deterministic ordering and emits [sert-seed] shuffle <seed>
+			local orderA: { string } = {}
+			local outShuffle = sert.capture(function()
+				local shufRes = runIsolated(function()
+					sert.test("s1", function() table.insert(orderA, "s1") end)
+					sert.test("s2", function() table.insert(orderA, "s2") end)
+					sert.test("s3", function() table.insert(orderA, "s3") end)
+					sert.test("s4", function() table.insert(orderA, "s4") end)
+					sert.test("s5", function() table.insert(orderA, "s5") end)
+				end, { shuffle = true, seed = 2027, markers = true, quiet = false })
+				sert.eq(shufRes.shuffleSeed, 2027)
+			end)
+			sert.contains(table.concat(outShuffle, "\n"), "[sert-seed] shuffle 2027")
+			sert.ne(orderA, { "s1", "s2", "s3", "s4", "s5" })
+
+			local orderB: { string } = {}
+			runIsolated(function()
+				sert.test("s1", function() table.insert(orderB, "s1") end)
+				sert.test("s2", function() table.insert(orderB, "s2") end)
+				sert.test("s3", function() table.insert(orderB, "s3") end)
+				sert.test("s4", function() table.insert(orderB, "s4") end)
+				sert.test("s5", function() table.insert(orderB, "s5") end)
+			end, { shuffle = true, seed = 2027 })
+			sert.eq(orderA, orderB)
+
+			local orderC: { string } = {}
+			runIsolated(function()
+				sert.test("s1", function() table.insert(orderC, "s1") end)
+				sert.test("s2", function() table.insert(orderC, "s2") end)
+				sert.test("s3", function() table.insert(orderC, "s3") end)
+				sert.test("s4", function() table.insert(orderC, "s4") end)
+				sert.test("s5", function() table.insert(orderC, "s5") end)
+			end, { shuffle = true, seed = 9999 })
+			sert.ne(orderA, orderC)
+
+			-- --retry N marks transient failure -> pass as FLAKY and fails normally if all attempts fail
+			local triesFlaky = 0
+			local retryLines = sert.capture(function()
+				local retryRes = runIsolated(function()
+					sert.test("flaky test", function()
+						triesFlaky += 1
+						if triesFlaky == 1 then error("transient glitch", 0) end
+						sert.eq(triesFlaky, 2)
+					end)
+					sert.test("always bad", function() sert.fail("hard failure") end)
+				end, { retry = 1, quiet = false, markers = true })
+				sert.eq(retryRes.passed, 1)
+				sert.eq(retryRes.failed, 1)
+				sert.eq(retryRes.flaky, 1)
+				sert.eq(retryRes.flakyTests, { "flaky test" })
+			end)
+			local retryText = table.concat(retryLines, "\n")
+			sert.contains(retryText, "FLAKY flaky test")
+			local flakyMarker: { [string]: any }? = nil
+			for _, line in retryLines do
+				local raw = string.match(line, "^%[sert%-test%]%s*(.+)$")
+				if raw ~= nil then
+					local dec = format.jsonDecode(raw)
+					if dec.name == "flaky test" then flakyMarker = dec end
+				end
+			end
+			sert.ok(flakyMarker ~= nil)
+			sert.eq((flakyMarker :: any).status, "flaky")
+			sert.eq((flakyMarker :: any).attempts, 2)
+			sert.contains((flakyMarker :: any).firstError, "transient glitch")
+
+			-- [sert-test] emits bounded expected/actual on eq failure and sert.throws does not leak inner diffs
+			local diffLines = sert.capture(function()
+				runIsolated(function()
+					sert.test("eq structured diff", function() sert.eq({ a = 1, b = "got" }, { a = 1, b = "want" }) end)
+					sert.test("throws no leak", function()
+						sert.throws(function() sert.eq(10, 20) end)
+						error("plain error after throws", 0)
+					end)
+				end, { markers = true, quiet = false })
+			end)
+			local eqMarker: { [string]: any }? = nil
+			local throwsMarker: { [string]: any }? = nil
+			for _, line in diffLines do
+				local raw = string.match(line, "^%[sert%-test%]%s*(.+)$")
+				if raw ~= nil then
+					local dec = format.jsonDecode(raw)
+					if dec.name == "eq structured diff" then
+						eqMarker = dec
+					elseif dec.name == "throws no leak" then
+						throwsMarker = dec
+					end
+				end
+			end
+			sert.ok(eqMarker ~= nil)
+			sert.eq((eqMarker :: any).expected, { a = 1, b = "want" })
+			sert.eq((eqMarker :: any).actual, { a = 1, b = "got" })
+			sert.ok(throwsMarker ~= nil)
+			sert.eq((throwsMarker :: any).expected, nil)
+			sert.eq((throwsMarker :: any).actual, nil)
+
+			-- Symmetry across .skip.each / .focus.each / .roblox.skip.each + keyed dict rejection
+			local focusRuns = 0
+			local symRes = runIsolated(function()
+				sert.test.skip.each({ 1, 2 })("skip case %d", function() end)
+				sert.test.roblox.skip.each({ 1 })("roblox skip case %d", function() end)
+				sert.test.focus.each({ "a" })("focus case %s", function(caseVal: string)
+					focusRuns += 1
+					sert.eq(caseVal, "a")
+				end)
+				sert.test("unfocused", function() error("must not run", 0) end)
+			end)
+			sert.eq(focusRuns, 1)
+			sert.eq(symRes.passed, 1)
+			sert.eq(symRes.failed, 0)
+			sert.throws(function()
+				local dictCases: any = { first = 1 }
+				sert.test.each(dictCases)("bad %s", function() end)
+			end, "keyed dictionary")
+			sert.throws(function()
+				local dictTuples: any = { first = { 1, 2 } }
+				sert.prop.eachTuple(dictTuples)("bad %s", function() end)
+			end, "keyed dictionary")
+
+			-- PropOptions accepts smoke = true and tags = { ... }
+			local propMetaRes = runIsolated(function()
+				sert.prop(
+					"tagged smoke prop",
+					function(g: sert.Gen) local _ = g:int(1, 3) end,
+					{ runs = 2, smoke = true, tags = { "smoke", "fast" } }
+				)
+			end, { strictAssertions = true })
+			sert.eq(propMetaRes.passed, 1)
+			sert.eq(propMetaRes.failed, 0)
+			sert.eq(propMetaRes.zeroAssertionTests, {})
+
+			-- `slowest` timing summary works when enabled and is omitted when unset
+			local timedLines = sert.capture(function()
+				local timedRes = runIsolated(function()
+					sert.test("timed a", function()
+						local a = 1
+						sert.eq(a + 1, 2)
+					end)
+					sert.test("timed b", function()
+						local b = 2
+						sert.eq(b + 1, 3)
+					end)
+				end, { slowest = 1, quiet = false })
+				sert.eq(timedRes.passed, 2)
+			end)
+			sert.contains(table.concat(timedLines, "\n"), "slowest 1 test:")
+			local untimedLines = sert.capture(function()
+				runIsolated(function()
+					sert.test("untimed", function()
+						local c = 3
+						sert.eq(c + 1, 4)
+					end)
+				end, { quiet = false })
+			end)
+			sert.eq(string.find(table.concat(untimedLines, "\n"), "slowest ", 1, true), nil)
+		end
+	)
 end)

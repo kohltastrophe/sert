@@ -5,6 +5,7 @@ local assertions = require("../core/assert")
 local format = require("../core/format")
 local gen = require("./gen")
 local prop = require("../prop")
+local propInternal = require("./internal")
 local registry = require("../core/registry")
 local util = require("../core/util")
 
@@ -166,7 +167,7 @@ local function resolve(
 		where,
 		"option",
 		options,
-		if kind == "complexity" then registry.TEST_OPTIONS else prop.PROP_OPTIONS
+		if kind == "complexity" then registry.TEST_OPTIONS else propInternal.PROP_OPTIONS
 	)
 	if type(spec.gen) ~= "function" then
 		error(`{where}: expected spec.gen to be a generator function, got {util.typeof(spec.gen)}`, at)

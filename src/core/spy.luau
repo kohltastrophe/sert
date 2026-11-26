@@ -62,7 +62,12 @@ local function createSpy(initialImpl: ((...any) -> ...any)?): Spy
 		__call = function(_tbl: any, receiver: any, maybeFn: any): Spy
 			local fn = if rawequal(receiver, spyTable) then maybeFn else receiver
 			if fn ~= nil and type(fn) ~= "function" then
-				error(`spy:calls: expected a function or nil, got {util.typeof(fn)}`, util.outside())
+				if isCallableTableOrUserdata(fn) then
+					local callable = fn
+					fn = function(...: any): ...any return (callable :: any)(...) end
+				else
+					error(`spy:calls: expected a function or nil, got {util.typeof(fn)}`, util.outside())
+				end
 			end
 			currentImpl = fn
 			return (spyTable :: any) :: Spy
@@ -107,7 +112,7 @@ local function createSpy(initialImpl: ((...any) -> ...any)?): Spy
 	end
 
 	function spyTable.restore(self: any)
-		self:reset()
+		table.clear(onceQueue)
 		currentImpl = initialImpl
 		local restoreFn = restorers[self]
 		if restoreFn ~= nil then restoreFn() end
@@ -165,7 +170,7 @@ function spy.new(fnOrTbl: any?, key: any?, impl: ((...any) -> ...any)?): Spy
 		error(`sert.spy: expected a target table as 1st argument, got {util.typeof(fnOrTbl)}`, util.outside())
 	end
 	if table.isfrozen(fnOrTbl) then error("sert.spy: cannot spy on a frozen table", util.outside()) end
-	if impl ~= nil and type(impl) ~= "function" then
+	if impl ~= nil and type(impl) ~= "function" and not isCallableTableOrUserdata(impl) then
 		error(
 			`sert.spy: expected implementation function or nil as 3rd argument, got {util.typeof(impl)}`,
 			util.outside()
@@ -181,7 +186,7 @@ function spy.new(fnOrTbl: any?, key: any?, impl: ((...any) -> ...any)?): Spy
 	end
 
 	local delegate: ((...any) -> ...any)? = if impl ~= nil
-		then impl
+		then (if type(impl) == "function" then impl else function(...: any): ...any return (impl :: any)(...) end)
 		elseif type(original) == "function" then original
 		elseif isCallableTableOrUserdata(original) then function(...: any): ...any return (original :: any)(...) end
 		else nil

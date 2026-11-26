@@ -3,6 +3,7 @@
 -- `sert.prop`'s tape so shrinking, replay, and bounded-exhaustive enumeration work automatically.
 
 local prop = require("../prop")
+local propInternal = require("./internal")
 local util = require("../core/util")
 
 local IS_ROBLOX = (game :: any) ~= nil
@@ -17,7 +18,7 @@ local NumberRangeLib: any = if IS_ROBLOX then NumberRange else Datatypes.NumberR
 local RectLib: any = if IS_ROBLOX then Rect else Datatypes.Rect
 
 local equal = util.equal
-local mark = prop.markGenerator
+local mark = propInternal.markGenerator
 
 type Gen = prop.GenContext
 export type Generator<T> = prop.Generator<T>
@@ -26,7 +27,9 @@ local gen = {}
 
 -- Guard against passing a generator factory (`gen.int`) instead of a generator (`gen.int(1, 10)`).
 local function called(api: string, example: string, first: any)
-	if prop.isGen(first) then error(`{api}(…) makes a generator: pass {example}, not {api}`, util.outside()) end
+	if propInternal.isGen(first) then
+		error(`{api}(…) makes a generator: pass {example}, not {api}`, util.outside())
+	end
 end
 
 local function checkBounds(api: string, min: number?, max: number?): number
@@ -48,8 +51,8 @@ end
 --- Generates an integer in `[lo, hi]`, shrinking toward `0`.
 function gen.int(lo: number, hi: number): Generator<number>
 	called("gen.int", "gen.int(1, 10)", lo)
-	prop.checkRange("gen.int", lo, hi, true)
-	return mark(function(g: Gen): number return prop.drawInt(g, lo, hi) end)
+	propInternal.checkRange("gen.int", lo, hi, true)
+	return mark(function(g: Gen): number return propInternal.drawInt(g, lo, hi) end)
 end
 
 --- Options for mixing IEEE-754 special values into `gen.float`.
@@ -62,7 +65,7 @@ export type FloatOptions = {
 --- Generates a float in `[lo, hi)`, shrinking toward `0`. Pass `options` to mix in `-0.0`, `±inf`, or `NaN` on a fixed-width draw span.
 function gen.float(lo: number, hi: number, options: FloatOptions?): Generator<number>
 	called("gen.float", "gen.float(0, 1)", lo)
-	prop.checkRange("gen.float", lo, hi, false)
+	propInternal.checkRange("gen.float", lo, hi, false)
 	local specials: { number } = {}
 	if options ~= nil then
 		for key in next, options :: any do
@@ -78,15 +81,15 @@ function gen.float(lo: number, hi: number, options: FloatOptions?): Generator<nu
 		if options.nan then table.insert(specials, 0 / 0) end
 	end
 	if #specials == 0 then
-		return mark(function(g: Gen): number return prop.drawFloat(g, lo, hi) end)
+		return mark(function(g: Gen): number return propInternal.drawFloat(g, lo, hi) end)
 	end
-	local width = prop.floatDrawWidth(lo, hi)
+	local width = propInternal.floatDrawWidth(lo, hi)
 	return mark(function(g: Gen): number
 		-- Tag 0 is always finite (`0.0` at all-zero draws); special tags pad `width` zero-range slots so downstream draws never shift.
-		local tag = prop.drawTag(g, #specials, 0.1)
-		if tag == 0 then return prop.drawFloat(g, lo, hi) end
+		local tag = propInternal.drawTag(g, #specials, 0.1)
+		if tag == 0 then return propInternal.drawFloat(g, lo, hi) end
 		for _ = 1, width do
-			prop.drawZero(g)
+			propInternal.drawZero(g)
 		end
 		return specials[tag]
 	end)
@@ -164,7 +167,7 @@ function gen.tuple(first: { Generator<any> } | Generator<any>, ...: Generator<an
 end
 
 --- Default character set used by `gen.string` and `g:string`.
-gen.CHARACTERS = prop.CHARACTERS
+gen.CHARACTERS = propInternal.CHARACTERS
 
 --- Generates a string of `min` (`0`) to `max` (`g.size`) characters from `charset` (default `gen.CHARACTERS`).
 function gen.string(charset: (string | Generator<string>)?, min: number?, max: number?): Generator<string>
@@ -202,19 +205,19 @@ function gen.filter<T>(source: Generator<T>, predicate: (T) -> boolean, maxTries
 	local file, line = debug.info(callerLevel, "sl")
 	local made = if file ~= nil then `{file}:{line}` else "?"
 	return mark(function(g: Gen): T
-		local firstMark = prop.mark(g)
+		local firstMark = propInternal.mark(g)
 		for attempt = 1, limit do
-			local attemptMark = prop.mark(g)
+			local attemptMark = propInternal.mark(g)
 			local value = source(g)
 			if predicate(value) then
 				if attempt > 1 then
-					local fullTape = prop.tape(g)
-					prop.hint(g, firstMark, #fullTape, table.move(fullTape, attemptMark, #fullTape, 1, {}))
+					local fullTape = propInternal.tape(g)
+					propInternal.hint(g, firstMark, #fullTape, table.move(fullTape, attemptMark, #fullTape, 1, {}))
 				end
 				return value
 			end
 		end
-		return prop.exhaust(g, `gen.filter ({made}): predicate not satisfied after {limit} attempts`, 0)
+		return propInternal.exhaust(g, `gen.filter ({made}): predicate not satisfied after {limit} attempts`, 0)
 	end)
 end
 
@@ -253,7 +256,9 @@ function gen.uniqueList<T>(element: Generator<T>, min: number?, max: number?): G
 				if s ~= nil and s.forced ~= nil and #s.out >= #s.forced then break end
 				if addUnique(out, seen, deep, element(g)) and #out >= least then break end
 			end
-			if #out < least then prop.exhaust(g, `gen.uniqueList: could not draw {least} unique elements`, 2) end
+			if #out < least then
+				propInternal.exhaust(g, `gen.uniqueList: could not draw {least} unique elements`, 2)
+			end
 		end
 		return out
 	end)
@@ -492,7 +497,7 @@ function gen.boundaryInt(lo: number?, hi: number?): Generator<number>
 	called("gen.boundaryInt", "gen.boundaryInt()", lo)
 	local minLo = if lo ~= nil then lo else -2147483648
 	local maxHi = if hi ~= nil then hi else 2147483647
-	prop.checkRange("gen.boundaryInt", minLo, maxHi, true)
+	propInternal.checkRange("gen.boundaryInt", minLo, maxHi, true)
 	local rawCandidates: { number } = {
 		0,
 		1,
@@ -527,26 +532,26 @@ function gen.boundaryInt(lo: number?, hi: number?): Generator<number>
 		if aa ~= ab then return aa < ab end
 		return a > b
 	end)
-	local width = prop.intDrawWidth(minLo, maxHi)
+	local width = propInternal.intDrawWidth(minLo, maxHi)
 	return mark(function(g: Gen): number
-		local firstMark = prop.mark(g)
+		local firstMark = propInternal.mark(g)
 		-- Branch on tag before drawing `[-2^31, 2^31 - 1]` so bounded-exhaustive enumeration never explodes.
-		local tag = prop.drawTag(g, #candidates, 0.7)
+		local tag = propInternal.drawTag(g, #candidates, 0.7)
 		if tag == 0 then
 			if g.exhaustive then
 				if minLo < 0 and maxHi > 0 then
 					local span = math.max(g.size, 1)
-					return prop.drawInt(g, math.max(minLo, -span), math.min(maxHi, span))
+					return propInternal.drawInt(g, math.max(minLo, -span), math.min(maxHi, span))
 				elseif minLo >= 0 then
-					return prop.drawInt(g, minLo, math.min(maxHi, minLo + g.size))
+					return propInternal.drawInt(g, minLo, math.min(maxHi, minLo + g.size))
 				else
-					return prop.drawInt(g, math.max(minLo, maxHi - g.size), maxHi)
+					return propInternal.drawInt(g, math.max(minLo, maxHi - g.size), maxHi)
 				end
 			end
-			return prop.drawInt(g, minLo, maxHi)
+			return propInternal.drawInt(g, minLo, maxHi)
 		end
 		for _ = 1, width do
-			prop.drawZero(g)
+			propInternal.drawZero(g)
 		end
 		local picked = candidates[tag]
 		if not g.exhaustive then
@@ -555,7 +560,7 @@ function gen.boundaryInt(lo: number?, hi: number?): Generator<number>
 				elseif maxHi <= 0 then { 0, maxHi - picked }
 				elseif picked >= 0 then { 0, 0, picked }
 				else { 0, 1, -picked - 1 }
-			prop.hint(g, firstMark, firstMark + width, hintDraws)
+			propInternal.hint(g, firstMark, firstMark + width, hintDraws)
 		end
 		return picked
 	end)
@@ -566,7 +571,7 @@ function gen.boundaryFloat(lo: number?, hi: number?): Generator<number>
 	called("gen.boundaryFloat", "gen.boundaryFloat()", lo)
 	local minLo = if lo ~= nil then lo else -1e6
 	local maxHi = if hi ~= nil then hi else 1e6
-	prop.checkRange("gen.boundaryFloat", minLo, maxHi, false)
+	propInternal.checkRange("gen.boundaryFloat", minLo, maxHi, false)
 	local finiteCandidates: { number } = {
 		0.0,
 		1.0,
@@ -600,14 +605,50 @@ function gen.boundaryFloat(lo: number?, hi: number?): Generator<number>
 	table.insert(specials, -math.huge)
 	table.insert(specials, 0 / 0)
 
-	local width = prop.floatDrawWidth(minLo, maxHi)
+	local width = propInternal.floatDrawWidth(minLo, maxHi)
+	local origin = math.clamp(0, minLo, maxHi)
+	local up, down = maxHi - origin, origin - minLo
+	local floatSteps = propInternal.U32 - 1
 	return mark(function(g: Gen): number
-		local tag = prop.drawTag(g, #specials, 0.7)
-		if tag == 0 then return prop.drawFloat(g, minLo, maxHi) end
+		local firstMark = propInternal.mark(g)
+		local tag = propInternal.drawTag(g, #specials, 0.7)
+		if tag == 0 then return propInternal.drawFloat(g, minLo, maxHi) end
 		for _ = 1, width do
-			prop.drawZero(g)
+			propInternal.drawZero(g)
 		end
-		return specials[tag]
+		local picked = specials[tag]
+		if not g.exhaustive and width > 0 then
+			local hintDraws: { number }
+			if
+				picked == picked
+				and math.abs(picked) < math.huge
+				and picked >= minLo
+				and picked <= maxHi
+				and not (picked == 0 and 1 / picked < 0)
+			then
+				if up <= 0 then
+					local off = if picked == origin or down <= 0
+						then 0
+						else math.clamp(math.round((origin - picked) / down * floatSteps), 0, floatSteps)
+					hintDraws = { 0, off }
+				elseif down <= 0 then
+					local off = if picked == origin or up <= 0
+						then 0
+						else math.clamp(math.round((picked - origin) / up * (floatSteps + 1)), 0, floatSteps)
+					hintDraws = { 0, off }
+				elseif picked < 0 then
+					local off = math.clamp(math.round((-picked / down) * (floatSteps + 1)) - 1, 0, floatSteps)
+					hintDraws = { 0, 1, off }
+				else
+					local off = math.clamp(math.round((picked / up) * (floatSteps + 1)), 0, floatSteps)
+					hintDraws = { 0, 0, off }
+				end
+			else
+				hintDraws = if width == 2 then { 0, 0, 0 } else { 0, 0 }
+			end
+			propInternal.hint(g, firstMark, firstMark + width, hintDraws)
+		end
+		return picked
 	end)
 end
 
@@ -758,7 +799,7 @@ end
 
 --- Draws a single value from `generator` outside a property test using `seed` (default `0x5EED`) and `size` (default `40`).
 function gen.sample<T>(generator: Generator<T>, seed: number?, size: number?): T
-	return generator(prop.gen(if seed ~= nil then seed else prop.DEFAULT_BASE, size))
+	return generator(propInternal.gen(if seed ~= nil then seed else propInternal.DEFAULT_BASE, size))
 end
 
 return gen

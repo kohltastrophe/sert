@@ -22,6 +22,7 @@ export type ShrinkBudget = { tries: number?, seconds: number? }
 export type RunOptions = {
 	filter: string?,
 	grep: string?,
+	greps: { string }?,
 	filters: { string }?,
 	names: { string }?,
 	exclude: string?,
@@ -41,6 +42,8 @@ export type RunOptions = {
 	testTimeout: number?,
 	timeout: number?,
 	repeatCount: number?,
+	retry: number?,
+	shuffle: boolean?,
 	slowest: number?,
 	failFast: boolean?,
 	quiet: boolean?,
@@ -85,6 +88,7 @@ export type AssertionTracker = {
 	tautologies: { TautologyRecord },
 	inlineOrdinals: { [string]: number },
 	fileOrdinal: number,
+	lastFailureDiff: { expected: any, actual: any }?,
 }
 
 export type BenchContext = {
@@ -208,10 +212,25 @@ export type TestEachTupleFn = (
 	tuples: { { any } }
 ) -> (fmt: EachFormat<{ any }>, fn: (...any) -> (), options: TestOptions?) -> ()
 
+export type TestSkipApi = typeof(setmetatable(
+	{} :: {
+		each: TestEachFn,
+		eachTuple: TestEachTupleFn,
+	},
+	{} :: { __call: (self: any, name: string, fn: TestFn?, options: TestOptions?) -> () }
+))
+export type TestFocusApi = typeof(setmetatable(
+	{} :: {
+		each: TestEachFn,
+		eachTuple: TestEachTupleFn,
+	},
+	{} :: { __call: (self: any, name: string, fn: TestFn, options: TestOptions?) -> () }
+))
+
 export type TargetTestApi = typeof(setmetatable(
 	{} :: {
-		skip: TestSkipFn,
-		focus: TestCall,
+		skip: TestSkipApi,
+		focus: TestFocusApi,
 		each: TestEachFn,
 		eachTuple: TestEachTupleFn,
 	},
@@ -220,8 +239,8 @@ export type TargetTestApi = typeof(setmetatable(
 
 export type TestApi = typeof(setmetatable(
 	{} :: {
-		skip: TestSkipFn,
-		focus: TestCall,
+		skip: TestSkipApi,
+		focus: TestFocusApi,
 		each: TestEachFn,
 		eachTuple: TestEachTupleFn,
 		roblox: TargetTestApi,
@@ -240,10 +259,25 @@ export type DescribeEachTupleFn = (
 	tuples: { { any } }
 ) -> (fmt: EachFormat<{ any }>, fn: (...any) -> (), options: DescribeOptions?) -> ()
 
+export type DescribeSkipApi = typeof(setmetatable(
+	{} :: {
+		each: DescribeEachFn,
+		eachTuple: DescribeEachTupleFn,
+	},
+	{} :: { __call: (self: any, prefix: string, fn: (() -> ())?, options: DescribeOptions?) -> () }
+))
+export type DescribeFocusApi = typeof(setmetatable(
+	{} :: {
+		each: DescribeEachFn,
+		eachTuple: DescribeEachTupleFn,
+	},
+	{} :: { __call: (self: any, prefix: string, fn: () -> (), options: DescribeOptions?) -> () }
+))
+
 export type TargetDescribeApi = typeof(setmetatable(
 	{} :: {
-		skip: DescribeSkipFn,
-		focus: DescribeCall,
+		skip: DescribeSkipApi,
+		focus: DescribeFocusApi,
 		each: DescribeEachFn,
 		eachTuple: DescribeEachTupleFn,
 	},
@@ -252,8 +286,8 @@ export type TargetDescribeApi = typeof(setmetatable(
 
 export type DescribeApi = typeof(setmetatable(
 	{} :: {
-		skip: DescribeSkipFn,
-		focus: DescribeCall,
+		skip: DescribeSkipApi,
+		focus: DescribeFocusApi,
 		each: DescribeEachFn,
 		eachTuple: DescribeEachTupleFn,
 		roblox: TargetDescribeApi,
@@ -299,6 +333,12 @@ local mutant = {
 	_slot = mutantSlot,
 	installCallerGlobals = nil :: (() -> ())?,
 	parsed = nil :: { id: number, outer: number }?,
+	parsedTrace = nil :: {
+		outerSlotId: number,
+		outerHits: { [number]: boolean }?,
+		outerMutant: number?,
+		outerLoadHits: { [number]: boolean }?,
+	}?,
 	traceLoadHits = nil :: { [number]: boolean }?,
 }
 
@@ -550,6 +590,7 @@ local RUN_OPTIONS = {
 	"filter",
 	"filters",
 	"grep",
+	"greps",
 	"list",
 	"markers",
 	"mutant",
@@ -562,10 +603,12 @@ local RUN_OPTIONS = {
 	"repeatCount",
 	"replay",
 	"requireTests",
+	"retry",
 	"runs",
 	"seed",
 	"seeds",
 	"shard",
+	"shuffle",
 	"silent",
 	"slowest",
 	"snapshots",
@@ -764,6 +807,7 @@ function registry.beginTestAssertions(): AssertionTracker
 		tautologies = {},
 		inlineOrdinals = {},
 		fileOrdinal = 0,
+		lastFailureDiff = nil,
 	}
 	activeState.assertions = tracker
 	return tracker
@@ -779,8 +823,7 @@ end
 --- Returns the active test's assertion tracker (`nil` when no test body is being tracked).
 function registry.activeTestAssertions(): AssertionTracker? return activeState.assertions end
 
---- Records an assertion invocation (and optional tautology note) against the active test.
-function registry.recordAssertion(kind: string, tautology: string?)
+local function activeTracker(): (State, AssertionTracker?)
 	local owner: State = activeState
 	local tracker = owner.assertions
 	if tracker == nil then
@@ -793,6 +836,18 @@ function registry.recordAssertion(kind: string, tautology: string?)
 			end
 		end
 	end
+	return owner, tracker
+end
+
+--- Records structured expected/actual diff metadata for the failing assertion in the active test.
+function registry.recordFailureDiff(expected: any, actual: any)
+	local _, tracker = activeTracker()
+	if tracker ~= nil then tracker.lastFailureDiff = { expected = expected, actual = actual } end
+end
+
+--- Records an assertion invocation (and optional tautology note) against the active test.
+function registry.recordAssertion(kind: string, tautology: string?)
+	local owner, tracker = activeTracker()
 	if tracker == nil then return end
 	tracker.count += 1
 	tracker.kinds[kind] = (tracker.kinds[kind] or 0) + 1
@@ -838,7 +893,6 @@ function registry.skipReason(test: Test): SkipReason
 	return "explicit"
 end
 
-function registry.qualifyName(name: string): string return qualify(name) end
 function registry.inline(): boolean return activeState.running ~= nil end
 function registry.currentRun(): Current? return activeState.running end
 function registry.currentOptions(): RunOptions? return activeState.options end
@@ -905,6 +959,9 @@ local function buildTestNamespace(
 		if type(cases) ~= "table" then
 			error(`sert.{apiPrefix}.each: expected a table of cases, got {util.typeof(cases)}`, util.outside())
 		end
+		if #cases == 0 and next(cases :: { [any]: any }) ~= nil then
+			error(`sert.{apiPrefix}.each: expected a 1-indexed array of cases, got a keyed dictionary`, util.outside())
+		end
 		return function(fmt: EachFormat<T>, fn: (case: T, ctx: TestContext) -> (), options: TestOptions?)
 			if fixedMode ~= "skip" or fn ~= nil then
 				registry.checkFn(`{apiPrefix}.each`, fmt, fn, options, "(cases)(fmt, fn, opts?)")
@@ -924,6 +981,12 @@ local function buildTestNamespace(
 		if type(tuples) ~= "table" then
 			error(
 				`sert.{apiPrefix}.eachTuple: expected a table of tuple rows, got {util.typeof(tuples)}`,
+				util.outside()
+			)
+		end
+		if #tuples == 0 and next(tuples :: { [any]: any }) ~= nil then
+			error(
+				`sert.{apiPrefix}.eachTuple: expected a 1-indexed array of tuple rows, got a keyed dictionary`,
 				util.outside()
 			)
 		end
@@ -1047,6 +1110,9 @@ local function buildDescribeNamespace(
 		if type(cases) ~= "table" then
 			error(`sert.{apiPrefix}.each: expected a table of cases, got {util.typeof(cases)}`, util.outside())
 		end
+		if #cases == 0 and next(cases :: { [any]: any }) ~= nil then
+			error(`sert.{apiPrefix}.each: expected a 1-indexed array of cases, got a keyed dictionary`, util.outside())
+		end
 		return function(fmt: EachFormat<T>, fn: (case: T) -> (), options: DescribeOptions?)
 			registry.checkFn(`{apiPrefix}.each`, fmt, fn, options, "(cases)(fmt, fn, opts?)")
 			registry.checkKeys(`sert.{apiPrefix}.each`, "option", options, DESCRIBE_OPTIONS)
@@ -1063,6 +1129,12 @@ local function buildDescribeNamespace(
 		if type(tuples) ~= "table" then
 			error(
 				`sert.{apiPrefix}.eachTuple: expected a table of tuple rows, got {util.typeof(tuples)}`,
+				util.outside()
+			)
+		end
+		if #tuples == 0 and next(tuples :: { [any]: any }) ~= nil then
+			error(
+				`sert.{apiPrefix}.eachTuple: expected a 1-indexed array of tuple rows, got a keyed dictionary`,
 				util.outside()
 			)
 		end

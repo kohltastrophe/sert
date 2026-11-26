@@ -7,18 +7,10 @@ local util = require("./util")
 
 local snapshot = {}
 
-local function stripStagePrefix(path: string): string
-	local stageSpec = string.match(path, "%.sert/stage/specs/(.+)$")
-	if stageSpec ~= nil then return stageSpec end
-	local stage = string.match(path, "%.sert/stage/(.+)$")
-	if stage ~= nil then return stage end
-	return path
-end
-
 local function cleanSourcePath(source: string): string
 	local clean = string.gsub(string.gsub(source, "^[@=]", ""), "\\", "/")
 	clean = string.gsub(clean, "^%./", "")
-	return stripStagePrefix(clean)
+	return util.stripStagePrefix(clean)
 end
 
 local function callerLocation(): (string, number)
@@ -140,8 +132,8 @@ local function lookupSnapshotBucket(
 	normFile: string
 ): { [string]: string }?
 	if type(store) ~= "table" then return nil end
-	local unstageRaw = stripStagePrefix(rawFile)
-	local unstageNorm = stripStagePrefix(normFile)
+	local unstageRaw = util.stripStagePrefix(rawFile)
+	local unstageNorm = util.stripStagePrefix(normFile)
 	for _, keyCandidate in { rawFile, unstageRaw, normFile, unstageNorm } do
 		local hit = store[keyCandidate]
 		if type(hit) == "table" then return hit end
@@ -150,8 +142,20 @@ local function lookupSnapshotBucket(
 	if stem ~= nil and type(store[stem]) == "table" then return store[stem] end
 	for candidate, bucket in next, store do
 		if type(candidate) == "string" and type(bucket) == "table" then
-			local candNorm = stripStagePrefix(registry.normalizeSpecFile(candidate))
-			if candNorm == unstageNorm or candNorm == normFile then return bucket end
+			local candNorm = util.stripStagePrefix(registry.normalizeSpecFile(candidate))
+			if
+				candNorm == unstageNorm
+				or candNorm == normFile
+				or (
+					candNorm ~= ""
+					and (
+						string.sub(unstageNorm, -(#candNorm + 1)) == "/" .. candNorm
+						or string.sub(normFile, -(#candNorm + 1)) == "/" .. candNorm
+					)
+				)
+			then
+				return bucket
+			end
 		end
 	end
 	return nil

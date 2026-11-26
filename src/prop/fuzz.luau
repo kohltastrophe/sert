@@ -4,6 +4,7 @@
 local corpusCodec = require("./corpus")
 local format = require("../core/format")
 local prop = require("../prop")
+local propInternal = require("./internal")
 local rng = require("../core/rng")
 
 export type CorpusItem = {
@@ -24,6 +25,7 @@ export type FuzzConfig = {
 	propCountHint: number?,
 	filter: string?,
 	grep: string?,
+	greps: { string }?,
 	files: { string }?,
 	dictStrings: { string }?,
 	dictNumbers: { number }?,
@@ -142,7 +144,7 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 		return withoutTracking(function(): string
 			local normTape: { number } = table.create(#tape, 0)
 			for i = 1, #tape do
-				normTape[i] = bit32.band(math.floor(tape[i]), 0xFFFFFFFF)
+				normTape[i] = math.max(0, math.floor(tape[i]))
 			end
 			local normSeed = math.floor(seedVal)
 			local normSize = math.max(0, math.floor(sizeVal))
@@ -168,7 +170,7 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 		return lo + (randU32() % (hi - lo + 1))
 	end
 
-	local charsStr: string = propApi.CHARACTERS or prop.CHARACTERS
+	local charsStr: string = propInternal.CHARACTERS
 	local charMap: { [string]: number } = {}
 	for ci = 1, #charsStr do
 		local ch = string.sub(charsStr, ci, ci)
@@ -634,7 +636,9 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 		runOptions: any,
 		_filter: string,
 		trialHook: any,
-		metaFile: string?
+		metaFile: string?,
+		shrinkHook: any?,
+		shortName: string?
 	): any
 		fuzzCtrl.reset()
 		local opts = options or {}
@@ -682,8 +686,9 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 
 		local corpusList: { any } = {}
 		local initialSeeds: { CorpusItem } = {}
-		if cfg.regressions ~= nil and type(cfg.regressions[name]) == "table" then
-			for _, tok in cfg.regressions[name] do
+		local function addRegressionTokens(list: any)
+			if type(list) ~= "table" then return end
+			for _, tok in list do
 				local parsed = withoutTracking(function() return corpusCodec.parseReplay(tok) end)
 				if parsed ~= nil then
 					if parsed.kind == "tape" then
@@ -694,6 +699,13 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 				end
 			end
 		end
+		if cfg.regressions ~= nil then
+			addRegressionTokens(cfg.regressions[name])
+			if type(shortName) == "string" and shortName ~= name then
+				addRegressionTokens(cfg.regressions[shortName])
+			end
+		end
+		addRegressionTokens(opts.regressions)
 		if cfg.corpus ~= nil and type(cfg.corpus[name]) == "table" then
 			for _, item in cfg.corpus[name] do
 				table.insert(initialSeeds, item)
@@ -728,22 +740,53 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 						trimmed[i] = usedTape[i]
 					end
 				end
-				local shrinkRes = withoutTracking(function()
-					local mTape, mErr = shrinkTape(rawRunner, trialSeed, trialSize, trimmed)
-					local _, _, _, mGen = rawRunner(trialSeed, trialSize, mTape)
-					return { tape = mTape, err = mErr, gen = mGen }
-				end)
-				local minTape: { number } = shrinkRes.tape
-				local minErr = shrinkRes.err
-				local minGen = shrinkRes.gen
-				local tok = encodeToken(trialSeed, trialSize, minTape)
+				local minTape: { number }
+				local minErr: any
 				local notes: { string } = {}
-				if minGen and minGen._s and minGen._s.notes then
-					for _, nt in minGen._s.notes do
-						table.insert(notes, if type(nt) == "function" then tostring(nt()) else tostring(nt))
+				local tok: string
+				local canonicalRes: any = nil
+				if type(shrinkHook) == "function" then
+					local shrinkFn = shrinkHook :: (any, number?, number?) -> any
+					canonicalRes = withoutTracking(
+						function()
+							return shrinkFn(
+								{ _gen = genObj, _err = err, seed = trialSeed, size = trialSize },
+								trialSeed,
+								trialSize
+							)
+						end
+					)
+					minTape = if type(canonicalRes) == "table" and type(canonicalRes.shrunk) == "table"
+						then canonicalRes.shrunk
+						else trimmed
+					minErr = if type(canonicalRes) == "table" and canonicalRes.message ~= nil
+						then canonicalRes.message
+						else err
+					if type(canonicalRes) == "table" and type(canonicalRes.notes) == "table" then
+						for _, nt in canonicalRes.notes do
+							table.insert(notes, tostring(nt))
+						end
+					end
+					tok = if type(canonicalRes) == "table" and type(canonicalRes.replay) == "string"
+						then canonicalRes.replay
+						else encodeToken(trialSeed, trialSize, minTape)
+				else
+					local shrinkRes = withoutTracking(function()
+						local mTape, mErr = shrinkTape(rawRunner, trialSeed, trialSize, trimmed)
+						local _, _, _, mGen = rawRunner(trialSeed, trialSize, mTape)
+						return { tape = mTape, err = mErr, gen = mGen }
+					end)
+					minTape = shrinkRes.tape
+					minErr = shrinkRes.err
+					local minGen = shrinkRes.gen
+					tok = encodeToken(trialSeed, trialSize, minTape)
+					if minGen and minGen._s and minGen._s.notes then
+						for _, nt in minGen._s.notes do
+							table.insert(notes, if type(nt) == "function" then tostring(nt()) else tostring(nt))
+						end
 					end
 				end
-				local errMsg = tostring(minErr or err or "property failed")
+				local errMsg = format.errorText(minErr or err or "property failed")
 				local ce = if #notes > 0
 					then table.concat(notes, "; ")
 					else string.format("tape[%d] seed=%d", #minTape, trialSeed)
@@ -757,6 +800,7 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 					replay = tok,
 					seed = trialSeed,
 					runs = propRuns,
+					propResult = canonicalRes,
 				}
 				emitEvent({
 					event = "failure",
@@ -830,10 +874,7 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 			end
 			if #corpusList < 8 or randRange(1, 5) == 1 then
 				randIdx += 1
-				local caseSeedFn: any = propApi.caseSeed
-				local cSeed = if type(caseSeedFn) == "function"
-					then (caseSeedFn :: (...any) -> number)(name, baseSeed, randIdx)
-					else (baseSeed + randIdx) % U32
+				local cSeed = propInternal.caseSeed(name, baseSeed, randIdx)
 				local ok, discarded, err, genObj = evalTrial(cSeed, size, nil)
 				local genTape: { number } = if genObj and genObj._s and genObj._s.out then genObj._s.out else {}
 				recordCorpusAndCheck(ok, discarded, err, genObj, cSeed, size, genTape)
@@ -863,6 +904,11 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 		end
 		if failed then
 			propsFailed += 1
+			if type(failInfo.propResult) == "table" then
+				local pr: { [string]: any } = table.clone(failInfo.propResult :: { [string]: any })
+				pr.cases = propRuns
+				return pr
+			end
 			return {
 				ok = false,
 				cases = propRuns,
@@ -886,7 +932,17 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 			local pFilter = ctx.filter or meta.filter or pName
 			local pOpts = ctx.options or { seed = meta.baseSeed, size = meta.size, file = meta.file }
 			local pRunOpts = ctx.runOptions or {}
-			return fuzzSingleProperty(pName, ctx.fn, pOpts, pRunOpts, pFilter, ctx.trial, meta.file)
+			return fuzzSingleProperty(
+				pName,
+				ctx.fn,
+				pOpts,
+				pRunOpts,
+				pFilter,
+				ctx.trial,
+				meta.file,
+				ctx.shrinkFn,
+				meta.shortName
+			)
 		end
 		return nil
 	end
@@ -947,6 +1003,7 @@ function fuzz.run(cfg: FuzzConfig, sertMod: any): FuzzSummary
 		end
 		if cfg.filter ~= nil then merged.filter = cfg.filter end
 		if cfg.grep ~= nil then merged.grep = cfg.grep end
+		if cfg.greps ~= nil then merged.greps = cfg.greps end
 		if cfg.files ~= nil and #cfg.files > 0 then merged.files = cfg.files end
 		merged.seed = cfg.seed
 		merged.quiet = true

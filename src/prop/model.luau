@@ -3,6 +3,7 @@
 
 local format = require("../core/format")
 local prop = require("../prop")
+local propInternal = require("../prop/internal")
 local registry = require("../core/registry")
 local util = require("../core/util")
 
@@ -47,6 +48,8 @@ export type Options = typeof(table.freeze({} :: {
 	timeout: number?,
 	skip: boolean?,
 	focus: boolean?,
+	smoke: boolean?,
+	tags: { string }?,
 	file: string?,
 	target: registry.Target?,
 	capMutant: boolean?,
@@ -83,29 +86,15 @@ export type ModelPropApi = typeof(setmetatable(
 
 export type ModelNamespace = typeof(setmetatable(
 	{} :: {
+		skip: ModelCall,
+		focus: ModelCall,
+		roblox: TargetModelApi,
+		server: TargetModelApi,
+		client: TargetModelApi,
 		prop: ModelPropApi,
 		property: <State, Sut>(spec: Spec<State, Sut>, options: Options?) -> (g: GenContext) -> (),
 		check: <State, Sut>(spec: Spec<State, Sut>, options: Options?) -> prop.PropResult,
 		replay: <State, Sut>(spec: Spec<State, Sut>, trace: { Step }, world: { [string]: any }?) -> (State, Sut),
-		commandList: <State, Sut>(spec: Spec<State, Sut>, caller: string?) -> { Command<State, Sut, any, any> },
-		checkInvariants: <State, Sut>(
-			spec: Spec<State, Sut>,
-			invKeys: { string },
-			state: State,
-			sut: Sut,
-			world: any
-		) -> (),
-		stepSpec: <State, Sut>(
-			spec: Spec<State, Sut>,
-			invKeys: { string },
-			command: Command<State, Sut, any, any>,
-			sut: Sut,
-			state: State,
-			arg: any,
-			index: number,
-			world: any
-		) -> (State, any),
-		propOptions: (options: Options?) -> prop.PropOptions,
 	},
 	{} :: ModelMeta
 ))
@@ -138,6 +127,8 @@ local OPTION_KEYS = {
 	"shrinkBudget",
 	"size",
 	"skip",
+	"smoke",
+	"tags",
 	"target",
 	"timeout",
 	"world",
@@ -206,7 +197,7 @@ local function normalizeCommand<State, Sut>(where: string, rawCmd: any, key: any
 		if #items == 0 then error(`{where}: command "{cmdName}" gen array cannot be empty`, util.outside()) end
 		command.gen = function(_state: State, g: GenContext): any return g:pick(items) end
 	elseif type(rawGen) == "function" then
-		if prop.isGenerator(rawGen) then
+		if propInternal.isGenerator(rawGen) then
 			local gFn = rawGen :: prop.Generator<any>
 			command.gen = function(_state: State, g: GenContext): any return gFn(g) end
 		else
@@ -240,7 +231,7 @@ end
 local model: { [string]: any } = {}
 
 --- Normalizes and sorts `spec.commands` by name so a seed produces identical sequences across Luau hash orders.
-function model.commandList<State, Sut>(rawSpec: Spec<State, Sut>, caller: string?): { Command<State, Sut, any, any> }
+local function commandList<State, Sut>(rawSpec: Spec<State, Sut>, caller: string?): { Command<State, Sut, any, any> }
 	local where = caller or "sert.model"
 	local spec: Spec<State, Sut> = validateSpec(rawSpec, where, false)
 	local commands: any = spec.commands
@@ -274,7 +265,7 @@ local function describeStep(name: string, arg: any): string
 end
 
 --- Evaluates every invariant in `spec.invariants` in deterministic sorted key order.
-function model.checkInvariants<State, Sut>(spec: Spec<State, Sut>, invKeys: { string }, state: State, sut: Sut, world: any?)
+local function checkInvariants<State, Sut>(spec: Spec<State, Sut>, invKeys: { string }, state: State, sut: Sut, world: any?)
 	local invs = spec.invariants
 	if invs == nil then return end
 	for _, key in invKeys do
@@ -288,7 +279,7 @@ function model.checkInvariants<State, Sut>(spec: Spec<State, Sut>, invKeys: { st
 end
 
 --- Executes a single model command (`run` -> `next` -> `post` -> `invariants`) and returns `(nextState, result)`.
-function model.stepSpec<State, Sut>(
+local function stepSpec<State, Sut>(
 	spec: Spec<State, Sut>,
 	invKeys: { string },
 	command: Command<State, Sut, any, any>,
@@ -307,7 +298,7 @@ function model.stepSpec<State, Sut>(
 			if produced ~= nil then nextState = produced end
 		end
 		if command.post ~= nil then command.post(nextState, sut, arg, result, world) end
-		model.checkInvariants(spec, invKeys, nextState, sut, world)
+		checkInvariants(spec, invKeys, nextState, sut, world)
 	end)
 	if not ok then error(`step {index} ({describeStep(command.name :: string, arg)}): {format.errorText(why)}`, 0) end
 	return nextState, result
@@ -336,7 +327,7 @@ local function finishSpec<State, Sut>(spec: Spec<State, Sut>, sut: Sut, world: a
 end
 
 --- Strips model-only keys (`length`, `redraw`, `maxRedraws`, `world`, `raise`, `replay`) from `options` to produce `PropOptions`.
-function model.propOptions(options: Options?): prop.PropOptions
+local function propOptions(options: Options?): prop.PropOptions
 	if options == nil then return {} end
 	local out: any = table.clone(options)
 	out.length = nil
@@ -353,7 +344,7 @@ function model.property<State, Sut>(rawSpec: Spec<State, Sut>, options: Options?
 	local spec: Spec<State, Sut> = validateSpec(rawSpec, "sert.model", true)
 	local opts: Options = options or {}
 	registry.checkKeys("sert.model", "option", options, OPTION_KEYS)
-	local commands = model.commandList(spec, "sert.model")
+	local commands = commandList(spec, "sert.model")
 	local invKeys = sortedKeys(spec.invariants)
 	local length = opts.length or 30
 	local redraw = opts.redraw ~= false
@@ -376,16 +367,16 @@ function model.property<State, Sut>(rawSpec: Spec<State, Sut>, options: Options?
 	-- Hint accepted redraws back to a single direct draw so shrinking earlier steps does not shift command choices.
 	local function choose(g: GenContext, state: State): (Command<State, Sut, any, any>?, any)
 		local left = weighted
-		local first = prop.mark(g)
+		local first = propInternal.mark(g)
 		local redraws = 0
 		local retriesPerCommand: { [Command<State, Sut, any, any>]: number } = {}
 		while #left > 0 do
-			local pick = prop.mark(g)
+			local pick = propInternal.mark(g)
 			local command = g:weighted(left) :: Command<State, Sut, any, any>
 			local genFn = command.gen :: ((State, GenContext) -> any)?
 			local arg = if genFn ~= nil then genFn(state, g) else nil
 			if command.pre == nil or command.pre(state, arg) then
-				if pick > first then prop.hint(g, first, pick, { drawn[command] }) end
+				if pick > first then propInternal.hint(g, first, pick, { drawn[command] }) end
 				return command, arg
 			elseif not redraw or redraws >= maxRedraws then
 				return nil, nil
@@ -409,22 +400,22 @@ function model.property<State, Sut>(rawSpec: Spec<State, Sut>, options: Options?
 		registry.recordAssertion("model")
 		local state, sut = startSpec(spec, hostWorld)
 		local ok, err = pcall(function()
-			model.checkInvariants(spec, invKeys, state, sut, hostWorld)
+			checkInvariants(spec, invKeys, state, sut, hostWorld)
 			local executed = 0
 			local refused = false
 			g:list(function(stepGen: GenContext)
 				local command, arg = choose(stepGen, state)
 				if command == nil then
 					refused = true
-					return false
+					return propInternal.STOP_LIST
 				end
 				executed += 1
 				local cmdName = command.name :: string
 				stepGen:note(function() return string.format("{ %q, %s },", cmdName, format.repr(arg)) end)
-				state = model.stepSpec(spec, invKeys, command, sut, state, arg, executed, hostWorld)
+				state = stepSpec(spec, invKeys, command, sut, state, arg, executed, hostWorld)
 				return true
 			end, 0, length)
-			if executed == 0 and refused then prop.vacuous(g, "pre refused every step") end
+			if executed == 0 and refused then propInternal.vacuous(g, "pre refused every step") end
 		end)
 		finishSpec(spec, sut, hostWorld, ok, err)
 	end
@@ -434,7 +425,7 @@ end
 function model.check<State, Sut>(rawSpec: Spec<State, Sut>, options: Options?): prop.PropResult
 	local spec: Spec<State, Sut> = validateSpec(rawSpec, "sert.model.check", true)
 	local propFn = model.property(spec, options)
-	local propOpts = model.propOptions(options)
+	local propOpts = propOptions(options)
 	local runOpts: registry.RunOptions? = registry.currentOptions()
 	if options ~= nil and options.replay ~= nil then
 		local cloned: registry.RunOptions = if runOpts ~= nil then table.clone(runOpts) else {}
@@ -457,13 +448,13 @@ function model.replay<State, Sut>(rawSpec: Spec<State, Sut>, trace: { Step }, wo
 		error(`sert.model.replay: expected a trace table, got {util.typeof(trace)}`, util.outside())
 	end
 	local commands: { [string]: Command<State, Sut, any, any> } = {}
-	for _, command in model.commandList(spec, "sert.model.replay") do
+	for _, command in commandList(spec, "sert.model.replay") do
 		commands[command.name :: string] = command
 	end
 	local invKeys = sortedKeys(spec.invariants)
 	local state, sut = startSpec(spec, world)
 	local ok, err = pcall(function()
-		model.checkInvariants(spec, invKeys, state, sut, world)
+		checkInvariants(spec, invKeys, state, sut, world)
 		for index, step in trace do
 			if type(step) ~= "table" then error(`step {index}: expected a step table, got {util.typeof(step)}`, 0) end
 			local name = step.command or step.name or step[1]
@@ -474,7 +465,7 @@ function model.replay<State, Sut>(rawSpec: Spec<State, Sut>, trace: { Step }, wo
 			if command.pre ~= nil and not command.pre(state, arg) then
 				error(`step {index} ({describeStep(name, arg)}): pre refused it`, 0)
 			end
-			state = model.stepSpec(spec, invKeys, command, sut, state, arg, index, world)
+			state = stepSpec(spec, invKeys, command, sut, state, arg, index, world)
 		end
 	end)
 	finishSpec(spec, sut, world, ok, err)
@@ -541,6 +532,8 @@ local function registerModelProp(
 		timeout = propOpts.timeout,
 		skip = propOpts.skip,
 		focus = propOpts.focus,
+		smoke = propOpts.smoke,
+		tags = propOpts.tags,
 		file = propOpts.file,
 		target = target or propOpts.target,
 	}
@@ -550,7 +543,7 @@ local function registerModelProp(
 	attachment = {
 		name = name,
 		exhaustive = propOpts.exhaustive,
-		defaultSeed = if propOpts.seed ~= nil then propOpts.seed else prop.DEFAULT_BASE,
+		defaultSeed = if propOpts.seed ~= nil then propOpts.seed else propInternal.DEFAULT_BASE,
 		exec = function(runOptions: registry.RunOptions, capMutant: boolean): registry.PropExecResult
 			local cloned = table.clone(runOptions)
 			if cloned.replay == nil then cloned.replay = replayOpt end
@@ -579,7 +572,7 @@ local function buildModelTarget(
 	local function invokeModel(nameOrSpec: any, specOrOpts: any?, maybeOpts: Options?)
 		local name, spec, opts = resolveModelArgs(`sert.{apiPrefix}`, nameOrSpec, specOrOpts, maybeOpts)
 		local propFn = if fixedSkip then function(_g: GenContext) end else model.property(spec, opts)
-		local propOpts = model.propOptions(opts)
+		local propOpts: any = propOptions(opts)
 		if target ~= nil and propOpts.target == nil then propOpts.target = target end
 		if fixedSkip then propOpts.skip = true end
 		if fixedFocus then propOpts.focus = true end
@@ -597,7 +590,7 @@ local function buildModelTarget(
 	else
 		ns.skip = function(nameOrSpec: any, specOrOpts: any?, maybeOpts: Options?)
 			local name, spec, opts = resolveModelArgs(`sert.{apiPrefix}.skip`, nameOrSpec, specOrOpts, maybeOpts)
-			local propOpts = model.propOptions(opts)
+			local propOpts: any = propOptions(opts)
 			if target ~= nil and propOpts.target == nil then propOpts.target = target end
 			propOpts.skip = true
 			local _ = spec
@@ -606,7 +599,7 @@ local function buildModelTarget(
 		ns.focus = function(nameOrSpec: any, specOrOpts: any?, maybeOpts: Options?)
 			local name, spec, opts = resolveModelArgs(`sert.{apiPrefix}.focus`, nameOrSpec, specOrOpts, maybeOpts)
 			local propFn = model.property(spec, opts)
-			local propOpts = model.propOptions(opts)
+			local propOpts: any = propOptions(opts)
 			if target ~= nil and propOpts.target == nil then propOpts.target = target end
 			propOpts.focus = true
 			registerModelProp(name, propFn, propOpts, if opts ~= nil then opts.replay else nil, true, target)
@@ -622,6 +615,13 @@ local function buildModelTarget(
 	) :: TargetModelApi
 end
 
+local rootModelTarget: any = buildModelTarget("model", nil, false, false)
+model.skip = rootModelTarget.skip
+model.focus = rootModelTarget.focus
+model.roblox = buildModelTarget("model.roblox", "roblox", false, false)
+model.server = buildModelTarget("model.server", "server", false, false)
+model.client = buildModelTarget("model.client", "client", false, false)
+
 local modelProp: any = buildModelTarget("model.prop", nil, false, false)
 modelProp.roblox = buildModelTarget("model.prop.roblox", "roblox", false, false)
 modelProp.server = buildModelTarget("model.prop.server", "server", false, false)
@@ -632,7 +632,7 @@ setmetatable(model, {
 	__call = function(_self: any, nameOrSpec: any, specOrOpts: any?, maybeOpts: Options?)
 		local name, spec, opts = resolveModelArgs("sert.model", nameOrSpec, specOrOpts, maybeOpts)
 		local propFn = model.property(spec, opts)
-		local propOpts = model.propOptions(opts)
+		local propOpts = propOptions(opts)
 		registerModelProp(name, propFn, propOpts, if opts ~= nil then opts.replay else nil, false, nil)
 	end,
 })

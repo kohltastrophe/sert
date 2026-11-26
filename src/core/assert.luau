@@ -41,10 +41,14 @@ function assertions.ok<T>(val: T, msg: string?): T
 	return (val :: any) :: T
 end
 
+-- Note: `expected`/`unexpected` intentionally stay `any` for dual-solver compatibility: overloaded intersections
+-- break metatable arithmetic in Luau's new solver, while `T | Matcher` breaks nested matchers, map `nil` checks,
+-- and tagged unions under the old solver.
 --- Asserts deep equality between `actual` and `expected` (with asymmetric `Matcher` support) and returns `actual`.
 function assertions.eq<T>(actual: T, expected: any, msg: string?): T
 	registry.recordAssertion("eq")
 	if not match.equal(actual, expected) then
+		registry.recordFailureDiff(expected, actual)
 		error(mismatch(msg or "values differ", actual, expected, false), util.outside())
 	end
 	return actual
@@ -59,7 +63,7 @@ function assertions.ne<T>(actual: T, unexpected: any, msg: string?): T
 	return actual
 end
 
---- Returns `true` when `a` matches `b` under `sert.eq` without raising.
+--- @deprecated Use `sert.eq` for assertions or `match.equal` internally; returns `true` when `a` matches `b` without recording an assertion.
 function assertions.equals(a: any, b: any): boolean return match.equal(a, b) end
 
 local function checkComparable(apiName: string, a: any, b: any)
@@ -113,12 +117,14 @@ end
 function assertions.near<T>(actual: T, expected: T, eps: number?, msg: string?): T
 	registry.recordAssertion("near")
 	local tol = if eps ~= nil then eps else 1e-6
-	local pass, misuse = match.nearCheck(actual, expected, tol)
+	local pass, misuse, detail = match.nearCheck(actual, expected, tol)
 	if misuse ~= nil then
 		error(`sert.near: {misuse}`, util.outside())
 	elseif not pass then
+		registry.recordFailureDiff(expected, actual)
+		local suffix = if detail ~= nil and detail ~= "" then ` ({detail})` else ""
 		error(
-			`{msg or "values differ"}: expected {match.describeNear(expected)} ± {tol}, got {match.describeNear(actual)}`,
+			`{msg or "values differ"}: expected {match.describeNear(expected)} ± {tol}, got {match.describeNear(actual)}{suffix}`,
 			util.outside()
 		)
 	end
@@ -142,6 +148,38 @@ function assertions.matches(str: string, pattern: string, msg: string?): string
 	return str
 end
 
+local function closestTableHint(haystack: { [any]: any }, needle: any): string
+	if type(needle) ~= "table" then return "" end
+	local count, bestElem: any, bestScore = 0, nil, -1
+	local needleRaw = if match.isMatcher(needle) then rawget(needle, "_partial") else needle
+	for _, item in next, haystack do
+		count += 1
+		if count > 32 then return "" end
+		if type(item) == "table" or util.typeof(item) == "Instance" then
+			local score = 0
+			if type(needleRaw) == "table" and getmetatable(needleRaw) == nil then
+				for k, v in next, needleRaw do
+					local okRead, gotV = pcall(function() return (item :: any)[k] end)
+					if okRead and gotV ~= nil then
+						score += if match.equal(gotV, v) then 3 else 1
+					end
+				end
+			end
+			if score > bestScore then
+				bestScore = score
+				bestElem = item
+			end
+		elseif util.typeof(item) == util.typeof(needle) and bestElem == nil then
+			bestElem = item
+			bestScore = 0
+		end
+	end
+	if bestElem == nil then return "" end
+	local okEx, explanation = pcall(match.explain, bestElem, needle, "closest")
+	if okEx and type(explanation) == "string" and explanation ~= "" then return `\n   closest match: {explanation}` end
+	return ""
+end
+
 --- Asserts that `haystack` (string, array, or map) contains `needle` (substring, value, or `Matcher`), returning `haystack`.
 function assertions.contains<T>(haystack: T, needle: any, msg: string?): T
 	registry.recordAssertion("contains")
@@ -163,7 +201,8 @@ function assertions.contains<T>(haystack: T, needle: any, msg: string?): T
 		for _, item in next, (haystack :: any) :: { [any]: any } do
 			if match.equal(item, needle) then return haystack end
 		end
-		error(`{msg or "missing element"}: expected {repr(haystack)} to contain {repr(needle)}`, util.outside())
+		local hint = closestTableHint((haystack :: any) :: { [any]: any }, needle)
+		error(`{msg or "missing element"}: expected {repr(haystack)} to contain {repr(needle)}{hint}`, util.outside())
 	end
 	error(`sert.contains: expected string or table haystack, got {util.typeof(haystack)}`, util.outside())
 end
@@ -172,6 +211,9 @@ local function matchesError(err: any, text: string, matcher: any): (boolean, str
 	if type(matcher) == "string" then
 		local okPat, foundPat = pcall(string.find, text, matcher)
 		if (okPat and foundPat ~= nil) or string.find(text, matcher, 1, true) ~= nil then return true, "" end
+		if not okPat then
+			return false, string.format("matching %q (invalid Luau pattern: %s)", matcher, errorText(foundPat))
+		end
 		return false, string.format("matching %q", matcher)
 	elseif match.isMatcher(matcher) then
 		if matcher.matches(err) or matcher.matches(text) then return true, "" end
@@ -195,7 +237,10 @@ function assertions.throws(
 ): string
 	registry.recordAssertion("throws")
 	if not isCallable(fn) then error(`sert.throws: expected a function, got {util.typeof(fn)}`, util.outside()) end
+	local tracker = registry.activeTestAssertions()
+	local savedDiff = if tracker ~= nil then tracker.lastFailureDiff else nil
 	local ok, err = pcall(fn)
+	if tracker ~= nil then tracker.lastFailureDiff = savedDiff end
 	if ok then error(msg or "expected function to throw, but it succeeded", util.outside()) end
 	local text = errorText(err)
 	if patternOrMatcher ~= nil then
@@ -277,6 +322,41 @@ function assertions.calledTimes(s: Spy, count: number, msg: string?)
 	end
 end
 
+local function closestCallHint(calls: any, wanted: { n: number, [number]: any }): string
+	local list: { spy.Call } = calls
+	if #list == 0 then return "" end
+	local bestIdx, bestScore = 1, -1
+	for i = 1, #list do
+		local call = list[i]
+		local score = if call.n == wanted.n then 100 else 0
+		local common = math.min(call.n, wanted.n)
+		for argIdx = 1, common do
+			if match.equal(call[argIdx], wanted[argIdx]) then
+				score += 10
+			end
+		end
+		if score >= bestScore then
+			bestScore = score
+			bestIdx = i
+		end
+	end
+	local bestCall = list[bestIdx]
+	local common = math.min(bestCall.n, wanted.n)
+	for argIdx = 1, common do
+		if not match.equal(bestCall[argIdx], wanted[argIdx]) then
+			local okEx, explanation = pcall(match.explain, bestCall[argIdx], wanted[argIdx], `arg[{argIdx}]`)
+			if okEx and type(explanation) == "string" and explanation ~= "" then
+				return `\n   closest call #{bestIdx}: {explanation}`
+			end
+			return `\n   closest call #{bestIdx}: arg[{argIdx}] expected {repr(wanted[argIdx])}, got {repr(
+				bestCall[argIdx]
+			)}`
+		end
+	end
+	if bestCall.n ~= wanted.n then return `\n   closest call #{bestIdx}: expected {wanted.n} args, got {bestCall.n}` end
+	return ""
+end
+
 --- Asserts that spy `s` was called at least once with arguments matching `...` (including asymmetric matchers).
 function assertions.calledWith(s: Spy, ...: any)
 	registry.recordAssertion("calledWith")
@@ -295,8 +375,9 @@ function assertions.calledWith(s: Spy, ...: any)
 			if allMatch then return end
 		end
 	end
+	local hint = closestCallHint(target.calls, wanted)
 	error(
-		`expected spy to have been called with {formatArgs(wanted)}{formatRecordedCalls(target.calls)}`,
+		`expected spy to have been called with {formatArgs(wanted)}{formatRecordedCalls(target.calls)}{hint}`,
 		util.outside()
 	)
 end

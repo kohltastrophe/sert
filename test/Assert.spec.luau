@@ -553,4 +553,68 @@ sert.describe("assertion tracking, strict assertions, tautologies, and skip reas
 		local parsedLong = sert.parseCliArgs("--update-snapshots")
 		sert.eq(parsedLong.updateSnapshots, true)
 	end)
+
+	sert.test("spy:restore preserves call history and accepts callable tables", function()
+		local svc = {
+			mul = function(_self: any, x: number): number return x * 2 end,
+		}
+		local s = sert.spy(svc, "mul")
+		sert.eq(svc:mul(4), 8)
+		s:restore()
+		sert.eq(s.called, true)
+		sert.eq(s.callCount, 1)
+		sert.calledWith(s, svc, 4)
+		sert.eq(svc:mul(4), 8)
+		sert.eq(s.callCount, 1)
+
+		local callable = setmetatable({}, {
+			__call = function(_t: any, _self: any, n: number): number return n + 10 end,
+		})
+		local sCall = sert.spy(svc, "mul", callable :: any)
+		sert.eq(svc:mul(5), 15)
+		sCall:calls(setmetatable({}, {
+			__call = function(_t: any, _self: any, n: number): number return n + 20 end,
+		}) :: any)
+		sert.eq(svc:mul(5), 25)
+		sCall:restore()
+		sert.eq(sCall.callCount, 2)
+	end)
+
+	sert.test(
+		"provides component delta hints on near/within, closest-candidate hints on contains/calledWith, and invalid-pattern fallback in throws",
+		function()
+			local nearVecErr = sert.throws(function() sert.near(V3.new(1, 2, 3), V3.new(1, 5, 3), 0.1) end)
+			sert.contains(nearVecErr, "Y: |Δ|=3 > 0.1")
+			local nearC3Err = sert.throws(function() sert.near(C3.new(1, 0, 0), C3.new(0.5, 0, 0), 0.01) end)
+			sert.contains(nearC3Err, "R: |Δ|=0.5 > 0.01")
+			local withinErr = sert.throws(function() sert.eq(V3.new(1, 10, 1), sert.within(V3.new(1, 2, 1), 0.5)) end)
+			sert.contains(withinErr, "Y: |Δ|=8 > 0.5")
+
+			local containsErr = sert.throws(
+				function()
+					sert.contains({
+						{ id = 1, role = "guest" },
+						{ id = 2, role = "member" },
+					}, { id = 2, role = "admin" })
+				end
+			)
+			sert.contains(containsErr, "closest match:")
+			sert.contains(containsErr, "role")
+
+			local s = sert.spy()
+			s("alpha", { x = 1, y = 2 })
+			s("beta", { x = 1, y = 9 })
+			local spyErr = sert.throws(function() sert.calledWith(s, "beta", { x = 1, y = 2 }) end)
+			sert.contains(spyErr, "closest call #2:")
+			sert.contains(spyErr, "y")
+
+			-- Plain substring match succeeds even when pattern contains unbalanced `%` or `[`
+			sert.throws(function() error("bad array [0] token", 0) end, "[0]")
+			-- When both pattern compilation and plain substring miss, invalid Luau pattern reason is surfaced
+			local invPatErr = sert.throws(function()
+				sert.throws(function() error("unrelated error", 0) end, "[unclosed")
+			end)
+			sert.contains(invPatErr, "invalid Luau pattern")
+		end
+	)
 end)

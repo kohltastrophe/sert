@@ -118,6 +118,7 @@ local _badMeta: sert.MetamorphicSpec<number, number> = { gen = intGen, sut = 123
 local _badMetaRel: sert.MetamorphicSpec<number, number> = { gen = intGen, sut = idFn, relations = "bad" } -- expect-error
 local _badComp: sert.ComplexitySpec<number> = { bound = "O(2^n)", gen = lenFn } -- expect-error
 local _badCompSizes: sert.ComplexitySpec<number> = { bound = "O(n)", sizes = { "big" }, gen = lenFn } -- expect-error
+sert.laws.complexity("bad comp opts", { bound = "O(n)", gen = lenFn, measure = lenFn }, { timeout = "ten" }) -- expect-error
 
 -- Wave 1 & Wave 2: Sim linearizable, recorder & explore
 local seqModelMisuse: sert.SimSequentialModel<number, number, number> = {
@@ -206,3 +207,20 @@ local function _misuseEnvApis(e: sert.Env)
 	label.RichText = "yes" -- expect-error
 	local _badContentText: number = label.ContentText -- expect-error
 end
+
+-- Milestone 4 negative probes: eq/ne msg types, hidden internals, new RunOptions/PropOptions, .each
+sert.eq(1, 2, 123) -- expect-error
+sert.ne(1, 2, 123) -- expect-error
+local _badDrawInt = sert.prop.drawInt -- expect-error
+local _badTape = sert.prop.tape -- expect-error
+local _badMark = sert.prop.mark -- expect-error
+local _badStop = sert.prop.STOP_LIST -- expect-error
+local _badCmdList = sert.model.commandList -- expect-error
+local _badCheckInv = sert.model.checkInvariants -- expect-error
+local _badStepSpec = sert.model.stepSpec -- expect-error
+local _badPropOpts = sert.model.propOptions -- expect-error
+sert.run({ shuffle = "yes" }) -- expect-error
+sert.run({ retry = "two" }) -- expect-error
+sert.prop("bad prop smoke", function(_g: sert.GenContext) end, { smoke = "yes" }) -- expect-error
+sert.prop("bad prop tags", function(_g: sert.GenContext) end, { tags = { 1 } }) -- expect-error
+sert.test.each("not-table") -- expect-error

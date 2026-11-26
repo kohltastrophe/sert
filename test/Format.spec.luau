@@ -366,4 +366,95 @@ sert.describe("format.diff multi-leaf and format.snapshot", function()
 		sert.contains(uiTree, '  Frame "Panel" [pos=(10, 20) size=(200, 80) visible=true]')
 		sert.contains(uiTree, '    TextLabel "Title" [pos=(14, 26) size=(120, 24) visible=false text="Score: 100"]')
 	end)
+
+	sert.test(
+		"renders multiline LCS diffs, CRLF notices, datatype deltas, Instance diffs, unreadable leaves, and jsonValue",
+		function()
+			local multi = format.diff("alpha\nbeta\ngamma\ndelta", "alpha\nBETA\ngamma\nepsilon")
+			sert.ok(multi ~= nil)
+			sert.contains(multi :: string, "multiline strings differ")
+			sert.contains(multi :: string, " - BETA")
+			sert.contains(multi :: string, " + beta")
+			sert.contains(multi :: string, " - epsilon")
+			sert.contains(multi :: string, " + delta")
+
+			local crlf = format.diff("a\r\nb", "a\nb")
+			sert.ok(crlf ~= nil)
+			sert.contains(crlf :: string, "line endings differ")
+
+			local manyA: { string } = {}
+			local manyB: { string } = {}
+			for i = 1, 35 do
+				table.insert(manyA, `lineA_{i}`)
+				table.insert(manyB, `lineB_{i}`)
+			end
+			local truncated = format.diff(table.concat(manyA, "\n"), table.concat(manyB, "\n"))
+			sert.ok(truncated ~= nil)
+			sert.contains(truncated :: string, "more diff lines)")
+
+			local vecDiff = format.diff(sert.env.Vector3.new(1, 2, 3), sert.env.Vector3.new(1, 5, 1))
+			sert.contains(vecDiff :: string, "Δ Y=-3, Z=+2")
+			local vec2Diff = format.diff(sert.env.Vector2.new(4, 1), sert.env.Vector2.new(1, 3))
+			sert.contains(vec2Diff :: string, "Δ X=+3, Y=-2")
+			local c3Diff = format.diff(sert.env.Color3.new(0.5, 0, 1), sert.env.Color3.new(0.25, 0, 1))
+			sert.contains(c3Diff :: string, "Δ R=+0.25")
+			local ud2Diff = format.diff(sert.env.UDim2.new(0, 10, 0, 20), sert.env.UDim2.new(0, 5, 0, 20))
+			sert.contains(ud2Diff :: string, "Δ X.Offset=+5")
+			local cfDiff = format.diff(sert.env.CFrame.new(3, 0, 0), sert.env.CFrame.new(1, 0, 2))
+			sert.contains(cfDiff :: string, "Δ X=+2, Z=-2")
+			local natVecDiff = format.diff(vector.create(10, 0, 0), vector.create(4, 0, 0))
+			sert.contains(natVecDiff :: string, "Δ x=+6")
+
+			local env = sert.env.new()
+			local pA = env.Instance.new("Part", env.workspace)
+			pA.Name = "BoxA"
+			pA.Anchored = false
+			pA:SetAttribute("HP", 10)
+			pA:AddTag("TagA")
+			env.Instance.new("Folder", pA)
+
+			local pB = env.Instance.new("Part", env.workspace)
+			pB.Name = "BoxB"
+			pB.Anchored = true
+			pB:SetAttribute("HP", 50)
+			pB:AddTag("TagB")
+
+			local instDiff = format.diff(pA, pB)
+			sert.ok(instDiff ~= nil)
+			sert.contains(instDiff :: string, 'Part "Workspace.BoxB"')
+			sert.contains(instDiff :: string, 'Part "Workspace.BoxA"')
+			sert.contains(instDiff :: string, "Anchored: true -> false")
+			sert.contains(instDiff :: string, "attr[HP]: 50 -> 10")
+			sert.contains(instDiff :: string, "tags: [TagB] -> [TagA]")
+			sert.contains(instDiff :: string, "children: 0 -> 1")
+
+			local strict = setmetatable({}, {
+				__index = function(_t, k) error(`bad key {tostring(k)}`, 0) end,
+			})
+			local safeDiff = format.diff({ present = { a = 1 } }, { present = strict :: any }, true)
+			sert.ok(safeDiff ~= nil)
+			sert.contains(safeDiff :: string, "actual.present.a: expected nil, got 1")
+
+			local unreadableDiff = format.diff({ sub = strict :: any }, { sub = sert.subset({ a = 1 }) })
+			sert.ok(unreadableDiff ~= nil)
+			sert.contains(unreadableDiff :: string, "<unreadable>")
+
+			local cycle: { [string]: any } = {}
+			cycle.self = cycle
+			local jVal = format.jsonValue({
+				nan = 0 / 0,
+				inf = math.huge,
+				longStr = string.rep("x", 1100),
+				part = pA,
+				deep = { a = { b = { c = { d = 1 } } } },
+				cycle = cycle,
+			}, 3)
+			sert.eq(jVal.nan, "nan")
+			sert.eq(jVal.inf, "inf")
+			sert.eq(#jVal.longStr, 1024)
+			sert.contains(jVal.part, 'Part "Workspace.BoxA"')
+			sert.eq(jVal.deep.a.b, "{…}")
+			sert.eq(jVal.cycle.self, "<cycle>")
+		end
+	)
 end)

@@ -4,6 +4,8 @@
 local format = require("./format")
 local perf = require("./perf")
 local registry = require("./registry")
+local rng = require("./rng")
+local util = require("./util")
 
 local mutant = registry.mutant
 local output = registry.output
@@ -32,6 +34,9 @@ export type Failure = string
 export type Results = {
 	passed: number,
 	failed: number,
+	flaky: number,
+	flakyTests: { string },
+	shuffleSeed: number?,
 	skipped: number,
 	skippedRoblox: number,
 	skippedRtest: number,
@@ -113,6 +118,15 @@ end
 
 local function resolveTimeout(opts: RunOptions): number return opts.testTimeout or opts.timeout or DEFAULT_TIMEOUT end
 
+local function attachTrace(err: any, thread: thread?): string
+	local msg = errorText(err)
+	if thread == nil then return msg end
+	local loc = string.match(msg, "^(.-:%d+):")
+	local tb = util.cleanTraceback(debug.traceback(thread), loc)
+	if tb == "" then return msg end
+	return `{msg}\n   stack:\n{tb}`
+end
+
 local function invoke(fn: () -> (), timeout: number): (boolean, any)
 	local curState = registry.state
 	local saved = table.clone(curState)
@@ -151,25 +165,33 @@ local function invoke(fn: () -> (), timeout: number): (boolean, any)
 		local thread = coroutine.create(fn)
 		local ok, err = coroutine.resume(thread)
 		if not ok then
+			local traced = attachTrace(err, thread)
 			restore()
-			return false, err
+			return false, traced
 		end
 		if coroutine.status(thread) ~= "dead" then
 			local driver = registry.getYieldDriver()
 			if driver ~= nil then
 				local callOk, drvOk, drvErr = pcall(driver, thread, timeout)
 				if not callOk then
+					local traced = attachTrace(drvOk, thread)
 					pcall(coroutine.close, thread)
 					restore()
-					return false, drvOk
+					return false, traced
 				end
 				if coroutine.status(thread) ~= "dead" then
+					local baseMsg = if drvErr ~= nil then errorText(drvErr) else `test timed out after {timeout} s`
+					local tb = util.cleanTraceback(debug.traceback(thread))
 					pcall(coroutine.close, thread)
 					restore()
-					return false, drvErr or `test timed out after {timeout} s`
+					return false, if tb ~= "" then `{baseMsg}\n   stack:\n{tb}` else baseMsg
 				end
-				if not drvOk then restore() end
-				return drvOk == true, drvErr
+				if not drvOk then
+					local traced = attachTrace(drvErr, thread)
+					restore()
+					return false, traced
+				end
+				return true, drvErr
 			end
 			pcall(coroutine.close, thread)
 			restore()
@@ -180,7 +202,7 @@ local function invoke(fn: () -> (), timeout: number): (boolean, any)
 
 	local done, ok, err = false, false, nil
 	local thread = task.spawn(function()
-		ok, err = pcall(fn)
+		ok, err = xpcall(fn, function(e: any) return attachTrace(e, coroutine.running()) end)
 		done = true
 	end)
 	if not done then
@@ -189,9 +211,11 @@ local function invoke(fn: () -> (), timeout: number): (boolean, any)
 			task.wait()
 		end
 		if not done then
+			local tb = util.cleanTraceback(debug.traceback(thread))
 			task.cancel(thread)
 			restore()
-			return false, `test timed out after {timeout} s`
+			local baseMsg = `test timed out after {timeout} s`
+			return false, if tb ~= "" then `{baseMsg}\n   stack:\n{tb}` else baseMsg
 		end
 	end
 	if not ok then restore() end
@@ -211,11 +235,30 @@ end
 
 local EMPTY_TAUTOLOGIES: { TautologyRecord } = {}
 
+local function encodeDiffPayload(diff: { expected: any, actual: any }?): { expected: any, actual: any }?
+	if diff == nil then return nil end
+	local okVal, payload = pcall(
+		function()
+			return {
+				expected = format.jsonValue(diff.expected),
+				actual = format.jsonValue(diff.actual),
+			}
+		end
+	)
+	if not okVal or type(payload) ~= "table" then return nil end
+	local okJson, encoded = pcall(format.json, payload)
+	if okJson and type(encoded) == "string" and #encoded <= 4096 then return payload end
+	return nil
+end
+
 local function runTest(
 	test: Test,
 	chain: { Hooks },
 	opts: RunOptions
-): (string?, string?, number?, { [string]: number }, boolean, { TautologyRecord })
+): (string?, string?, number?, { [string]: number }, boolean, { TautologyRecord }, {
+	expected: any,
+	actual: any,
+}?)
 	local state = registry.state
 	local timeout = test.timeout or resolveTimeout(opts)
 	local outerDeferred, outerSeeds = state.deferred, state.inlineSeeds
@@ -316,7 +359,8 @@ local function runTest(
 	state.deferred, state.inlineSeeds = outerDeferred, outerSeeds
 	endEnvScope()
 	local tautologies = if tracker ~= nil and #tracker.tautologies > 0 then tracker.tautologies else EMPTY_TAUTOLOGIES
-	return failure, detail, seed, inlineSeeds, zeroAssertion, tautologies
+	local diffPayload = if failure ~= nil and tracker ~= nil then encodeDiffPayload(tracker.lastFailureDiff) else nil
+	return failure, detail, seed, inlineSeeds, zeroAssertion, tautologies, diffPayload
 end
 
 type Outcome = {
@@ -330,6 +374,10 @@ type Outcome = {
 	tautologies: { TautologyRecord },
 	ms: number,
 	traceCsv: string?,
+	flaky: boolean?,
+	attempts: number?,
+	firstFailure: string?,
+	diff: { expected: any, actual: any }?,
 }
 
 local function mergeHits(dst: { [number]: boolean }, src: { [number]: boolean }?)
@@ -459,7 +507,17 @@ local function execute(
 		local detail: string?, seed: number?, inlineSeeds: { [string]: number } = nil, nil, {}
 		local zeroAssertion = false
 		local tautologies: { TautologyRecord } = EMPTY_TAUTOLOGIES
+		local diff: { expected: any, actual: any }? = nil
+		local flaky = false
+		local attempts = 1
+		local firstFailure: string? = nil
 		local testHits: { [number]: boolean }? = nil
+		local maxRetries = if opts.mutant == nil
+				and opts.mutants == nil
+				and type(opts.retry) == "number"
+				and opts.retry > 0
+			then math.floor(opts.retry)
+			else 0
 		if failure == nil then
 			if tracing then
 				testHits = {}
@@ -471,7 +529,20 @@ local function execute(
 				target = test.target,
 				last = withLast and lastOfFile[test.file] == position,
 			}
-			failure, detail, seed, inlineSeeds, zeroAssertion, tautologies = runTest(test, chain, opts)
+			failure, detail, seed, inlineSeeds, zeroAssertion, tautologies, diff = runTest(test, chain, opts)
+			if failure ~= nil and maxRetries > 0 then
+				firstFailure = failure
+				for _ = 1, maxRetries do
+					attempts += 1
+					local rFail, rDetail, rSeed, rSeeds, rZero, rTauts, rDiff = runTest(test, chain, opts)
+					failure, detail, seed, inlineSeeds, zeroAssertion, tautologies, diff =
+						rFail, rDetail, rSeed, rSeeds, rZero, rTauts, rDiff
+					if failure == nil then
+						flaky = true
+						break
+					end
+				end
+			end
 			state.running = nil
 			if tracing then mutant.setTrace(true, nil) end
 		end
@@ -495,6 +566,10 @@ local function execute(
 				tautologies = tautologies,
 				ms = math.round((os.clock() - clock) * 1000),
 				traceCsv = traceCsv,
+				flaky = flaky,
+				attempts = attempts,
+				firstFailure = firstFailure,
+				diff = diff,
 			})
 		then
 			if pass ~= nil and plan ~= nil then
@@ -545,6 +620,14 @@ local function enterMutant(opts: RunOptions): (boolean, () -> ())
 	local parsed = mutant.parsed
 	if parsed ~= nil and parsed.id == opts.mutant then
 		outerMutant, mutant.parsed = parsed.outer, nil
+	end
+	local parsedTrace = mutant.parsedTrace
+	if isTrace and parsedTrace ~= nil then
+		outerMutant = parsedTrace.outerMutant
+		outerSlotId = parsedTrace.outerSlotId
+		outerHits = parsedTrace.outerHits
+		outerLoadHits = parsedTrace.outerLoadHits
+		mutant.parsedTrace = nil
 	end
 	local mutantRun = opts.mutant ~= nil or batch ~= nil or (registry.isolateDepth == 0 and mutant.get() ~= nil)
 	if mutantRun and opts.failFast == nil then opts.failFast = true end
@@ -611,6 +694,7 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean, (name: st
 	local lowerFilter = if opts.filter ~= nil then string.lower(opts.filter) else nil
 	local grep = opts.grep
 	local lowerGrep = if grep ~= nil then string.lower(grep) else nil
+	local greps = if opts.greps ~= nil and #opts.greps > 0 then opts.greps else nil
 	local lowerFilters: { string }? = nil
 	if filters ~= nil then
 		local lowered = {}
@@ -633,7 +717,12 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean, (name: st
 		wantedFiles = list
 	end
 
-	local explicit = opts.filter ~= nil or grep ~= nil or filters ~= nil or opts.names ~= nil or wantedFiles ~= nil
+	local explicit = opts.filter ~= nil
+		or grep ~= nil
+		or greps ~= nil
+		or filters ~= nil
+		or opts.names ~= nil
+		or wantedFiles ~= nil
 	local shard: Shard? = if type(opts.shard) == "table"
 		then opts.shard
 		elseif opts.shard == true or (opts.shard == nil and not explicit) then shardInfo.get()
@@ -643,8 +732,23 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean, (name: st
 		if shard ~= nil and not shardInfo.selects(name, shard) then return false end
 		local lowerName = string.lower(name)
 		if lowerFilter ~= nil and string.find(lowerName, lowerFilter, 1, true) == nil then return false end
-		if grep ~= nil and lowerGrep ~= nil and not matchesPatternOrSubstring(name, lowerName, grep, lowerGrep) then
+		if
+			grep ~= nil
+			and lowerGrep ~= nil
+			and greps == nil
+			and not matchesPatternOrSubstring(name, lowerName, grep, lowerGrep)
+		then
 			return false
+		end
+		if greps ~= nil then
+			local anyGrep = false
+			for _, pat in greps do
+				if matchesPatternOrSubstring(name, lowerName, pat, string.lower(pat)) then
+					anyGrep = true
+					break
+				end
+			end
+			if not anyGrep then return false end
 		end
 		if lowerFilters ~= nil then
 			local any = false
@@ -661,7 +765,7 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean, (name: st
 			if excludeExact[name] then return false end
 			local exactMap: { [any]: boolean } = excludeExact :: any
 			for ex in next, exactMap do
-				if type(ex) == "string" and string.find(lowerName, string.lower(ex), 1, true) ~= nil then
+				if type(ex) == "string" and matchesPatternOrSubstring(name, lowerName, ex, string.lower(ex)) then
 					return false
 				end
 			end
@@ -680,18 +784,29 @@ local function selector(opts: RunOptions): (Shard?, (Test) -> boolean, (name: st
 	return shard, selected, matchesEntry
 end
 
-local function selectionText(opts: RunOptions, shard: Shard?): string
+local function selectionText(opts: RunOptions, shard: Shard?, shuffleSeed: number?): string
 	local selection = {}
 	if opts.filter ~= nil then table.insert(selection, `filter "{opts.filter}"`) end
-	if opts.grep ~= nil then table.insert(selection, `grep "{opts.grep}"`) end
+	if opts.grep ~= nil then
+		table.insert(selection, `grep "{opts.grep}"`)
+	elseif opts.greps ~= nil and #opts.greps > 0 then
+		table.insert(selection, `grep "{table.concat(opts.greps, '" | "')}"`)
+	end
 	if opts.filters ~= nil and #opts.filters > 0 then
 		table.insert(selection, `filters "{table.concat(opts.filters, '" | "')}"`)
 	end
 	if opts.names ~= nil then table.insert(selection, `{#opts.names} named`) end
-	if opts.exclude ~= nil then table.insert(selection, `exclude "{opts.exclude}"`) end
-	if opts.excludes ~= nil and #opts.excludes > 0 then table.insert(selection, `{#opts.excludes} excluded`) end
+	if opts.exclude ~= nil then
+		table.insert(selection, `exclude "{opts.exclude}"`)
+	elseif opts.excludes ~= nil and #opts.excludes > 0 then
+		table.insert(selection, `{#opts.excludes} excluded`)
+	end
 	if opts.files ~= nil and #opts.files > 0 then table.insert(selection, `files {table.concat(opts.files, ", ")}`) end
 	if shard ~= nil then table.insert(selection, `shard {shard.name} ({shard.index}/{shard.count})`) end
+	if shuffleSeed ~= nil then table.insert(selection, `shuffle seed {shuffleSeed}`) end
+	if type(opts.retry) == "number" and opts.retry > 0 then
+		table.insert(selection, `retry {math.floor(opts.retry)}`)
+	end
 	if opts.exhaustive then
 		table.insert(selection, `exhaustive · budget {opts.budget or 600} s`)
 	elseif opts.replay ~= nil then
@@ -764,7 +879,7 @@ local function planTests(opts: RunOptions, selected: (Test) -> boolean, shard: S
 	return plan, properties, focusedRan
 end
 
-local function runOrder(opts: RunOptions, mutantRun: boolean): { number }
+local function runOrder(opts: RunOptions, mutantRun: boolean): ({ number }, number?)
 	local tests = registry.state.tests
 	if opts.mutant ~= nil and opts.mutantTests ~= nil then
 		local allowed = opts.mutantTests[opts.mutant]
@@ -780,7 +895,7 @@ local function runOrder(opts: RunOptions, mutantRun: boolean): { number }
 			for index = 1, #tests do
 				if not seen[index] then table.insert(order, index) end
 			end
-			return order
+			return order, nil
 		end
 	end
 	local order: { number } = {}
@@ -790,12 +905,17 @@ local function runOrder(opts: RunOptions, mutantRun: boolean): { number }
 			table.insert(if test.prop ~= nil then slow else order, index)
 		end
 		table.move(slow, 1, #slow, #order + 1, order)
-	else
-		for index = 1, #tests do
-			order[index] = index
-		end
+		return order, nil
 	end
-	return order
+	for index = 1, #tests do
+		order[index] = index
+	end
+	local shuffleSeed: number? = nil
+	if opts.shuffle == true and not mutantRun and opts.mutants == nil then
+		shuffleSeed = if opts.seed ~= nil then opts.seed else os.time()
+		rng.new(shuffleSeed :: number):shuffle(order)
+	end
+	return order, shuffleSeed
 end
 
 local function listTests(plan: { string }, results: Results, emit: (string) -> ())
@@ -916,14 +1036,14 @@ local function runSelection(
 	plan: { string },
 	opts: RunOptions,
 	results: Results,
-	timings: { { name: string, file: string, ms: number } },
+	timings: { { name: string, file: string, ms: number } }?,
 	out: (...any) -> (),
 	shout: (...any) -> (),
 	emitMarker: (string) -> ()
 )
-	local function marker(test: Test, status: string, ms: number, failure: string?)
+	local function marker(test: Test, status: string, ms: number, failure: string?, outcome: Outcome?)
 		if opts.markers then
-			emitMarker(`[sert-test] {format.json({
+			local payload: { [string]: any } = {
 				name = test.name,
 				file = test.file,
 				target = test.target,
@@ -931,11 +1051,24 @@ local function runSelection(
 				ms = ms,
 				err = failure,
 				error = failure,
-			})}`)
+			}
+			if outcome ~= nil then
+				if outcome.flaky == true then
+					payload.flaky = true
+					payload.attempts = outcome.attempts
+					payload.firstError = outcome.firstFailure
+				end
+				if outcome.diff ~= nil then
+					payload.expected = outcome.diff.expected
+					payload.actual = outcome.diff.actual
+				end
+			end
+			emitMarker(`[sert-test] {format.json(payload)}`)
 		end
 	end
 
 	local seenZeroAssertion: { [string]: boolean } = {}
+	local maxAttempts = 1 + (if type(opts.retry) == "number" and opts.retry > 0 then math.floor(opts.retry) else 0)
 	local repeats = math.max(1, opts.repeatCount or 1)
 	for iteration = 1, repeats do
 		local iterSuffix = if repeats > 1 then ` (iter {iteration}/{repeats})` else ""
@@ -947,7 +1080,9 @@ local function runSelection(
 			iteration == repeats,
 			function(outcome: Outcome): boolean
 				local test, failure = outcome.test, outcome.failure
-				table.insert(timings, { name = test.name .. iterSuffix, file = test.file, ms = outcome.ms })
+				if timings ~= nil then
+					table.insert(timings, { name = test.name .. iterSuffix, file = test.file, ms = outcome.ms })
+				end
 				if outcome.zeroAssertion and not seenZeroAssertion[test.name] then
 					seenZeroAssertion[test.name] = true
 					table.insert(results.zeroAssertionTests, test.name)
@@ -968,14 +1103,23 @@ local function runSelection(
 				end
 				if failure == nil then
 					results.passed += 1
-					if not opts.compact then
+					if outcome.flaky == true then
+						results.flaky += 1
+						table.insert(results.flakyTests, test.name)
 						out(
-							`✅ {test.name}{iterSuffix} · {outcome.ms} ms{if outcome.detail
-								then " · " .. outcome.detail
-								else ""}`
+							`⚠️ FLAKY {test.name}{iterSuffix} · passed on attempt {outcome.attempts}/{maxAttempts} · {outcome.ms} ms`
 						)
+						marker(test, "flaky", outcome.ms, nil, outcome)
+					else
+						if not opts.compact then
+							out(
+								`✅ {test.name}{iterSuffix} · {outcome.ms} ms{if outcome.detail
+									then " · " .. outcome.detail
+									else ""}`
+							)
+						end
+						marker(test, "pass", outcome.ms, nil, outcome)
 					end
-					marker(test, "pass", outcome.ms)
 					return false
 				end
 				results.failed += 1
@@ -989,7 +1133,7 @@ local function runSelection(
 					results.seeds[test.name] = outcome.seed
 					emitMarker(`[sert-seed] {test.name}|{outcome.seed}`)
 				end
-				marker(test, "fail", outcome.ms, failure)
+				marker(test, "fail", outcome.ms, failure, outcome)
 				if opts.failFast == true then
 					stoppedEarly = true
 					return true
@@ -1266,6 +1410,9 @@ function runner.run(options: RunOptions?): Results
 	local results: Results = {
 		passed = 0,
 		failed = 0,
+		flaky = 0,
+		flakyTests = format.array({}),
+		shuffleSeed = nil,
 		skipped = 0,
 		skippedRoblox = 0,
 		skippedRtest = 0,
@@ -1330,13 +1477,16 @@ function runner.run(options: RunOptions?): Results
 		return abort("sert.run: no tests registered")
 	end
 
-	local selection = selectionText(opts, shard)
+	local order, shuffleSeed = runOrder(opts, mutantRun)
+	results.shuffleSeed = shuffleSeed
+	local selection = selectionText(opts, shard, shuffleSeed)
 	local runtime = if IS_ROBLOX then "Roblox" else "Luau CLI"
 	local focusTag = if state.focusing or (opts.bench == true and state.benchFocusing) then " · FOCUS" else ""
 	out(`sert · {#tests} {if #tests == 1 then "test" else "tests"} · {runtime}{focusTag}{selection}`)
 
 	results.total -= countStep(plan, "ignore")
 	if properties and not opts.exhaustive then emitMarker(`[sert-seed] run {opts.seed or DEFAULT_SEED_BASE}`) end
+	if shuffleSeed ~= nil then emitMarker(`[sert-seed] shuffle {shuffleSeed}`) end
 	if
 		not onlyBenchmarks
 		and opts.requireTests
@@ -1346,11 +1496,10 @@ function runner.run(options: RunOptions?): Results
 		and not table.find(plan, "skip")
 	then
 		results.skipped = results.total
-		local hint = filterHint(opts.filter or opts.grep, tests)
+		local hint = filterHint(opts.filter or opts.grep or (if opts.greps ~= nil then opts.greps[1] else nil), tests)
 		return abort(`sert.run: requireTests: selection{selection} matched none of the {results.total} tests{hint}`)
 	end
 
-	local order = runOrder(opts, mutantRun)
 	state.options = opts
 	local startClock = os.clock()
 	if opts.mutants ~= nil then
@@ -1360,13 +1509,22 @@ function runner.run(options: RunOptions?): Results
 		return results
 	end
 
-	local timings: { { name: string, file: string, ms: number } } = {}
+	local timings: { { name: string, file: string, ms: number } }? = if opts.slowest ~= nil
+			and opts.slowest > 0
+		then {}
+		else nil
 	if not onlyBenchmarks then runSelection(order, plan, opts, results, timings, out, shout, emitMarker) end
 	if opts.bench == true and #state.benchmarks > 0 then runBenchmarks(opts, matchesEntry, results, out, shout) end
 
-	-- Enforce CI `.focus` gate when any focused test ran under CI without `allowFocused`.
+	-- Enforce CI `.focus` gate when any focused test ran (or unfiltered suite is focused) under CI without `allowFocused`.
+	local hasExplicitSel = opts.filter ~= nil
+		or opts.grep ~= nil
+		or (opts.greps ~= nil and #opts.greps > 0)
+		or (opts.filters ~= nil and #opts.filters > 0)
+		or opts.names ~= nil
+		or (opts.files ~= nil and #opts.files > 0)
 	if
-		(focusedRan or state.focusing or (opts.bench == true and state.benchFocusing))
+		(focusedRan or ((state.focusing or (opts.bench == true and state.benchFocusing)) and not hasExplicitSel))
 		and detectCi(opts)
 		and opts.allowFocused ~= true
 	then
@@ -1379,7 +1537,7 @@ function runner.run(options: RunOptions?): Results
 	results.clock = os.clock() - startClock
 	settle()
 
-	if opts.slowest ~= nil and opts.slowest > 0 and #timings > 0 then
+	if opts.slowest ~= nil and opts.slowest > 0 and timings ~= nil and #timings > 0 then
 		table.sort(
 			timings,
 			function(
@@ -1399,26 +1557,32 @@ function runner.run(options: RunOptions?): Results
 
 	local unselected = countStep(plan, "out")
 	local notSelected = if unselected > 0 then ` · {unselected} not selected` else ""
+	local flakyNote = if results.flaky > 0 then ` ({results.flaky} flaky)` else ""
 	local robloxNote = if results.skippedRoblox > 0
 		then ` ({results.skippedRoblox} roblox — run 'python3 tools/sert.py studio' to execute engine tests)`
 		else ""
 	out(
-		`\n{results.passed} passed · {results.failed} failed · {results.skipped - unselected} skipped{robloxNote}{notSelected}`
+		`\n{results.passed} passed{flakyNote} · {results.failed} failed · {results.skipped - unselected} skipped{robloxNote}{notSelected}`
 			.. ` · {math.round(results.clock * 1000)} ms`
 	)
+	if results.failed > 0 and shuffleSeed ~= nil then
+		local cmd = opts.command or "python3 tools/sert.py run"
+		out(`   shuffle seed: {shuffleSeed} (replay: {cmd} --shuffle --seed {shuffleSeed})`)
+	end
 	emitMarker(`[sert-done] {format.json(results)}`)
 
 	if results.failed > 0 and opts.raise ~= false then error(`{results.failed} of {results.total} tests failed`, 0) end
 	return results
 end
 
-local KNOWN_FLAGS = "--filter, --grep/-g, --exclude, --file, --seed, --replay, --runs, --budget, --test-timeout, "
-	.. "--repeat, --slowest, --exhaustive, --list, --markers, --quiet, --silent, --compact, --ci, --allow-focused, "
-	.. "--all, --no-sweep, -x/--fail-fast, --mutant, --mutants, --trace-mutants, --shard, --update-snapshots/-u, "
-	.. "--strict-assertions, --bench"
+local KNOWN_FLAGS = "--filter, --grep/-g, --exclude, --file, --seed, --shuffle, --replay, --runs, --retry, --budget, "
+	.. "--test-timeout, --repeat, --slowest, --exhaustive, --list, --markers, --quiet, --silent, --compact, --ci, "
+	.. "--allow-focused, --all, --no-sweep, -x/--fail-fast, --mutant, --mutants, --trace-mutants, --shard, "
+	.. "--update-snapshots/-u, --strict-assertions, --bench"
 
 local NUMERIC_FLAGS: { [string]: string } = {
 	seed = "seed",
+	retry = "retry",
 	runs = "runs",
 	budget = "budget",
 	["test-timeout"] = "testTimeout",
@@ -1428,6 +1592,7 @@ local NUMERIC_FLAGS: { [string]: string } = {
 
 local SWITCH_FLAGS: { [string]: string } = {
 	list = "list",
+	shuffle = "shuffle",
 	exhaustive = "exhaustive",
 	markers = "markers",
 	quiet = "quiet",
@@ -1506,6 +1671,16 @@ function runner.parseCliArgs(...: any): RunOptions
 		end
 		opts.filter = filter
 	end
+	local function appendMulti(singleKey: string, multiKey: string, val: string)
+		if opts[multiKey] ~= nil then
+			table.insert(opts[multiKey], val)
+		elseif opts[singleKey] == nil then
+			opts[singleKey] = val
+		else
+			opts[multiKey] = { opts[singleKey], val }
+			opts[singleKey] = nil
+		end
+	end
 	while i <= #raw do
 		local arg = raw[i]
 		i += 1
@@ -1521,7 +1696,7 @@ function runner.parseCliArgs(...: any): RunOptions
 			local nextArg = raw[i]
 			if type(nextArg) ~= "string" then failCli("-g expects a pattern value") end
 			i += 1
-			opts.grep = nextArg
+			appendMulti("grep", "greps", nextArg)
 			continue
 		elseif string.sub(arg, 1, 1) ~= "-" then
 			setFilter(arg)
@@ -1568,9 +1743,9 @@ function runner.parseCliArgs(...: any): RunOptions
 		elseif flag == "filter" then
 			setFilter(takeValue())
 		elseif flag == "grep" then
-			opts.grep = takeValue()
+			appendMulti("grep", "greps", takeValue())
 		elseif flag == "exclude" then
-			opts.exclude = takeValue()
+			appendMulti("exclude", "excludes", takeValue())
 		elseif flag == "file" then
 			opts.files = opts.files or {}
 			table.insert(opts.files, takeValue())
@@ -1608,6 +1783,8 @@ function runner.parseCliArgs(...: any): RunOptions
 					and (number < 1 or number ~= math.floor(number))
 				then
 					failCli(`--{flag} expects a whole number from 1, got "{val}"`)
+				elseif flag == "retry" and (number < 0 or number ~= math.floor(number)) then
+					failCli(`--retry expects a non-negative integer, got "{val}"`)
 				elseif (flag == "budget" or flag == "test-timeout") and number <= 0 then
 					failCli(`--{flag} expects a number above 0, got "{val}"`)
 				end
@@ -1623,6 +1800,12 @@ function runner.parseCliArgs(...: any): RunOptions
 		mutant.parsed = { id = opts.mutant, outer = mutant.get() or 0 }
 		mutant.set(opts.mutant)
 	elseif opts.traceMutants == true then
+		mutant.parsedTrace = {
+			outerSlotId = mutant._slot.id,
+			outerHits = mutant._slot.hits,
+			outerMutant = mutant.get(),
+			outerLoadHits = mutant.traceLoadHits,
+		}
 		local loadHits: { [number]: boolean } = {}
 		mutant.traceLoadHits = loadHits
 		mutant.setTrace(true, loadHits)

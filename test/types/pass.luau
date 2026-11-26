@@ -210,11 +210,16 @@ local modelSpec: sert.ModelSpec<{ n: number }, { n: number }> = {
 	commands = { inc = cmd },
 	invariants = { match = function(s: { n: number }, sut: { n: number }) sert.eq(s.n, sut.n) end },
 }
-local modelOpts: sert.ModelOptions = { length = 8, redraw = true, maxRedraws = 4, runs = 5, raise = false }
-local _modelPropOpts: sert.PropOptions = sert.model.propOptions(modelOpts)
+local modelOpts: sert.ModelOptions =
+	{ length = 8, redraw = true, maxRedraws = 4, runs = 5, raise = false, smoke = true, tags = { "model" } }
 local _modelFn: (sert.GenContext) -> () = sert.model.property(modelSpec, modelOpts)
 local _mRes: sert.PropResult = sert.model.check(modelSpec, modelOpts)
 local _mState, _mSut = sert.model.replay(modelSpec, { { "inc", 1 } })
+sert.model.roblox("roblox model", modelSpec, modelOpts)
+sert.model.server("server model", modelSpec, modelOpts)
+sert.model.client("client model", modelSpec, modelOpts)
+sert.model.skip("skip model", modelSpec)
+sert.model.focus("focus model", modelSpec, modelOpts)
 
 local codecSpec: sert.CodecSpec<number, string> = {
 	gen = intGen,
@@ -376,7 +381,7 @@ local _compSpec: sert.ComplexitySpec<{ number }> = {
 	sut = function(xs: { number }): number return #xs end,
 	measure = function(xs: { number }): number return #xs end,
 }
-sert.laws.complexity("scan complexity law", _compSpec, { runs = 3 })
+sert.laws.complexity("scan complexity law", _compSpec, { timeout = 10 })
 sert.laws.complexity(_compSpec)
 
 -- Wave 1 & Wave 2: Linearizability, Recorder, and State-Hashed / DPOR Exploration
@@ -529,4 +534,23 @@ local function _probeEnvEngineApis(e: sert.Env)
 	label.Text = "<b>Hi</b>"
 	local _contentText: string = label.ContentText
 	local _activeMutant: number? = sert.mutant()
+end
+
+-- Milestone 4 probes: symmetric modifiers, installGlobals, shuffle/retry RunOptions & Results, PropOptions smoke/tags
+sert.test.skip.each({ 1, 2 })("t skip each %d", function(_x: number) end)
+sert.test.focus.each({ 1 })("t focus each %d", function(_x: number) end)
+sert.test.roblox.skip.each({ 1 })("t roblox skip each %d", function(_x: number) end)
+sert.describe.skip.each({ "a" })("d skip each %s", function(_s: string) end)
+sert.prop.skip.each({ 1 })("p skip each %d", function(_x: number, _g: sert.GenContext) end)
+sert.prop.roblox.skip.each({ 1 })("p roblox skip each %d", function(_x: number, _g: sert.GenContext) end)
+sert.prop("p smoke tags", function(_g: sert.GenContext) end, { smoke = true, tags = { "unit" } })
+
+local _installTarget: { [string]: any } = {}
+sert.env.installGlobals(_installTarget)
+local _m4RunOpts: sert.RunOptions = { shuffle = true, retry = 2, quiet = true }
+local function _checkM4Results(r: sert.Results)
+	local _flaky: number = r.flaky
+	local _flakyTests: { string } = r.flakyTests
+	local _shufSeed: number? = r.shuffleSeed
+	local _: { any } = { _flaky, _flakyTests, _shufSeed }
 end

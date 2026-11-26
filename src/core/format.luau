@@ -15,7 +15,7 @@ local function safeTostring(value: any): (boolean, string)
 end
 
 -- Sort numbers ascending (NaN last), then strings, then other keys by type and safe tostring.
-local function keyBefore(a: any, b: any): boolean
+function format.keyBefore(a: any, b: any): boolean
 	local rankA, rankB = KEY_RANK[type(a)] or 3, KEY_RANK[type(b)] or 3
 	if rankA ~= rankB then return rankA < rankB end
 	if rankA == 1 then
@@ -34,8 +34,10 @@ local function keyBefore(a: any, b: any): boolean
 	return `{type(a)}:{strA}` < `{type(b)}:{strB}`
 end
 
+local keyBefore = format.keyBefore
+
 -- Use `next` instead of generalized iteration so `__iter` metamethods cannot error or loop while formatting.
-local function sortedKeys(value: { [any]: any }): { any }
+function format.sortedKeys(value: { [any]: any }): { any }
 	local keys = {}
 	for key in next, value do
 		table.insert(keys, key)
@@ -43,6 +45,8 @@ local function sortedKeys(value: { [any]: any }): { any }
 	table.sort(keys, keyBefore)
 	return keys
 end
+
+local sortedKeys = format.sortedKeys
 
 type Limits = { depth: number, items: number }
 local DEFAULT_LIMITS: Limits = { depth = 3, items = 8 }
@@ -183,6 +187,8 @@ local function pathText(path: { any }): string
 	return table.concat(parts)
 end
 
+local UNREADABLE = table.freeze({})
+
 -- Reads `container[key]` without allowing strict `__index` tables or invalid userdata properties to crash diffing.
 local function safeReadField(container: any, key: any, raw: boolean): (boolean, any)
 	local kind = type(container)
@@ -197,6 +203,338 @@ local function safeReadField(container: any, key: any, raw: boolean): (boolean, 
 		return ok, if ok then value else nil
 	end
 	return false, nil
+end
+
+function format.snapNum(n: number): string
+	if n ~= n then return "nan" end
+	if n == math.huge then
+		return "inf"
+	elseif n == -math.huge then
+		return "-inf"
+	end
+	if n == 0 then return "0" end
+	if n % 1 == 0 and math.abs(n) < 1e15 then return tostring(n) end
+	return string.format("%.6g", n)
+end
+
+local snapNum = format.snapNum
+
+local function signedDelta(delta: number): string
+	if delta ~= delta then return "nan" end
+	local s = snapNum(delta)
+	if delta > 0 and string.sub(s, 1, 1) ~= "+" then return "+" .. s end
+	return s
+end
+
+local CFRAME_PART_NAMES = { "X", "Y", "Z", "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22" }
+
+function format.datatypeComponents(value: any): (string, { { any } }?)
+	local kind = util.typeof(value)
+	local v: any = value
+	if kind == "vector" then
+		return kind, { { "x", v.x }, { "y", v.y }, { "z", v.z } }
+	elseif kind == "Vector2" or kind == "Vector2int16" then
+		return kind, { { "X", v.X }, { "Y", v.Y } }
+	elseif kind == "Vector3" or kind == "Vector3int16" then
+		return kind, { { "X", v.X }, { "Y", v.Y }, { "Z", v.Z } }
+	elseif kind == "Color3" then
+		return kind, { { "R", v.R }, { "G", v.G }, { "B", v.B } }
+	elseif kind == "UDim" then
+		return kind, { { "Scale", v.Scale }, { "Offset", v.Offset } }
+	elseif kind == "UDim2" then
+		return kind,
+			{
+				{ "X.Scale", v.X.Scale },
+				{ "X.Offset", v.X.Offset },
+				{ "Y.Scale", v.Y.Scale },
+				{ "Y.Offset", v.Y.Offset },
+			}
+	elseif kind == "Rect" then
+		return kind,
+			{
+				{ "Min.X", v.Min.X },
+				{ "Min.Y", v.Min.Y },
+				{ "Max.X", v.Max.X },
+				{ "Max.Y", v.Max.Y },
+			}
+	elseif kind == "NumberRange" then
+		return kind, { { "Min", v.Min }, { "Max", v.Max } }
+	elseif kind == "CFrame" then
+		local okC, comps = pcall(function() return { v:GetComponents() } end)
+		if okC and type(comps) == "table" and #comps >= 12 then
+			local pairsOut: { { any } } = {}
+			for i = 1, 12 do
+				table.insert(pairsOut, { CFRAME_PART_NAMES[i], comps[i] })
+			end
+			return kind, pairsOut
+		end
+	end
+	return kind, nil
+end
+
+local datatypeComponents = format.datatypeComponents
+
+local function datatypeDeltaNote(actual: any, expected: any): string?
+	local kindA, partsA = datatypeComponents(actual)
+	local kindB, partsB = datatypeComponents(expected)
+	if kindA ~= kindB or partsA == nil or partsB == nil then return nil end
+
+	if kindA == "CFrame" then
+		local cA, cB = partsA, partsB
+		local diffs: { string } = {}
+		for i = 1, 3 do
+			local vA, vB = cA[i][2] :: number, cB[i][2] :: number
+			local d = vA - vB
+			if d ~= 0 or (d ~= d and (vA == vA or vB == vB)) then table.insert(diffs, `{cA[i][1]}={signedDelta(d)}`) end
+		end
+		local maxRotDelta = 0
+		local rotDiffer = false
+		for i = 4, 12 do
+			local d = math.abs((cA[i][2] :: number) - (cB[i][2] :: number))
+			if d ~= 0 then
+				rotDiffer = true
+				if d == d and d > maxRotDelta then maxRotDelta = d end
+			end
+		end
+		if rotDiffer then table.insert(diffs, `rot max Δ={snapNum(maxRotDelta)}`) end
+		if #diffs > 0 then return `Δ {table.concat(diffs, ", ")}` end
+		return nil
+	end
+
+	local diffs: { string } = {}
+	for i = 1, #partsA do
+		local name = partsA[i][1] :: string
+		local valA = partsA[i][2] :: number
+		local valB = partsB[i][2] :: number
+		local bothNan = valA ~= valA and valB ~= valB
+		if not bothNan and valA ~= valB then table.insert(diffs, `{name}={signedDelta(valA - valB)}`) end
+	end
+	if #diffs > 0 then return `Δ {table.concat(diffs, ", ")}` end
+	return nil
+end
+
+local INSTANCE_KEY_PROPS = {
+	"Name",
+	"Parent",
+	"Value",
+	"Visible",
+	"Text",
+	"Position",
+	"Size",
+	"Anchored",
+	"CanCollide",
+	"Transparency",
+	"Color",
+	"AbsolutePosition",
+	"AbsoluteSize",
+}
+
+local function instanceLabel(inst: any): (string, string)
+	local okCls, cls = pcall(function() return inst.ClassName end)
+	local clsName = if okCls and type(cls) == "string" then cls else "Instance"
+	local okFull, full = pcall(function() return inst:GetFullName() end)
+	if okFull and type(full) == "string" then return clsName, full end
+	local okNm, nm = pcall(function() return inst.Name end)
+	return clsName, if okNm and type(nm) == "string" then nm else "?"
+end
+
+local function renderShort(v: any): string return render(v, 1, DEFAULT_LIMITS, nil, 1, {}) end
+
+local function mergedStringKeys(a: { [any]: any }, b: { [any]: any }): { string }
+	local keys: { string } = {}
+	local seenK: { [string]: boolean } = {}
+	for _, tbl in { b, a } do
+		for k in next, tbl do
+			if type(k) == "string" and not seenK[k] then
+				seenK[k] = true
+				table.insert(keys, k)
+			end
+		end
+	end
+	table.sort(keys)
+	return keys
+end
+
+local function instanceDiffNote(actual: any, expected: any): string?
+	if util.typeof(actual) ~= "Instance" or util.typeof(expected) ~= "Instance" or actual == expected then
+		return nil
+	end
+	local expCls, expFull = instanceLabel(expected)
+	local actCls, actFull = instanceLabel(actual)
+	local header = string.format("expected %s %q, got %s %q", expCls, expFull, actCls, actFull)
+
+	local diffs: { string } = {}
+	if expCls == actCls then
+		for _, propName in INSTANCE_KEY_PROPS do
+			if #diffs >= 6 then break end
+			local okA, vA = pcall(function() return actual[propName] end)
+			local okB, vB = pcall(function() return expected[propName] end)
+			if okA and okB and vA ~= vB then
+				if propName == "Parent" then
+					local pAStr = if vA == nil then "nil" else select(2, instanceLabel(vA))
+					local pBStr = if vB == nil then "nil" else select(2, instanceLabel(vB))
+					table.insert(diffs, `Parent: {pBStr} -> {pAStr}`)
+				else
+					table.insert(diffs, `{propName}: {renderShort(vB)} -> {renderShort(vA)}`)
+				end
+			end
+		end
+
+		if #diffs < 6 then
+			local okAA, attrsA = pcall(function() return actual:GetAttributes() end)
+			local okAB, attrsB = pcall(function() return expected:GetAttributes() end)
+			if okAA and okAB and type(attrsA) == "table" and type(attrsB) == "table" then
+				for _, k in mergedStringKeys(attrsA :: { [any]: any }, attrsB :: { [any]: any }) do
+					if #diffs >= 6 then break end
+					local vA, vB = (attrsA :: any)[k], (attrsB :: any)[k]
+					if vA ~= vB then table.insert(diffs, `attr[{k}]: {renderShort(vB)} -> {renderShort(vA)}`) end
+				end
+			end
+		end
+
+		if #diffs < 6 then
+			local okTA, tagsA = pcall(function() return actual:GetTags() end)
+			local okTB, tagsB = pcall(function() return expected:GetTags() end)
+			if okTA and okTB and type(tagsA) == "table" and type(tagsB) == "table" then
+				local sA = table.concat(tagsA :: { string }, ",")
+				local sB = table.concat(tagsB :: { string }, ",")
+				if sA ~= sB then table.insert(diffs, `tags: [{sB}] -> [{sA}]`) end
+			end
+		end
+
+		if #diffs < 6 then
+			local okCA, chA = pcall(function() return #actual:GetChildren() end)
+			local okCB, chB = pcall(function() return #expected:GetChildren() end)
+			if okCA and okCB and chA ~= chB then table.insert(diffs, `children: {chB} -> {chA}`) end
+		end
+	end
+
+	if #diffs > 0 then return `{header}; {table.concat(diffs, ", ")}` end
+	return header
+end
+
+local function splitLines(text: string): { string }
+	local lines: { string } = {}
+	local pos = 1
+	while true do
+		local nl = string.find(text, "\n", pos, true)
+		if nl == nil then
+			table.insert(lines, string.sub(text, pos))
+			break
+		end
+		table.insert(lines, string.sub(text, pos, nl - 1))
+		pos = nl + 1
+	end
+	return lines
+end
+
+local function diffMultilineStrings(actualStr: string, expectedStr: string): (number, number, string)
+	local expLines = splitLines(expectedStr)
+	local actLines = splitLines(actualStr)
+
+	local crlfOnly = #expLines == #actLines
+	if crlfOnly then
+		for i = 1, #expLines do
+			if (string.gsub(expLines[i], "\r$", "")) ~= (string.gsub(actLines[i], "\r$", "")) then
+				crlfOnly = false
+				break
+			end
+		end
+	end
+	if crlfOnly then return #expLines, #actLines, "  line endings differ (\\r\\n vs \\n)" end
+
+	type OpLine = { tag: string, text: string }
+	local ops: { OpLine } = {}
+	local n, m = #expLines, #actLines
+	if n * m <= 40000 then
+		local dp: { { number } } = table.create(n + 1) :: any
+		for i = 1, n + 1 do
+			dp[i] = table.create(m + 1, 0)
+		end
+		for i = n, 1, -1 do
+			local row = dp[i]
+			local nextRow = dp[i + 1]
+			local eLine = expLines[i]
+			for j = m, 1, -1 do
+				if eLine == actLines[j] then
+					row[j] = nextRow[j + 1] + 1
+				else
+					local a, b = nextRow[j], row[j + 1]
+					row[j] = if a >= b then a else b
+				end
+			end
+		end
+		local i, j = 1, 1
+		while i <= n and j <= m do
+			if expLines[i] == actLines[j] then
+				table.insert(ops, { tag = " ", text = expLines[i] })
+				i += 1
+				j += 1
+			elseif dp[i + 1][j] >= dp[i][j + 1] then
+				table.insert(ops, { tag = "-", text = expLines[i] })
+				i += 1
+			else
+				table.insert(ops, { tag = "+", text = actLines[j] })
+				j += 1
+			end
+		end
+		while i <= n do
+			table.insert(ops, { tag = "-", text = expLines[i] })
+			i += 1
+		end
+		while j <= m do
+			table.insert(ops, { tag = "+", text = actLines[j] })
+			j += 1
+		end
+	else
+		local maxLen = math.max(n, m)
+		for idx = 1, maxLen do
+			local eLine, aLine = expLines[idx], actLines[idx]
+			if eLine == aLine then
+				table.insert(ops, { tag = " ", text = eLine })
+			else
+				if eLine ~= nil then table.insert(ops, { tag = "-", text = eLine }) end
+				if aLine ~= nil then table.insert(ops, { tag = "+", text = aLine }) end
+			end
+		end
+	end
+
+	local keep: { [number]: boolean } = {}
+	for idx, op in ops do
+		if op.tag ~= " " then
+			keep[idx] = true
+			if idx > 1 then keep[idx - 1] = true end
+			if idx < #ops then keep[idx + 1] = true end
+		end
+	end
+
+	local out: { string } = { "  --- expected", "  +++ actual" }
+	local MAX_LINES = 24
+	local emitted = 0
+	local remaining = 0
+	local lastKept = 0
+	for idx, op in ops do
+		if keep[idx] then
+			if lastKept > 0 and idx > lastKept + 1 then
+				if emitted < MAX_LINES then
+					table.insert(out, "  @@ … @@")
+					emitted += 1
+				else
+					remaining += 1
+				end
+			end
+			lastKept = idx
+			if emitted < MAX_LINES then
+				local prefix = if op.tag == " " then "   " else ` {op.tag} `
+				table.insert(out, `{prefix}{op.text}`)
+				emitted += 1
+			else
+				remaining += 1
+			end
+		end
+	end
+	if remaining > 0 then table.insert(out, `  … (+{remaining} more diff lines)`) end
+	return n, m, table.concat(out, "\n")
 end
 
 local MAX_DIFF_LINES = 8
@@ -252,10 +590,10 @@ local function collectDifferences(a: any, b: any, path: { any }, state: DiffColl
 			local eqX = (va.x == vb.x and (va.x ~= 0 or 1 / va.x == 1 / vb.x)) or (va.x ~= va.x and vb.x ~= vb.x)
 			local eqY = (va.y == vb.y and (va.y ~= 0 or 1 / va.y == 1 / vb.y)) or (va.y ~= va.y and vb.y ~= vb.y)
 			local eqZ = (va.z == vb.z and (va.z ~= 0 or 1 / va.z == 1 / vb.z)) or (va.z ~= va.z and vb.z ~= vb.z)
-			if not (eqX and eqY and eqZ) then recordDiff(state, path, nil) end
+			if not (eqX and eqY and eqZ) then recordDiff(state, path, datatypeDeltaNote(a, b)) end
 			return
 		end
-		if a ~= b then recordDiff(state, path, nil) end
+		if a ~= b then recordDiff(state, path, datatypeDeltaNote(a, b)) end
 		return
 	end
 
@@ -265,13 +603,17 @@ local function collectDifferences(a: any, b: any, path: { any }, state: DiffColl
 		if not bytes.equal(a, b) then recordDiff(state, path, bytes.diff(a, b)) end
 		return
 	elseif typeA ~= "table" then
-		if not (raw and a == b) then recordDiff(state, path, nil) end
+		if not (raw and a == b) then
+			local note = instanceDiffNote(a, b) or datatypeDeltaNote(a, b)
+			recordDiff(state, path, note)
+		end
 		return
 	end
 
 	if not raw and (getmetatable(a) ~= nil or getmetatable(b) ~= nil) then
 		if util.doubleTag(a) ~= nil or util.doubleTag(b) ~= nil then
-			recordDiff(state, path, nil)
+			local note = instanceDiffNote(a, b) or datatypeDeltaNote(a, b)
+			recordDiff(state, path, note)
 		else
 			recordDiff(
 				state,
@@ -324,23 +666,50 @@ end
 
 local function resolveLeafValues(actual: any, expected: any, path: { any }, isRaw: boolean): (any, any)
 	local here, there = actual, expected
+	local hereBroken, thereBroken = false, false
 	for _, key in path do
-		local okHere, nextHere = safeReadField(here, key, isRaw)
-		local okThere, nextThere = safeReadField(there, key, isRaw)
-		if isMatcherTable(there) then
-			-- When a matcher (`subset`) reported a deeper sub-path, walk `here` to the failing leaf and check if `partial` has it.
-			local partial = rawget(there, "_partial")
-			if type(partial) == "table" then
-				okThere, nextThere = safeReadField(partial, key, false)
+		if not hereBroken then
+			local okHere, nextHere = safeReadField(here, key, isRaw)
+			if okHere then
+				here = nextHere
 			else
-				break
+				here = UNREADABLE
+				hereBroken = true
 			end
 		end
-		if not okHere and not okThere then break end
-		if okHere then here = nextHere end
-		if okThere then there = nextThere end
+		if not thereBroken then
+			if isMatcherTable(there) then
+				-- When a matcher (`subset`) reported a deeper sub-path, check `_partial` before falling back.
+				local partial = rawget(there, "_partial")
+				if type(partial) == "table" then
+					local okPartial, nextPartial = safeReadField(partial, key, false)
+					if okPartial then
+						there = nextPartial
+					else
+						there = UNREADABLE
+						thereBroken = true
+					end
+				else
+					thereBroken = true
+				end
+			else
+				local okThere, nextThere = safeReadField(there, key, isRaw)
+				if okThere then
+					there = nextThere
+				else
+					there = UNREADABLE
+					thereBroken = true
+				end
+			end
+		end
+		if hereBroken and thereBroken then break end
 	end
 	return here, there
+end
+
+local function reprLeaf(value: any): string
+	if value == UNREADABLE then return "<unreadable>" end
+	return format.repr(value)
 end
 
 --- Returns up to 8 leaf path differences between `actual` and `expected`, or `nil` when equal.
@@ -360,12 +729,26 @@ function format.diff(actual: any, expected: any, raw: boolean?): string?
 		local here, there = resolveLeafValues(actual, expected, diff.path, isRaw)
 		local where = if #diff.path > 0 then `actual{pathText(diff.path)}: ` else ""
 		local note = diff.note
-		table.insert(
-			lines,
-			`{where}expected {format.repr(there)}, got {format.repr(here)}{if note and note ~= ""
-				then ` ({note})`
-				else ""}`
-		)
+		if
+			type(here) == "string"
+			and type(there) == "string"
+			and here ~= there
+			and (string.find(here, "\n", 1, true) ~= nil or string.find(there, "\n", 1, true) ~= nil)
+		then
+			local expCount, actCount, block = diffMultilineStrings(here, there)
+			table.insert(
+				lines,
+				`{where}multiline strings differ ({expCount} expected {if expCount == 1 then "line" else "lines"}, {actCount} actual {if actCount
+						== 1
+					then "line"
+					else "lines"}):\n{block}`
+			)
+		else
+			table.insert(
+				lines,
+				`{where}expected {reprLeaf(there)}, got {reprLeaf(here)}{if note and note ~= "" then ` ({note})` else ""}`
+			)
+		end
 	end
 	if state.total > MAX_DIFF_LINES then
 		table.insert(lines, `… and {state.total - MAX_DIFF_LINES} more differences`)
@@ -389,7 +772,7 @@ function format.errorText(err: any): string
 		if not strOk then error("tostring failed", 0) end
 		return str
 	end)
-	if ok and type(text) == "string" then return text end
+	if ok and type(text) == "string" then return util.stripStagePrefix(text) end
 	return `<{util.typeof(err)} error>`
 end
 
@@ -619,17 +1002,60 @@ function format.jsonDecode(text: string, options: JsonOptions?): any
 	return value
 end
 
-local function snapNum(n: number): string
-	if n ~= n then return "nan" end
-	if n == math.huge then
-		return "inf"
-	elseif n == -math.huge then
-		return "-inf"
+local function sanitizeJsonValue(value: any, depth: number, limit: number, seen: { [any]: boolean }): any
+	local kind = type(value)
+	if value == nil or kind == "boolean" then return value end
+	if kind == "number" then
+		if value == value and math.abs(value) ~= math.huge then return value end
+		return if value ~= value then "nan" else tostring(value)
+	elseif kind == "string" then
+		if #value > 1024 then return string.sub(value, 1, 1021) .. "..." end
+		return value
+	elseif kind == "table" then
+		if isMatcherTable(value) or util.doubleTag(value) ~= nil or getmetatable(value) ~= nil then
+			if util.typeof(value) == "Instance" then
+				local cls, full = instanceLabel(value)
+				return string.format("%s %q", cls, full)
+			end
+			return format.repr(value)
+		end
+		if seen[value] then return "<cycle>" end
+		if depth > limit then return "{…}" end
+		seen[value] = true
+		local keys = sortedKeys(value)
+		local n = #value
+		local isArr = #keys == n and (n == 0 or (keys[1] == 1 and keys[n] == n))
+		local out: { [any]: any } = {}
+		if isArr then
+			local take = math.min(n, 16)
+			for i = 1, take do
+				out[i] = sanitizeJsonValue(rawget(value, i), depth + 1, limit, seen)
+			end
+			if n > 16 then table.insert(out, `… {n - 16} more`) end
+		else
+			local taken = 0
+			for _, k in keys do
+				if taken >= 16 then
+					out["…"] = `{#keys - 16} more`
+					break
+				end
+				taken += 1
+				local _, kStr = safeTostring(k)
+				out[kStr] = sanitizeJsonValue(rawget(value, k), depth + 1, limit, seen)
+			end
+		end
+		seen[value] = nil
+		return out
 	end
-	if n == 0 then return "0" end
-	if n % 1 == 0 and math.abs(n) < 1e15 then return tostring(n) end
-	return string.format("%.6g", n)
+	if util.typeof(value) == "Instance" then
+		local cls, full = instanceLabel(value)
+		return string.format("%s %q", cls, full)
+	end
+	return format.repr(value)
 end
+
+--- Converts arbitrary values into bounded JSON-encodable structures for structured diagnostics.
+function format.jsonValue(value: any, maxDepth: number?): any return sanitizeJsonValue(value, 1, maxDepth or 3, {}) end
 
 local DATATYPE_FORMATTERS: { [string]: (v: any) -> string } = {
 	Vector2 = function(v: any): string return `Vector2.new({snapNum(v.X)}, {snapNum(v.Y)})` end,

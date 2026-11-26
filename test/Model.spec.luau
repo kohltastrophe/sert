@@ -103,7 +103,7 @@ sert.describe("sert.model unified Spec<State, Sut>", function()
 		local teardowns = { 0 }
 		local spec = makeQueueSpec(nil, teardowns)
 
-		local checkRes = sert.model.check(spec, { runs = 25, length = 20, seed = 101 })
+		local checkRes = sert.model.check(spec, { runs = 25, length = 20, seed = 101, capMutant = false })
 		sert.eq(checkRes.ok, true)
 		sert.eq(teardowns[1], 25)
 
@@ -136,6 +136,7 @@ sert.describe("sert.model unified Spec<State, Sut>", function()
 					length = 25,
 					seed = 4242,
 					raise = false,
+					capMutant = false,
 				})
 
 				sert.eq(res.ok, false)
@@ -152,6 +153,7 @@ sert.describe("sert.model unified Spec<State, Sut>", function()
 					seed = 4242,
 					replay = res.seed,
 					raise = false,
+					capMutant = false,
 				})
 			end)
 			sert.eq(replayRes.ok, false)
@@ -181,7 +183,7 @@ sert.describe("sert.model unified Spec<State, Sut>", function()
 					},
 				},
 			}
-			local redrawRes = sert.model.check(heavyPreSpec, { runs = 15, length = 10, seed = 9 })
+			local redrawRes = sert.model.check(heavyPreSpec, { runs = 15, length = 10, seed = 9, capMutant = false })
 			sert.eq(redrawRes.ok, true)
 			sert.ge(maxReached, 3)
 		end
@@ -321,5 +323,47 @@ sert.describe("sert.model unified Spec<State, Sut>", function()
 		end, { strictAssertions = true })
 		sert.eq(strictRes.passed, 2)
 		sert.eq(strictRes.failed, 0)
+
+		-- Model property stops cleanly when every command's `pre` returns false
+		local emptyPreSpec: sert.ModelSpec<number, number> = {
+			init = function() return 0 end,
+			commands = {
+				never = {
+					pre = function() return false end,
+					run = function() error("should not run", 0) end,
+					next = function(s: number) return s end,
+				},
+			},
+		}
+		local vacRes: any
+		sert.capture(function() vacRes = sert.model.check(emptyPreSpec, { runs = 5, length = 6, raise = false }) end)
+		sert.eq(vacRes.ok, false)
+		sert.contains(vacRes.message :: string, "pre refused every step")
 	end)
+
+	sert.test(
+		"exposes skip, focus, roblox, server, client directly on sert.model alongside deprecated model.prop",
+		function()
+			local spec = makeQueueSpec(nil)
+			local skippedRes = runIsolated(function()
+				sert.model.skip("skipped model", spec)
+				sert.model.roblox("roblox model", spec, { runs = 2, length = 3 })
+				sert.model.server("server model", spec, { runs = 2, length = 3 })
+				sert.model.client("client model", spec, { runs = 2, length = 3 })
+				sert.model("run model", spec, { runs = 2, length = 3 })
+				sert.model.prop("compat prop model", spec, { runs = 2, length = 3 })
+			end)
+			sert.eq(skippedRes.passed, 2)
+			sert.eq(skippedRes.failed, 0)
+			sert.eq(skippedRes.skippedByReason.explicit, 1)
+			if not sert.isRoblox then sert.eq(skippedRes.skippedRoblox, 3) end
+
+			local focusedRes = runIsolated(function()
+				sert.model.focus("only this model", spec, { runs = 2, length = 3 })
+				sert.test("skipped unfocused test", function() error("must not run", 0) end)
+			end)
+			sert.eq(focusedRes.passed, 1)
+			sert.eq(focusedRes.failed, 0)
+		end
+	)
 end)

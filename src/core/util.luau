@@ -53,9 +53,6 @@ end
 --- Returns the Roblox or headless engine datatype name for `value`.
 function util.typeof(value: any): string return util.doubleTag(value) or nativeTypeof(value) end
 
---- Returns `"userdata"` for headless engine datatype/Instance doubles and `type(value)` otherwise.
-function util.type(value: any): string return if util.doubleTag(value) ~= nil then "userdata" else nativeType(value) end
-
 --- Returns `true` when `chunk` (`debug.info(level, "s")`) belongs to `sert` or is `[C]`.
 function util.internal(chunk: string): boolean
 	if chunk == "[C]" or chunk == SELF_SOURCE then return true end
@@ -68,6 +65,69 @@ function util.internal(chunk: string): boolean
 	if string.sub(clean, 1, #ROOT) ~= ROOT then return false end
 	local sep = string.sub(clean, #ROOT + 1, #ROOT + 1)
 	return sep == "/" or sep == "\\" or sep == "."
+end
+
+local STAGE_PREFIXES = {
+	"./.sert/stage/lexical/",
+	"./.sert/stage/files/",
+	"./.sert/stage/specs/",
+	"./.sert/fuzz/overlay/",
+	".sert/stage/lexical/",
+	".sert/stage/files/",
+	".sert/stage/specs/",
+	".sert/fuzz/overlay/",
+	"./stage/lexical/",
+	"./stage/files/",
+	"./stage/specs/",
+	"stage/lexical/",
+	"stage/files/",
+	"stage/specs/",
+}
+
+--- Strips `.sert` staging directory prefixes from error paths and stack frames.
+function util.stripStagePrefix(text: string): string
+	if nativeType(text) ~= "string" or text == "" then return text end
+	local out = text
+	for _, prefix in STAGE_PREFIXES do
+		while true do
+			local startPos, endPos = string.find(out, prefix, 1, true)
+			if startPos == nil or endPos == nil then break end
+			out = string.sub(out, 1, startPos - 1) .. string.sub(out, endPos + 1)
+		end
+	end
+	return out
+end
+
+--- Filters `debug.traceback(...)` output to user frames, stripping internal `sert` and staging prefixes.
+function util.cleanTraceback(raw: string, primaryLocation: string?): string
+	if nativeType(raw) ~= "string" or raw == "" then return "" end
+	local frames: { string } = {}
+	for line in string.gmatch(raw, "[^\r\n]+") do
+		local trimmed = string.match(line, "^%s*(.-)%s*$") or ""
+		if trimmed ~= "" and trimmed ~= "stack traceback:" then
+			local chunk, lineAndRest = string.match(trimmed, "^(.-):(%d+.*)$")
+			if
+				chunk ~= nil
+				and chunk ~= "[C]"
+				and not util.internal(chunk)
+				and string.match(chunk, "%.sert[/\\]run%.luau?$") == nil
+			then
+				local cleanChunk = util.stripStagePrefix(chunk)
+				table.insert(frames, `{cleanChunk}:{lineAndRest}`)
+				if #frames >= 12 then break end
+			end
+		end
+	end
+	if #frames == 0 then return "" end
+	if #frames == 1 and primaryLocation ~= nil then
+		local cleanPrimary = util.stripStagePrefix(primaryLocation)
+		local only = frames[1]
+		if only == cleanPrimary or string.sub(only, 1, #cleanPrimary + 1) == cleanPrimary .. " " then return "" end
+	end
+	for i, frame in frames do
+		frames[i] = `      {frame}`
+	end
+	return table.concat(frames, "\n")
 end
 
 --- Returns the `error` stack level of the nearest caller outside `sert` (or `2` if none).

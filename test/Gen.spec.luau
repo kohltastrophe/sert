@@ -2,6 +2,7 @@
 local corpus = require("../src/prop/corpus")
 local format = require("../src/core/format")
 local propCore = require("../src/prop")
+local propInternal = require("../src/prop/internal")
 local registry = require("../src/core/registry")
 local sert = require("../src")
 
@@ -84,7 +85,7 @@ sert.describe("sert.prop registration, assumptions, and seed replay", function()
 
 		local vacuousRes = sert.prop.run("explicitly vacuous", function(g)
 			local _ = g:int(1, 5)
-			propCore.vacuous(g, "no transitions enabled")
+			propInternal.vacuous(g, "no transitions enabled")
 		end, { runs = 10, seed = 3 })
 		sert.eq(vacuousRes.ok, false)
 		sert.contains(vacuousRes.message :: string, "no transitions enabled in all 10 cases")
@@ -201,13 +202,13 @@ sert.describe("shrinker O(log N) convergence and float/int boundary invariants",
 		sert.eq(lastNegShrink, -1)
 
 		local specialFloatGen = gen.float(-100, 100, { nan = true, inf = true, negZero = true })
-		local widthZero = #propCore.tape((function()
-			local g = propCore.gen(1, 40, { 0, 0, 0 })
+		local widthZero = #propInternal.tape((function()
+			local g = propInternal.gen(1, 40, { 0, 0, 0 })
 			g:draw(specialFloatGen)
 			return g
 		end)())
-		local widthNan = #propCore.tape((function()
-			local g = propCore.gen(1, 40, { 4, 0, 0 })
+		local widthNan = #propInternal.tape((function()
+			local g = propInternal.gen(1, 40, { 4, 0, 0 })
 			g:draw(specialFloatGen)
 			return g
 		end)())
@@ -370,9 +371,17 @@ sert.describe("sert.gen combinators and datatype/adversarial generators", functi
 
 		sert.eq(res.ok, true)
 		sert.throws(function()
-			local g = propCore.gen(1, 10)
+			local g = propInternal.gen(1, 10)
 			g:draw(gen.bool :: any)
 		end, "gen.bool()")
+		sert.throws(function()
+			local g = propInternal.gen(1, 10)
+			g:draw(gen.filter(gen.constant(1), function() return false end, 5))
+		end, "predicate not satisfied")
+		sert.throws(function()
+			local g = propInternal.gen(1, 10)
+			g:draw(gen.uniqueList(gen.constant(1), 2, 2))
+		end, "unique elements")
 	end)
 end)
 
@@ -399,7 +408,14 @@ sert.describe("corpus codec, target/classify/cover, v1 regressions, markers, and
 		sert.eq(nz, 0)
 		sert.eq(nt, { 9 })
 
-		for _, bad in { "", "v2:1:2:", "v1:abc:10:00000000", "v1:1:-1:", "v1:1:10:123", "v1:1:10:zzzzzzzz" } do
+		local v2Tok = corpus.encode(9007199254740991, 2, { 4294967296, 5 })
+		sert.eq(v2Tok, "v2:9007199254740991:2:0000010000000000000000000005")
+		local v2s, v2z, v2t = corpus.decode(v2Tok)
+		sert.eq(v2s, 9007199254740991)
+		sert.eq(v2z, 2)
+		sert.eq(v2t, { 4294967296, 5 })
+
+		for _, bad in { "", "v99:1:2:", "v1:abc:10:00000000", "v1:1:-1:", "v1:1:10:123", "v1:1:10:zzzzzzzz" } do
 			local rs, rz, rt = corpus.decode(bad)
 			sert.eq(rs, nil)
 			sert.eq(rz, nil)
@@ -411,11 +427,15 @@ sert.describe("corpus codec, target/classify/cover, v1 regressions, markers, and
 		sert.eq(corpus.parseReplay(99), { kind = "seed", seed = 99 })
 		sert.eq(corpus.parseReplay("99"), { kind = "seed", seed = 99 })
 		sert.eq(corpus.parseReplay(tok), { kind = "tape", seed = 0, size = 12, tape = entries })
+		sert.eq(
+			corpus.parseReplay(v2Tok),
+			{ kind = "tape", seed = 9007199254740991, size = 2, tape = { 4294967296, 5 } }
+		)
 
 		sert.throws(function() corpus.encode(1.5, 10, {}) end, "finite integer")
 		sert.throws(function() corpus.encode(1, -1, {}) end, "non-negative integer")
-		sert.throws(function() corpus.encode(1, 10, { -1 }) end, "u32")
-		sert.throws(function() corpus.encode(1, 10, { 2 ^ 32 }) end, "u32")
+		sert.throws(function() corpus.encode(1, 10, { -1 }) end, "u53")
+		sert.throws(function() corpus.encode(1, 10, { 2 ^ 53 }) end, "u53")
 	end)
 
 	sert.test("emits [sert-x:regression], includes replay = token, and replays v1 regressions", function()
@@ -551,22 +571,22 @@ sert.describe("corpus codec, target/classify/cover, v1 regressions, markers, and
 		sert.contains(failRes.report :: string, "small:")
 
 		sert.throws(function()
-			local g = propCore.gen(1, 10)
+			local g = propInternal.gen(1, 10)
 			g:classify(true, "")
 		end, "non-empty string")
 	end)
 
 	sert.test("g:cover validates bounds, uses 99% Wilson score check, and skips single --replay trial", function()
 		sert.throws(function()
-			local g = propCore.gen(1, 10)
+			local g = propInternal.gen(1, 10)
 			g:cover(-1, true, "bad")
 		end, "[0, 100]")
 		sert.throws(function()
-			local g = propCore.gen(1, 10)
+			local g = propInternal.gen(1, 10)
 			g:cover(101, true, "bad")
 		end, "[0, 100]")
 		sert.throws(function()
-			local g = propCore.gen(1, 10)
+			local g = propInternal.gen(1, 10)
 			g:cover(10, true, "")
 		end, "non-empty string")
 
@@ -697,4 +717,70 @@ sert.describe("corpus codec, target/classify/cover, v1 regressions, markers, and
 		sert.eq(res.passed, 1)
 		sert.eq(res.failed, 0)
 	end)
+
+	sert.test("corpus encodes/decodes 53-bit U53 tapes via v2 tokens while preserving v1 for u32", function()
+		local u32Tok = corpus.encode(42, 16, { 0, 123, 0xFFFFFFFF })
+		sert.eq(string.sub(u32Tok, 1, 3), "v1:")
+		local s1, sz1, t1 = corpus.decode(u32Tok)
+		sert.eq(s1, 42)
+		sert.eq(sz1, 16)
+		sert.eq(t1, { 0, 123, 0xFFFFFFFF })
+
+		local u53Tape = { 0, 0xFFFFFFFF, 0x100000000, 9007199254740991 }
+		local u53Tok = corpus.encode(-9, 32, u53Tape)
+		sert.eq(string.sub(u53Tok, 1, 3), "v2:")
+		local s2, sz2, t2 = corpus.decode(u53Tok)
+		sert.eq(s2, -9)
+		sert.eq(sz2, 32)
+		sert.eq(t2, u53Tape)
+		local parsed = corpus.parseReplay(u53Tok)
+		sert.ok(parsed ~= nil and parsed.kind == "tape")
+		if parsed ~= nil and parsed.kind == "tape" then sert.eq(parsed.tape, u53Tape) end
+	end)
+
+	sert.test(
+		"auto-records drawn values on failure when g:note is omitted and shrinks boundaryFloat specials cleanly",
+		function()
+			local autoRes: any
+			sert.capture(function()
+				autoRes = sert.prop.run("auto draw note", function(g: sert.Gen)
+					local x = g:draw(gen.int(5, 20))
+					local tag = g:draw(gen.pick({ "red", "blue" }))
+					sert.fail(`boom {tag}`)
+					local _ = x
+				end, { runs = 5, seed = 42 })
+			end)
+			sert.eq(autoRes.ok, false)
+			sert.contains(autoRes.report :: string, "draw #1 (draw): 5")
+			sert.contains(autoRes.report :: string, 'draw #2 (draw): "red"')
+
+			local manualRes: any
+			sert.capture(function()
+				manualRes = sert.prop.run("manual note priority", function(g: sert.Gen)
+					local x = g:int(5, 20)
+					g:note("explicit=%d", x)
+					sert.fail("boom manual")
+				end, { runs = 5, seed = 42 })
+			end)
+			sert.eq(manualRes.ok, false)
+			sert.contains(manualRes.report :: string, "explicit=5")
+			sert.eq(string.find(manualRes.report :: string, "draw #1", 1, true), nil)
+
+			-- Verify boundaryFloat emits shrink hints toward finite 0.0 starting from NaN/inf tape
+			local seenHint = false
+			local gHint = propInternal.gen(1, 40, { 1, 0, 0 })
+			local val = gHint:draw(gen.boundaryFloat(-10, 10))
+			sert.ok(val ~= val or math.abs(val) == math.huge or val == 0)
+			local shrunkRes: any
+			sert.capture(function()
+				shrunkRes = sert.prop.run("boundaryFloat zero shrink", function(g: sert.Gen)
+					local v = g:draw(gen.boundaryFloat(-50, 50))
+					if v == 0 then seenHint = true end
+					sert.fail("fail all floats")
+				end, { regressions = { corpus.encode(1, 40, { 1, 0, 0 }) }, runs = 1 })
+			end)
+			sert.eq(shrunkRes.ok, false)
+			sert.ok(seenHint, "expected NaN boundaryFloat seed to shrink down to finite 0.0")
+		end
+	)
 end)

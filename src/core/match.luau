@@ -44,58 +44,62 @@ local function makeMatcher(
 	return (m :: any) :: Matcher
 end
 
-local function components(value: any): (string, { number }?)
-	local kind = util.typeof(value)
-	local v: any = value
-	if kind == "number" then
-		return kind, { v }
-	elseif kind == "vector" then
-		return kind, { v.x, v.y, v.z }
-	elseif kind == "Vector2" or kind == "Vector2int16" then
-		return kind, { v.X, v.Y }
-	elseif kind == "Vector3" or kind == "Vector3int16" then
-		return kind, { v.X, v.Y, v.Z }
-	elseif kind == "Color3" then
-		return kind, { v.R, v.G, v.B }
-	elseif kind == "UDim" then
-		return kind, { v.Scale, v.Offset }
-	elseif kind == "UDim2" then
-		return kind, { v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset }
-	elseif kind == "CFrame" then
-		return kind, { v:GetComponents() }
-	elseif kind == "Rect" then
-		return kind, { v.Min.X, v.Min.Y, v.Max.X, v.Max.Y }
-	elseif kind == "NumberRange" then
-		return kind, { v.Min, v.Max }
-	end
-	return kind, nil
+local function nearComponents(value: any): (string, { { any } }?)
+	if util.typeof(value) == "number" then return "number", { { "", value } } end
+	return format.datatypeComponents(value)
 end
 
 --- Formats numeric or Roblox datatype components for near/within failure messages.
 function match.describeNear(value: any): string
-	local kind, parts = components(value)
+	local kind, parts = nearComponents(value)
 	if kind == "number" or parts == nil then return if kind == "number" then tostring(value) else repr(value) end
 	local shown = table.create(#parts)
 	for index, part in parts do
-		shown[index] = tostring(part)
+		shown[index] = tostring(part[2])
 	end
 	return `{kind}({table.concat(shown, ", ")})`
 end
 
---- Checks component-wise numeric/datatype proximity within `eps`, returning `(pass, usageError)`.
-function match.nearCheck(value: any, expected: any, eps: number): (boolean, string?)
+--- Checks component-wise numeric/datatype proximity within `eps`, returning `(pass, usageError, detail)`.
+function match.nearCheck(value: any, expected: any, eps: number): (boolean, string?, string?)
 	if type(eps) ~= "number" or eps ~= eps or eps < 0 then
-		return false, `tolerance must be a non-negative number, got {repr(eps)}`
+		return false, `tolerance must be a non-negative number, got {repr(eps)}`, nil
 	end
-	local expectedKind, want = components(expected)
-	if want == nil then return false, `expected a number or numeric Roblox datatype, got {expectedKind}` end
-	local kind, got = components(value)
-	if kind ~= expectedKind or got == nil or #got ~= #want then return false, nil end
-	for index, part in want do
+	local expectedKind, want = nearComponents(expected)
+	if want == nil then return false, `expected a number or numeric Roblox datatype, got {expectedKind}`, nil end
+	local kind, got = nearComponents(value)
+	if kind ~= expectedKind or got == nil or #got ~= #want then
+		return false, nil, `type mismatch: expected {expectedKind}, got {kind}`
+	end
+	if #want == 1 then
+		local gotVal, wantVal = got[1][2] :: number, want[1][2] :: number
+		local delta = math.abs(gotVal - wantVal)
+		if not (delta <= eps) then
+			if gotVal ~= gotVal or wantVal ~= wantVal then return false, nil, "non-finite component (nan)" end
+			return false, nil, `|actual - expected| = {format.snapNum(delta)} > {format.snapNum(eps)}`
+		end
+		return true, nil, nil
+	end
+	local mismatches: { string } = {}
+	for index, pair in want do
+		local delta = math.abs((got[index][2] :: number) - (pair[2] :: number))
 		-- `not (... <= eps)` rejects NaN components cleanly.
-		if not (math.abs(got[index] - part) <= eps) then return false, nil end
+		if not (delta <= eps) then
+			if #mismatches < 4 then
+				local cname = pair[1] :: string
+				if delta ~= delta then
+					table.insert(mismatches, `{cname}: nan`)
+				else
+					table.insert(mismatches, `{cname}: |Δ|={format.snapNum(delta)} > {format.snapNum(eps)}`)
+				end
+			elseif #mismatches == 4 then
+				table.insert(mismatches, "…")
+				break
+			end
+		end
 	end
-	return true, nil
+	if #mismatches > 0 then return false, nil, table.concat(mismatches, ", ") end
+	return true, nil, nil
 end
 
 local function isKind(actual: any, kind: string): boolean
@@ -115,7 +119,7 @@ function match.any(kindOrPred: (string | ((value: any) -> boolean))?): Matcher
 	if kindOrPred == nil then
 		return makeMatcher("any", "any()", function(actual: any, path: { any }): (boolean, { any }?, string?)
 			if actual ~= nil then return true, nil, nil end
-			return false, table.clone(path), nil
+			return false, table.clone(path), "expected non-nil value"
 		end)
 	elseif type(kindOrPred) == "string" then
 		local wanted = kindOrPred
@@ -153,9 +157,9 @@ function match.within(expected: any, eps: number?): Matcher
 	end
 	local desc = `within({match.describeNear(expected)}, {tol})`
 	return makeMatcher("within", desc, function(actual: any, path: { any }): (boolean, { any }?, string?)
-		local pass = match.nearCheck(actual, expected, tol)
+		local pass, _, detail = match.nearCheck(actual, expected, tol)
 		if pass then return true, nil, nil end
-		return false, table.clone(path), nil
+		return false, table.clone(path), detail
 	end)
 end
 
@@ -172,7 +176,10 @@ function match.matching(pattern: string): Matcher
 		"matching",
 		string.format("matching(%q)", pattern),
 		function(actual: any, path: { any }): (boolean, { any }?, string?)
-			if type(actual) == "string" and string.find(actual, pattern) ~= nil then return true, nil, nil end
+			if type(actual) ~= "string" then
+				return false, table.clone(path), `expected string, got {util.typeof(actual)}`
+			end
+			if string.find(actual, pattern) ~= nil then return true, nil, nil end
 			return false, table.clone(path), nil
 		end
 	)
@@ -191,30 +198,7 @@ function match.exact(expected: any): Matcher
 	)
 end
 
-local KEY_RANK: { [string]: number } = { number = 1, string = 2 }
-
-local function safeKeyOrder(a: any, b: any): boolean
-	local ra, rb = KEY_RANK[type(a)] or 3, KEY_RANK[type(b)] or 3
-	if ra ~= rb then return ra < rb end
-	if ra == 1 then
-		if a ~= a or b ~= b then return a == a and b ~= b end
-		return a < b
-	elseif ra == 2 then
-		return a < b
-	end
-	local okA, sa = pcall(tostring, a)
-	local okB, sb = pcall(tostring, b)
-	return `{type(a)}:{if okA then sa else ""}` < `{type(b)}:{if okB then sb else ""}`
-end
-
-local function orderedKeys(tbl: { [any]: any }): { any }
-	local out = {}
-	for k in next, tbl do
-		table.insert(out, k)
-	end
-	table.sort(out, safeKeyOrder)
-	return out
-end
+local orderedKeys = format.sortedKeys
 
 local function readTargetProperty(target: any, key: any): (boolean, any, string?)
 	local kind = type(target)
@@ -312,7 +296,7 @@ function matchNode(
 	for _, key in orderedKeys(actual) do
 		if not present[key] then table.insert(keys, key) end
 	end
-	table.sort(keys, safeKeyOrder)
+	table.sort(keys, format.keyBefore)
 	for _, key in keys do
 		table.insert(path, key)
 		local ok, subPath, reason = matchNode(rawget(actual, key), rawget(expected, key), path, seen, false)
@@ -355,6 +339,8 @@ local function formatPath(root: string, path: { any }): string
 	return table.concat(parts)
 end
 
+local EXPLAIN_UNREADABLE = table.freeze({})
+
 --- Returns `nil` when `match.equal(actual, expected)` holds, or a human-readable path + mismatch explanation (`$.items[2].pos: ...`).
 function match.explain(actual: any, expected: any, path: string?): string?
 	local ok, subPath, reason = matchNode(actual, expected, {}, {}, false)
@@ -362,6 +348,7 @@ function match.explain(actual: any, expected: any, path: string?): string?
 	local root = path or "$"
 	local failPath: { any } = subPath or {}
 	local here, there = actual, expected
+	local hereBroken = false
 	for _, key in failPath do
 		if match.isMatcher(there) then
 			local partial = rawget(there :: any, "_partial")
@@ -373,11 +360,19 @@ function match.explain(actual: any, expected: any, path: string?): string?
 		elseif type(there) == "table" then
 			there = rawget(there, key)
 		end
-		local readable, nextHere = readTargetProperty(here, key)
-		if readable then here = nextHere end
+		if not hereBroken then
+			local readable, nextHere = readTargetProperty(here, key)
+			if readable then
+				here = nextHere
+			else
+				here = EXPLAIN_UNREADABLE
+				hereBroken = true
+			end
+		end
 	end
 	local note = if reason ~= nil and reason ~= "" then ` ({reason})` else ""
-	return `{formatPath(root, failPath)}: expected {repr(there)}, got {repr(here)}{note}`
+	local hereText = if here == EXPLAIN_UNREADABLE then "<unreadable>" else repr(here)
+	return `{formatPath(root, failPath)}: expected {repr(there)}, got {hereText}{note}`
 end
 
 return table.freeze(match)
