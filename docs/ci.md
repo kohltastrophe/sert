@@ -111,9 +111,9 @@ When `CI=1` or `CI=true` (set automatically by GitHub Actions), any `.focus` tes
 
 `sert check` runs `sert lint` and `sert run --coverage` concurrently and enforces `[coverage].min`. Pass `sert check --diff origin/main --audit --strict` (or `sert check --changed origin/main --strict`) on pull requests to apply the coverage floor to added and modified lines while catching zero-assertion tests, tautologies, vacuous properties, unfuzzed `.OnServerEvent` / `.OnServerInvoke` handlers, and uncovered public exports.
 
-`sert run` and `sert studio` load `test/.sert-regressions.toml` automatically in CI so shrunk `v1:...` counterexamples from `sert fuzz` stay locked in the suite. `sert mutate` enforces `[mutate].min` (or `--min N`) with zero-config line-to-spec routing and `--diff origin/main` on pull requests, while `sert bench --compare main` enforces median timing and allocation budgets (`--fail-regression PCT`, default `20`).
+`sert run` and `sert studio` load `test/.sert-regressions.toml` automatically in CI so shrunk `v1:...` and `v2:...` counterexamples from `sert fuzz` stay locked in the suite. `sert mutate` enforces `[mutate].min` (or `--min N`) with zero-config line-to-spec routing and `--diff origin/main` on pull requests, while `sert bench --compare main` enforces median timing and allocation budgets (`--fail-regression PCT`, default `20`).
 
-When `GITHUB_ACTIONS=true`, `sert lint`, `sert run`, and `sert cloud` emit `::error` and `::warning` annotations directly on PR diffs, while `sert coverage` and `sert mutate` append Markdown tables to `$GITHUB_STEP_SUMMARY`. Pass `--junit sert-junit.xml` to `sert run` for test reporters and `--badge coverage.json` to `sert coverage` to write a Shields.io endpoint JSON payload.
+When `GITHUB_ACTIONS=true`, human-mode runs of `sert lint`, `sert run`, `sert studio`, `sert cloud`, `sert audit`, failing `sert coverage`, and `sert mutate` emit `::error` and `::warning` annotations directly on PR diffs (never polluting `--format json` or `--agent` stdout), while `sert coverage` and `sert mutate` append Markdown tables to `$GITHUB_STEP_SUMMARY`. Pass `--junit sert-junit.xml` to `sert run`, `sert studio`, or `sert cloud` for test reporters and `--badge coverage.json` to `sert coverage` to write a Shields.io endpoint JSON payload.
 
 ## Open Cloud in CI (`sert cloud`)
 

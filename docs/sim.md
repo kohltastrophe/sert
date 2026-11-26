@@ -118,13 +118,14 @@ Configure `world = { faults = ... }` with a named profile (`"none"`, `"light"`, 
 
 ### Network faults on real `Instance` remotes
 
-`server:env()` and `client:env()` bridge real DataModel instances across peers:
+`server:env()` and `client:env()` bridge real DataModel instances across peers under the configured `signalBehavior` (`"Deferred"` by default, or `"Immediate"`):
 
-- Server `ReplicatedStorage`, `Workspace`, `Players`, attributes, and `CollectionService` tags replicate to connected clients.
-- Firing a real `RemoteEvent`, `UnreliableRemoteEvent`, or `RemoteFunction` routes payloads through `sert`'s boundary serializer and fault fabric:
-  - `remoteDropRate` drops packets (`UnreliableRemoteEvent` also drops payloads exceeding 1,000 bytes and applies higher loss under contention).
+- Server `ReplicatedStorage`, `Workspace`, `Players`, attributes, and `CollectionService` tags replicate to connected clients, and remote channels are keyed by `(ClassName, fullPath)` so identically named remotes in different folders remain isolated.
+- Firing a `RemoteEvent`, `UnreliableRemoteEvent`, or `RemoteFunction` routes payloads through Roblox wire sanitization and the fault fabric:
+  - `remoteDropRate` drops packets (`UnreliableRemoteEvent` drops payloads exceeding `900` bytes including true `buffer.len` size, and applies higher loss under contention).
   - `remoteReorderRate` and `remoteLatencyRange` jitter delivery timestamps so packets arrive out of order.
   - `remoteDuplicateRate` delivers duplicate packets to test handler idempotency.
+  - `RemoteFunction:InvokeServer` / `InvokeClient` yields while `OnServerInvoke` / `OnClientInvoke` is unset and rejects cleanly on peer disconnect instead of deadlocking.
 
 ### Cloud storage and messaging faults
 
@@ -156,7 +157,7 @@ Use `world:partition(server, seconds)`, `world:isolate(server)`, and `world:heal
 
 ## Bounded scheduler exploration (`sert.sim.explore`)
 
-`sert.sim.explore` branches across nondeterministic task interleavings in a `SimWorld` under `maxChoices`, `maxRuns`, and `maxBranch` bounds. By default (`stateHash` omitted or `false`), it performs exact bounded prefix exploration without skipping interleavings. Pass `stateHash = "backing"` to prune revisited states using the built-in hash of backing `DataStore`, `OrderedDataStore`, `MemoryStore`, `MessagingService`, in-flight remote packets, peer states, and `scheduler:stateDigest()`, or pass a custom `stateHash = function(world) ... end` (automatically salted with `world.scheduler:stateDigest()`). Truncated subtrees are never cached as explored. The returned `ExploreOutcome` reports `{ runs, pruned, truncated, limit?, failure? }`.
+`sert.sim.explore` branches across nondeterministic task interleavings in a `SimWorld` under `maxChoices`, `maxRuns`, and `maxBranch` bounds. By default (`stateHash` omitted or `false`), it performs exact bounded prefix exploration without skipping interleavings. Pass `stateHash = "backing"` to prune revisited states using the built-in hash of backing `DataStore`, `OrderedDataStore`, `MemoryStore`, `MessagingService`, receipts, partitions, kicks, remote errors, actions, HTTP requests, server DataModels, in-flight remote packets, peer states, and `scheduler:stateDigest()`, or pass a custom `stateHash = function(world) ... end` (automatically salted with `world.scheduler:stateDigest()`). Truncated subtrees are never cached as explored. The returned `ExploreOutcome` reports `{ runs, pruned, truncated, limit?, failure? }`.
 
 ---
 

@@ -1,3 +1,7 @@
+<div align="right">
+<a href="https://discord.gg/kohl"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/kohltastrophe/kohltastrophe/main/.github/img/link-discord-dark.svg"><img alt="Discord" src="https://raw.githubusercontent.com/kohltastrophe/kohltastrophe/main/.github/img/link-discord.svg"></picture></a>
+</div>
+
 # sert
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kohltastrophe/sert/ci.yml?style=for-the-badge)](https://github.com/kohltastrophe/sert/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kohltastrophe/sert/badges/coverage.json&style=for-the-badge)](https://github.com/kohltastrophe/sert/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/kohltastrophe/sert?style=for-the-badge)](LICENSE.txt) [![GitHub Release](https://img.shields.io/github/v/release/kohltastrophe/sert?style=for-the-badge)](https://github.com/kohltastrophe/sert/releases)
@@ -27,7 +31,9 @@ end)
 
 ## Quickstart
 
-`sert` requires Python 3.11 or newer and [Rokit](https://github.com/rojo-rbx/rokit) to manage `luau`, `rojo`, `selene`, `StyLua`, and `luau-lsp`.
+`sert` supports two workflows depending on whether you want the full CLI suite (`run`, `lint`, `coverage`, `mutate`, `fuzz`, `studio`, `cloud`) or only the Luau testing package.
+
+### Full CLI toolchain (Python 3.11+ and Rokit)
 
 ```sh
 curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.2.1/tools/sert.py
@@ -45,7 +51,23 @@ rokit install
 python tools/sert.py run
 ```
 
-`init --fetch` writes `sert.toml`, `rokit.toml` (pinning `luau = "luau-lang/luau@0.724"` alongside your lint and build tools), `tools/sert.py`, `.luaurc`, `.gitignore`, `sert.lock`, and `test/example.spec.luau`. Commit `tools/sert.py` and `sert.lock` to your repository so every machine and CI job verifies the exact SHA-256 digests of the `sert` CLI archive, Luau package, and `globalTypes.d.luau`.
+`init --fetch` writes `sert.toml`, `rokit.toml` (pinning `luau = "luau-lang/luau@0.724"` alongside `rojo`, `selene`, `StyLua`, and `luau-lsp`), `tools/sert.py`, `.luaurc`, `.gitignore`, `sert.lock`, and `test/example.spec.luau`. Commit `tools/sert.py` and `sert.lock` so every machine and CI job verifies the exact SHA-256 digests of the `sert` CLI archive, Luau package, and `globalTypes.d.luau`.
+
+### Luau-only install (Wally or Pesde, zero Python)
+
+Add `sert` directly in `wally.toml` or `pesde.toml` if you run tests through standalone `lute`/`lune`, existing Rojo places, or `sert.roblox.Runner` in Studio:
+
+```toml
+# wally.toml ([dependencies] or [dev-dependencies])
+Sert = "kohltastrophe/sert@0.2.1"
+```
+
+```toml
+# pesde.toml ([dependencies] or [dev_dependencies])
+sert = { name = "kohltastrophe/sert", version = "^0.2.1" }
+```
+
+To share headless Roblox datatype globals (`Vector3`, `CFrame`, `Color3`, `UDim2`, `Enum`) without reaching into internal modules, call `sert.env.installGlobals()` from your test setup file.
 
 ## Writing specs
 
@@ -162,6 +184,8 @@ end)
 ```
 
 ```sh
+python3 tools/sert.py run --watch
+python3 tools/sert.py run --shuffle --retry 2
 python3 tools/sert.py studio --device Phone
 python3 tools/sert.py studio --clients 2
 python3 tools/sert.py studio --warm --affected
@@ -174,11 +198,13 @@ python3 tools/sert.py check --changed --agent
 | --- | --- |
 | [docs/agents.md](docs/agents.md) | AI-agent workflow (`sert check --changed`, `sert audit`, `sert init --skill`, `--agent` / `--format json`, `--affected`, `sert fuzz`, zero-config `sert mutate`, snapshots, and anti-reward-hacking rules). |
 | [docs/api.md](docs/api.md) | Registration, targets, assertions, inline and `.snap` snapshots, allocation budgets and `sert.bench`, spies, `sert.prop`, `sert.gen`, `sert.laws`, `sert.model`, `sert.bytes`, output capture, and `sert.run`. |
-| [docs/env.md](docs/env.md) | `sert.env.new()`, strict and deferred defaults, `[test].stage` and `@game`, 3D spatial casts, `InputAction`, `SharedTable`, Audio nodes, UI layout, and `env:input()`. |
-| [docs/sim.md](docs/sim.md) | Multi-peer `sert.sim`, unified `Spec<State, Sut>`, VOPR fault injection, `{ replay = "v1:..." }` reproduction, bounded `explore` (`stateHash`), and linearizability checks (`sert.sim.linearizable`). |
+| [docs/env.md](docs/env.md) | `sert.env.new()`, `sert.env.installGlobals()`, strict and deferred defaults, `[test].stage` and `@game`, 3D spatial casts, `InputAction`, `SharedTable`, Audio nodes, UI layout, and `env:input()`. |
+| [docs/sim.md](docs/sim.md) | Multi-peer `sert.sim`, unified `Spec<State, Sut>`, VOPR fault injection, replay tokens, bounded `explore` (`stateHash`), and linearizability checks (`sert.sim.linearizable`). |
 | [docs/roblox.md](docs/roblox.md) | Zero-boilerplate `sert studio` and `sert cloud`, target tags, `--device`, `--clients`, `--warm`, `sert.roblox.conformance`, `Layout`, `Flicker`, `fuzzRemote`, and `sweep`. |
 | [docs/cli.md](docs/cli.md) | All CLI commands (`check`, `run`, `fuzz`, `audit`, `bench`, `coverage`, `mutate`, `studio`, `cloud`, `lint`, `init`, `fetch`), `sert.toml`, and `sert.lock`. |
 | [docs/ci.md](docs/ci.md) | GitHub Actions setup (`kohltastrophe/sert/actions/setup@v0.2.1`), lockfile caching, coverage, audit, benchmark and mutation gates, and Open Cloud secrets. |
+| [docs/migration.md](docs/migration.md) | Side-by-side migration recipes from Jest-Lua, TestEZ, and frktest. |
+| [docs/compatibility.md](docs/compatibility.md) | Runtime matrix (`luau`, `lute`, `lune`, Studio, Open Cloud), `sert.env` fidelity vs stubs, platform notes, and TIA boundaries. |
 
 ## CI
 

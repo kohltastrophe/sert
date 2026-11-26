@@ -39,7 +39,7 @@ When a `"roblox"`, `"server"`, or `"client"` test is loaded under standalone `se
 
 ### Modifiers and parameterized tables
 
-Every registration entry (`sert.test`, `sert.describe`, `sert.prop`, and their `.roblox`, `.server`, `.client` namespaces) supports `.skip` and `.focus`. `sert.test` and `sert.describe` (including target namespaces) also provide `.each` and `.eachTuple`:
+Every registration entry (`sert.test`, `sert.describe`, `sert.prop`, and their `.roblox`, `.server`, `.client` namespaces) supports `.skip` and `.focus`. `sert.test` and `sert.describe` (including target namespaces `.roblox`, `.server`, `.client`, and `.skip`) also provide `.each` and `.eachTuple`. Passing a keyed dictionary instead of an array raises an explicit error so test tables never silently register zero cases.
 
 | Modifier | Behavior |
 | --- | --- |
@@ -86,14 +86,14 @@ sert.setup(hooks: { beforeAll?: () -> (), afterAll?: () -> (), beforeEach?: () -
 
 ## Procedural assertions
 
-All assertions report the caller's stack frame and (unless noted) return their first argument so you can inline them in expressions (`local user = sert.ok(findUser(id))`).
+All assertions report cleaned repo stack frames (stripping internal `sert` and `.sert/stage/` prefixes), capture yielded timeout traces, and return their first argument unless noted (`local user = sert.ok(findUser(id))`). Multi-line string `sert.eq` mismatches print unified line diffs, and `Instance`, `CFrame`, `Color3`, `Vector3`, `Vector2`, `UDim2`, and `vector` diffs format differing properties and component deltas directly.
 
 | Assertion | Description |
 | --- | --- |
 | `sert.ok(val, msg?)` / `sert(val, msg?)` | Asserts `val` is truthy (`val ~= nil and val ~= false`) and returns `val`. |
-| `sert.eq(actual, expected, msg?)` | Deep structural equality with cycle handling, `NaN == NaN`, hex diffs on `buffer`, nested `Matcher` support, and up to `8` leaf path diffs per mismatch. |
-| `sert.ne(actual, unexpected, msg?)` | Asserts `not sert.equals(actual, unexpected)`. |
-| `sert.equals(a, b) -> boolean` | Boolean predicate using the same deep comparison and matcher rules as `sert.eq`. |
+| `sert.eq<T>(actual: T, expected: T \| Matcher, msg?)` | Strict-typed deep structural equality with cycle handling, `NaN == NaN`, hex diffs on `buffer`, multi-line string line diffs, Roblox datatype/Instance diffs, and nested `Matcher` support. |
+| `sert.ne<T>(actual: T, unexpected: T \| Matcher, msg?)` | Strict-typed deep inequality check matching `sert.eq` comparison rules. |
+| `sert.equals(a, b) -> boolean` | *(Deprecated alias)* Boolean deep equality predicate (kept for compatibility; prefer `sert.eq` for assertions). |
 | `sert.lt(a, b, msg?)` / `sert.le(a, b, msg?)` | Asserts `a < b` or `a <= b`. |
 | `sert.gt(a, b, msg?)` / `sert.ge(a, b, msg?)` | Asserts `a > b` or `a >= b`. |
 | `sert.near(actual, expected, eps?, msg?)` | Component-wise tolerance check (default `eps = 1e-6`) across `number`, `vector`, `Vector2`, `Vector3`, `Vector2int16`, `Vector3int16`, `UDim`, `UDim2`, `Color3`, `CFrame`, `Rect`, and `NumberRange`. |
@@ -195,7 +195,7 @@ Table spies read and write via `rawget` / `rawset`, so tables guarded by strict 
 | `spy:returns(...)` / `spy:returnsOnce(...)` | Configures default or FIFO one-shot return values. |
 | `spy:throws(err?)` / `spy:throwsOnce(err?)` | Configures default or FIFO one-shot raised errors. |
 | `spy:reset()` | Clears recorded calls, results, and queued one-shot behaviors. |
-| `spy:restore()` | Restores `tbl[key]` early (also runs automatically at scope exit). |
+| `spy:restore()` | Restores `tbl[key]` early while preserving recorded `calls`, `callCount`, `called`, and `results` (also runs automatically at scope exit). |
 | `sert.called(spy, msg?)` | Asserts `spy.callCount >= 1`. |
 | `sert.calledTimes(spy, n, msg?)` | Asserts `spy.callCount == n`. |
 | `sert.calledWith(spy, ...expected)` | Asserts at least one recorded call matched `...expected` (supports `Matcher` arguments and exact vararg arity). |
@@ -240,7 +240,7 @@ end, {
 | `g:classify(cond, label)` | Tallies label hit percentages across non-vacuous trials and prints distributions on failure (or when verbose). |
 | `g:cover(minPct, cond, label)` | Requires `label` to occur in at least `minPct` (`0–100`) percent of trials, failing when the 99% Wilson upper confidence bound falls below `minPct`. |
 
-`PropOptions` accepts `runs`, `size`, `seed`, `regressions: { number | string }` (integer seeds or `"v1:<seed>:<size>:<hex>"` shrunk tapes), `exhaustive: { size: number }`, `shrinkBudget: { tries?: number, seconds?: number }`, and `timeout`. Use `sert.prop.skip`, `.focus`, `.each`, and `.eachTuple` across `sert.prop` and target namespaces. `sert run` and `sert studio` load saved tokens from `test/.sert-regressions.toml` into `RunOptions.regressions` automatically. Call `sert.prop.run(fn, opts?)` to execute a property inline and get back a `PropResult`.
+`PropOptions` accepts `runs`, `size`, `seed`, `regressions: { number | string }` (integer seeds or `"v1:..."` / `"v2:..."` lossless 53-bit shrunk tapes), `exhaustive: { size: number }`, `shrinkBudget: { tries?: number, seconds?: number }`, `timeout`, `smoke`, and `tags`. Failing properties automatically print the shrunk drawn values captured during counterexample replay alongside any `g:note` annotations. Use `sert.prop.skip`, `.focus`, `.each`, and `.eachTuple` across `sert.prop` and target namespaces. `sert run` and `sert studio` load saved tokens from `test/.sert-regressions.toml` into `RunOptions.regressions` automatically. Call `sert.prop.run(fn, opts?)` to execute a property inline and get back a `PropResult`.
 
 ### Built-in generators (`sert.gen`)
 

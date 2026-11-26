@@ -43,6 +43,9 @@ end)
 | `viewport` | `Vector2.new(1920, 1080)` | Initial `Workspace.CurrentCamera.ViewportSize` for UI layout calculation. |
 | `isServer` / `isClient` / `isStudio` | `true` / `false` / `false` | Configures `RunService:IsServer()`, `:IsClient()`, and `:IsStudio()`. |
 | `placeId` / `jobId` | `0` / `"sert-job"` | Sets `game.PlaceId` and `game.JobId`. |
+| `strictRemotes` | `false` | When `false` (default), remote calls sanitize mixed/sparse tables and drop non-replicated instances like Roblox; set `true` to raise an error on lossy payloads. |
+
+`sert.env.installGlobals()` installs Roblox datatypes (`Vector2`, `Vector3`, `CFrame`, `Color3`, `UDim`, `UDim2`, `Rect`, `NumberRange`, `ColorSequence`, `NumberSequence`, `TweenInfo`, `Font`, `BrickColor`, `Enum`, `typeof`, etc.) onto the active test globals when modules expect globals outside `env:run`.
 
 When a test yields while an `env` is active in `sert run`, `sert`'s runner automatically steps that `env` forward until the coroutine completes or `--test-timeout` expires.
 
@@ -110,19 +113,20 @@ You can also load staged instances directly via `env:require(env.game.Replicated
 ### Core DataModel and datatypes
 
 - **Exact datatype equality:** `Vector2`, `Vector3`, `CFrame`, `Color3`, `UDim`, `UDim2`, and `Rect` compare exact components under `==` (matching Luau's native engine `__eq`). Use `:FuzzyEq` or `sert.near` for floating-point tolerances.
-- **Signals and hierarchy:** `GetPropertyChangedSignal(prop)` and `GetAttributeChangedSignal(attr)` fire with `0` arguments; `Instance:WaitForChild(name, timeOut?)` yields on the virtual clock (emitting an infinite-yield warning at 5 seconds when `timeOut` is omitted); `Instance:Destroy()` disconnects all signals without firing spurious descendant `Changed("Parent")` cascades.
-- **Boundary serialization:** `RemoteEvent` / `RemoteFunction` payloads strip user table metatables, clone buffers and tables, and reject functions, threads, and mixed array/dictionary tables. `DataStore` and `MemoryStore` payloads enforce strict JSON tree cloning (`NaN`, `±math.huge`, invalid UTF-8, and shared DAG reference aliasing are rejected or cloned into independent trees).
+- **Signals and hierarchy:** `GetPropertyChangedSignal(prop)` and `GetAttributeChangedSignal(attr)` fire with `0` arguments and suppress `NaN -> NaN` no-op updates; `Instance:SetAttribute` rejects `Instance` and table values; `Instance:WaitForChild(name, timeOut?)` wakes on `Destroy()`, handles `timeOut = 0`, and emits an infinite-yield warning at 5 seconds when `timeOut` is omitted; `Instance:Destroy()` fires `Destroying` before child teardown without firing spurious descendant `Changed("Parent")` cascades; `Clone()` clears object references pointing to `Archivable = false` descendants.
+- **Boundary serialization:** `RemoteEvent`, `UnreliableRemoteEvent` (capped at `900` bytes including `buffer.len`), and `RemoteFunction` strip user table metatables, clone buffers and tables, and sanitize mixed tables, sparse arrays, and non-replicated instances matching Roblox wire behavior (set `strictRemotes = true` on `EnvOptions` to throw on lossy payloads). `DataStore` and `MemoryStore` payloads enforce strict JSON tree cloning (`NaN`, `±math.huge`, invalid UTF-8, and shared DAG reference aliasing are rejected or cloned into independent trees). `MemoryStoreService` enforces Roblox's `32 KB` item size cap and `expiry > 0`.
 
 ### Built-in services (`game:GetService(name)`)
 
 | Service | Modeled capabilities |
 | --- | --- |
-| `RunService` | Distinct `PreRender`, `PreAnimation`, `PreSimulation`, `PostSimulation`, `Heartbeat`, and `Stepped` signals passing `dt` while advancing `Workspace.DistributedGameTime`, `time()`, and `elapsedTime()`. |
-| `DataStoreService` | `GetDataStore`, `GetOrderedDataStore` (`GetSortedAsync`), `GetAsync`, `SetAsync`, `IncrementAsync`, `RemoveAsync`, `UpdateAsync` (enforces Roblox's no-yield transform rule), `DataStoreKeyInfo` metadata/userIds/versions, and request budgets. |
-| `MemoryStoreService` | `GetHashMap` (including `ListItemsAsync`), `GetSortedMap` (`GetRangeAsync` with `sortKey` lower/upper bounds), and `GetQueue` (`AddAsync`, `ReadAsync` with `waitTimeout` and `invisibilityTimeout` lease expiry, `RemoveAsync`). |
+| `RunService` | Distinct `PreRender`, `PreAnimation`, `PreSimulation`, `Stepped`, `PostSimulation`, and `Heartbeat` phase order passing `dt` while advancing `Workspace.DistributedGameTime`, `time()`, and `elapsedTime()`, with isolated `BindToRenderStep` callbacks. |
+| `DataStoreService` | `GetDataStore` (including `DataStoreOptions.AllScopes`), `GetOrderedDataStore` (`GetSortedAsync`), `GetAsync`, `SetAsync`, `IncrementAsync`, tombstone `RemoveAsync`, `UpdateAsync` (enforces Roblox's no-yield transform rule), `DataStoreKeyInfo` metadata/userIds/versions, and request budgets. |
+| `MemoryStoreService` | `GetHashMap` (including `ListItemsAsync`), `GetSortedMap` (`GetRangeAsync` with `sortKey` lower/upper bounds), and `GetQueue` (`AddAsync`, `ReadAsync` with `waitTimeout` and `invisibilityTimeout` lease expiry, `RemoveAsync`), enforcing `32 KB` values and `expiry > 0`. |
 | `EncodingService` | `Base64Encode`, `Base64Decode`, zstd-framed `CompressBuffer` / `DecompressBuffer`, and `ComputeStringHash` / `ComputeBufferHash`. |
 | `HttpService` | `JSONEncode`, `JSONDecode`, `GenerateGUID`, and `RequestAsync` (mocked via `env:onHttp(handler)`). |
-| `CollectionService` | `AddTag`, `RemoveTag`, `HasTag`, `GetTags`, `GetTagged`, `GetInstanceAddedSignal`, `GetInstanceRemovedSignal`. |
+| `CollectionService` | `AddTag`, `RemoveTag`, `HasTag`, `GetTags`, `GetAllTags`, `GetTagged`, `GetInstanceAddedSignal`, `GetInstanceRemovedSignal`. |
+| `GuiService` & `TextService` | `GuiService:GetGuiInset()` synced with `TopbarInset`, and `TextService:GetTextBoundsAsync()` matching `TextLabel.TextBounds`. |
 | `TweenService` | `Create` and `GetValue` across numeric, vector, color, `CFrame`, `UDim`, and `UDim2` properties on the virtual clock. |
 | `Players` | `PlayerAdded`, `PlayerRemoving`, `GetPlayers`, `GetPlayerByUserId`, `LocalPlayer`, and character helpers. |
 | `MarketplaceService` | `ProcessReceipt`, `PromptProductPurchase`, `PromptGamePassPurchase`, `UserOwnsGamePassAsync`, `GetProductInfo` (configured with `env:setGamePass` and `env:setProductInfo`). |

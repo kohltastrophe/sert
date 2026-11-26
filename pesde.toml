@@ -1,0 +1,21 @@
+name = "kohltastrophe/sert"
+version = "0.2.1"
+description = "Testing, property shrinking, deterministic simulation, and Studio verification for Luau and Roblox."
+authors = ["Kohl <hi@kohl.gg>"]
+repository = "https://github.com/kohltastrophe/sert"
+license = "MIT"
+includes = [
+	"pesde.toml",
+	"README.md",
+	"LICENSE.txt",
+	"default.project.json",
+	"src/**",
+]
+
+[target]
+environment = "roblox"
+lib = "src/init.luau"
+build_files = ["src"]
+
+[indices]
+default = "https://github.com/pesde-pkg/index"

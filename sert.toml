@@ -36,6 +36,11 @@ versions = [
 	{ file = "actions/setup/action.yml", pattern = '^#.*uses: kohltastrophe/sert/actions/setup@v([^\s`")]+)' },
 	{ file = "README.md", pattern = 'sert/v([^\s`")]+)/tools/sert\.py' },
 	{ file = "README.md", pattern = 'actions/setup@v([^\s`")]+)' },
+	{ file = "README.md", pattern = 'kohltastrophe/sert@([^\s`")]+)' },
+	{ file = "README.md", pattern = 'name = "kohltastrophe/sert", version = "\^([^"]+)"' },
 	{ file = "docs/ci.md", pattern = 'actions/setup@v([^\s`")]+)' },
 	{ file = "docs/cli.md", pattern = '`version = "([^"]+)"`' },
+	{ file = "wally.toml", key = "package.version" },
+	{ file = "pesde.toml", key = "version" },
+	{ file = "tools/sert.py", pattern = '^DEFAULT_VERSION = "([^"]+)"$' },
 ]

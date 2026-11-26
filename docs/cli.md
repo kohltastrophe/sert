@@ -5,9 +5,9 @@ Run `sert` through the committed repository wrapper (`python3 tools/sert.py <com
 ### Global flags and exit codes
 
 - `--version` prints `sert <version>`.
-- `--root DIR` overrides the project root (defaults to `$SERT_ROOT`, `git rev-parse --show-toplevel`, or the nearest ancestor containing `sert.toml`).
+- `--root DIR` overrides the project root (defaults to `$SERT_ROOT`, else the nearest ancestor containing `sert.toml`, else `git rev-parse --show-toplevel`).
 
-Set `SERT_AGENT=1` to default compatible subcommands (`check`, `run`, `coverage`, `mutate`, `audit`, `bench`, `fuzz`, `studio`) to compact agent output, or `SERT_COMPACT=1` to suppress passing test lines. Every subcommand returns exit `0` when passed, `1` on test or quality gate failure, `2` on configuration, usage, or infrastructure error, `3` on timeout, and `130` on `SIGINT`.
+`sert` discovers tools (`luau`, `lute`, `lune`, `rojo`, `selene`, `StyLua`, `luau-lsp`) in `.sert/bin`, `PATH`, Rokit (`~/.rokit/bin`), Aftman (`~/.aftman/bin`), and Mise shims (`~/.local/share/mise/shims`). Set `SERT_AGENT=1` to default compatible subcommands (`check`, `run`, `lint`, `coverage`, `mutate`, `audit`, `bench`, `fuzz`, `studio`, `cloud`) to compact agent output, or `SERT_COMPACT=1` to suppress passing test lines. Every subcommand returns exit `0` when passed, `1` on test or quality gate failure, `2` on configuration, usage, or infrastructure error, `3` on timeout, and `130` on `SIGINT`.
 
 ---
 
@@ -38,13 +38,14 @@ Downloads `sert-<version>.pyz`, `sert-<version>.zip` (extracted to `.sert/sert/`
 
 ### `sert lint`
 
-Runs up to seven static checks in parallel: `sourcemap` (`rojo sourcemap`), `analyze` (`luau-lsp analyze` across both `"new"` and `"old"` Luau type solvers by default), `types`, `stylua`, `selene`, `extra` (`[lint].extra`), and `stub` (`[lint].stub` parity against `tools/sert.py`). The `types` check verifies positive probes and `-- expect-error` negative probes across every configured solver.
+Runs up to seven static checks in parallel: `sourcemap` (`rojo sourcemap`, cached in `.sert/sourcemap.json`), `analyze` (`luau-lsp analyze` across both `"new"` and `"old"` Luau type solvers in parallel), `types`, `stylua`, `selene`, `extra` (`[lint].extra`), and `stub` (`[lint].stub` parity against `tools/sert.py`). Works zero-config without `sert.toml` when `src/`, `test/`, `tests/`, or `default.project.json` exist. The `types` check verifies positive probes and `-- expect-error` negative probes across every configured solver.
 
 | Flag | Description |
 | --- | --- |
 | `--fix` | Formats files in place (`stylua` instead of `stylua --check`). |
 | `--dry-run` | Prints planned tool commands without executing them. |
 | `--only CHECK ...` / `--skip CHECK ...` | Filters checks (`sourcemap`, `analyze`, `types`, `stylua`, `selene`, `extra`, `stub`). |
+| `--agent` / `--format human\|agent\|json` | Emits agent summary or a single JSON envelope with structured diagnostics. |
 
 Negative type probes (`[types].fail` globs) mark expected type errors inline with `-- expect-error` (or `-- expect-error: substring`). `sert lint` verifies that every marked line produces a diagnostic under **every** configured solver and that no unmarked lines fail. Under `[lint].solvers = ["new", "old"]`, annotate literal unions on local tables and arrays so the old type solver does not widen bare literals past the union type.
 
@@ -55,20 +56,21 @@ Discovers specs matching `[test].specs`, compiles `[test].stage` if configured, 
 | Flag | Description |
 | --- | --- |
 | `[specs...]` / `--file FILE` | Restricts execution to matching spec paths or basenames. |
-| `--affected [REV]` / `--changed [REV]` | Runs only specs impacted by git diff against `REV` (default `HEAD`) using static `require`/Rojo graph analysis and `.sert/coverage-map.json`. |
+| `--affected [REV]` / `--changed [REV]` | Runs only specs impacted by git diff against `REV` (default `HEAD`) using cached static `require`/Rojo/`.luaurc` graph analysis and `.sert/coverage-map.json`. |
 | `--runner luau\|lute\|lune` | Selects the standalone Luau runtime (default `luau`). |
 | `--codegen` / `--no-codegen` | Enables (default) or disables native Luau code generation (`luau --codegen`). |
 | `--roblox-globals` | Installs `Vector3`, `CFrame`, `Color3`, `UDim2`, `Enum`, and `typeof` into headless spec globals. |
 | `--coverage` | Collects `luau --coverage` data, writes `coverage.out`, and records per-spec line coverage in `.sert/coverage-map.json`. |
-| `-j, --jobs N` | Parallel shard count (`0` uses CPU core count; `1` runs in a single process, automatic under `--coverage`). |
-| `--filter SUBSTR` / `-g, --grep PAT` | Runs tests matching case-insensitive substring(s) or regex pattern. |
+| `-j, --jobs N` | Parallel shard count (`>= 1`; defaults to CPU core count, or `1` under `--coverage`). |
+| `--filter SUBSTR` / `-g, --grep PAT` | Runs tests matching case-insensitive substring(s) or repeatable Luau string patterns (`%d+`, `%s`). |
 | `--exclude SUBSTR` | Excludes tests matching substring(s). |
-| `--failed` | Re-runs failures from `.sert/last-failed.json`, replaying stored failure seeds and `v1:...` tapes. |
-| `--watch` | Re-runs specs whenever `.luau` or config files change (`0.25 s` poll). |
-| `--repeat N` | Runs the selected tests `N` times to surface order or timing flakes. |
-| `--slowest N` | Prints the `N` slowest tests after the summary. |
+| `--failed` | Re-runs failures from `.sert/last-failed.json`, replaying stored failure seeds and shrunk tapes. |
+| `--watch` | Polls `.luau`, `.lua`, `.snap`, `.meta.json`, `.project.json`, `.luaurc`, and `sert.toml` (`0.25 s`) and re-runs only TIA-affected specs. |
+| `--shuffle` | Randomizes test execution order deterministically (prints `--seed` for replay). |
+| `--repeat N` / `--retry N` | Runs the selected tests `N` times, or retries failing tests up to `N` times and marks recovered passes as `flaky`. |
+| `--slowest N` | Prints the `N` slowest tests (`>= 1`). |
 | `--timeout S` / `--test-timeout S` | Shard wall-clock timeout and per-test timeout in seconds. |
-| `--seed N\|random` / `--runs N` / `--replay N\|TOKEN` | Overrides property base seed, trial count, or replays one counterexample seed or `v1:...` tape token. |
+| `--seed N\|random` / `--runs N` / `--replay N\|TOKEN` | Overrides property base seed or shuffle seed, trial count, or replays one counterexample seed or `v1:...`/`v2:...` tape token. |
 | `--exhaustive` / `--budget S` | Runs bounded-exhaustive properties within an optional wall-clock budget. |
 | `-u, --update-snapshots` / `--prune-snapshots` | Writes inline and `.snap` snapshot updates or removes unused `.snap` keys/files (rejected under `--ci` or `CI=true`). |
 | `--strict-assertions` | Fails any test that finishes with zero recorded assertions unless marked `{ smoke = true }`. |
@@ -85,9 +87,9 @@ Detects test reward-hacking and uncovered public exports using `luau_lex` static
 
 | Flag | Description |
 | --- | --- |
-| `--diff [REV]` | Scopes static remote-fuzz and export checks to changes since `REV` (default `HEAD`). |
-| `--strict` | Fails with exit `1` when public module exports (`M.foo`) have `0` LCOV hits. |
-| `--allow-unfuzzed-remotes` | Waives `.OnServerEvent` / `.OnServerInvoke` handlers missing `fuzzRemote` or `remotePayload` coverage. |
+| `--diff [REV]` | Scopes export and remote checks to changes since `REV` (default `HEAD`) while scanning specs covering changed `src/` files. |
+| `--strict` | Fails with exit `1` when public module exports (`M.foo`, including single-line functions) have `0` hits or explicit `sert.test.skip` calls exist. |
+| `--allow-unfuzzed-remotes` | Waives per-handler `.OnServerEvent` / `.OnServerInvoke` remote checks missing `fuzzRemote` or `remotePayload` coverage. |
 | `--no-run` / `--run-output FILE` / `--coverage-file FILE` | Reuses `.sert/last-telemetry.json`, captured output markers, or an alternate `coverage.out`. |
 | `--agent` / `--format human\|agent\|json` | Emits agent summary or JSON envelope. |
 
@@ -140,9 +142,9 @@ Built-in operators cover `stmt_del` (statement deletion), `ret_val` (return valu
 | `--min N` | Minimum mutation score percentage `(killed + timeout) / total * 100`. |
 | `--operators a,b,...` | Comma-separated subset of operators to enable. |
 | `--max-mutants N` | Deterministic sample cap when bounding CI runtime (`0` = unlimited). |
-| `-j, --jobs N` / `--timeout S` | Worker concurrency and per-mutant timeout (auto-scaled to 5x baseline when `0`). |
+| `-j, --jobs N` / `--timeout S` | Worker concurrency and per-mutant timeout (auto-scaled to 3.5x baseline when `0`). |
 | `--coverage-file FILE` / `--no-coverage-run` | Reuses an existing LCOV file or skips baseline coverage pruning. |
-| `--no-cache` | Ignores cached mutant verdicts in `.sert/mutate/cache.json`. |
+| `--no-cache` / `--strict-cache` | Ignores cached mutant verdicts, or verifies cache keys including transitive dependencies and config files. |
 | `--agent` / `--format human\|agent\|json` | Emits concise agent output or JSON envelope. |
 
 ### `sert check`
@@ -155,17 +157,17 @@ Runs `sert lint` and `sert run --coverage` concurrently, enforces `sert coverage
 | `--diff [REV]` | Scopes `coverage` and `audit` checks to lines added or modified since `REV` (default `HEAD`). |
 | `--audit` / `--no-audit` | Enables or skips the `sert audit` stage (enabled automatically by `--changed` or `--strict`). |
 | `--mutate` / `--no-mutate` | Enables or skips incremental `sert mutate --diff` (enabled automatically by `--changed`). |
-| `--strict` | Fails audit on uncovered public module exports (`M.foo`); implies `--audit`. |
+| `--strict` | Fails audit on uncovered public exports (`M.foo`) and explicit skips; implies `--audit`. |
 | `--allow-unfuzzed-remotes` / `--allow-skipped-targets` | Waives missing remote fuzz coverage in `audit`, or waives `--no-studio` failure when engine-targeted specs were skipped. |
 | `--studio` / `--no-studio` / `--studio-id ID` | Runs `[studio]` checks (`--studio`), forbids launching Studio (`--no-studio`), or pins a warm Studio session (`--studio-id ID`; falls back from `--warm` to cold headless `sert studio` only on bridge exit `2`). |
-| `--fix` / `--uncovered` / `--compact` | Formats with StyLua first, prints missed coverage lines, and suppresses passing test lines. |
+| `--fix` / `--watch` / `--uncovered` / `--compact` | Formats with StyLua first, re-runs on edits (pair with `--changed` for TIA re-verification), prints missed coverage lines, and suppresses passing test lines. |
 | `--timeout S` / `-j, --jobs N` / `--ci` | Entry timeout, parallel worker limit, and strict CI mode. |
-| `--agent` / `--format human\|agent\|json` | Selects compact agent summary or JSON envelope output. |
+| `--agent` / `--format human\|agent\|json` | Selects compact agent summary or JSON envelope output (preserving exit codes `0/1/2/3`). |
 
 ### `sert studio` and `sert cloud`
 
-- **`sert studio`:** `--mode edit|play|run`, `--device PRESET`, `--clients N`, `--warm`, `--studio ID`, `--capture`, `--affected [REV]`, `--suite NAME`, `--check`, `--side server|client`, `--filter`, `-g/--grep`, `--exclude`, `--file`, `--failed`, `--list`, `--repeat N`, `--seed`, `--runs`, `--replay`, `--exhaustive`, `--budget`, `--test-timeout`, `--deadline`, `--timeout`, `-u/--update-snapshots`, `--prune-snapshots`, `--strict-assertions`, `--save-regressions`, `--bench`, `--ci`, `--allow-focused`, `-x/--fail-fast`, `--compact`, `--slowest N`, `--keep`, `--launcher PATH`, `--agent`, `--format human|agent|json`, `--json-out FILE`.
-- **`sert cloud`:** `--project FILE`, `--script FILE`, `--place FILE`, `--place-version N`, `--output DIR`, `--shard k/N`, `-j/--jobs N` (default `8`, max `10`), `--timeout S`, `--json-out FILE`, `--unsharded`, `--dry-run`, `--emit FILE`.
+- **`sert studio`:** `--mode edit|play|run`, `--device PRESET`, `--clients N`, `--warm`, `--studio / --studio-id ID`, `--capture`, `--affected [REV]`, `--suite NAME`, `--check`, `--side server|client`, `--filter`, `-g/--grep`, `--exclude`, `--file`, `--failed`, `--list`, `--shuffle`, `--repeat N`, `--retry N`, `--seed`, `--runs`, `--replay`, `--exhaustive`, `--budget`, `--test-timeout`, `--deadline`, `--timeout`, `-u/--update-snapshots`, `--prune-snapshots`, `--strict-assertions`, `--save-regressions`, `--bench`, `--ci`, `--allow-focused`, `-x/--fail-fast`, `--compact`, `--slowest N`, `--keep`, `--launcher PATH`, `--agent`, `--format human|agent|json`, `--json-out FILE`, `--junit FILE`.
+- **`sert cloud`:** `--project FILE`, `--script FILE`, `--place FILE`, `--place-version N`, `--output FILE`, `--shard NAME`, `-j/--jobs N` (default `8`, max `10`), `--timeout S`, `--json-out FILE`, `--junit FILE`, `--agent`, `--format human|agent|json`, `--unsharded`, `--dry-run`, `--emit DIR` (requires `--dry-run`).
 
 ---
 
@@ -176,13 +178,13 @@ Runs `sert lint` and `sert run --coverage` concurrently, enforces `sert coverage
 | Section | Key settings |
 | --- | --- |
 | `[sert]` | `version = "0.2.1"`, `repo = "kohltastrophe/sert"` |
-| `[test]` | `specs = ["test/**/*.spec.luau"]`, `entries = []`, `runner = "luau"`, `codegen = true`, `setup = ""`, `stage = ""`, `globals = ""`, `jobs = 0`, `timeout = 120`, `repeat = 1`, `slowest = 0`, `allow_focused = false` |
-| `[studio]` | `project = "default.project.json"`, `specs = [...]`, `mode = "play"`, `device = ""`, `clients = 1`, `warm = false`, `studio = ""`, `capture = false`, `sides = [...]`, `timeout = 180`, `out = ".sert/studio"`, `hooks = ""`, `config = ""`, `runner = ""`, `[studio.suites.<name>]` |
+| `[test]` | `specs = ["test/**/*.spec.luau"]`, `entries = []`, `runner = "luau"`, `codegen = true`, `setup = ""`, `stage = ""`, `globals = ""`, `jobs = <CPU count>`, `timeout = 120`, `repeat = 1`, `slowest = <unset>`, `allow_focused = false` |
+| `[studio]` | `project = "default.project.json"`, `specs = [...]`, `mode = "play"`, `device = ""`, `clients = 1`, `warm = false`, `studio = ""`, `bridge = ""`, `capture = false`, `sides = [...]`, `timeout = 900`, `out = "build/sert"`, `hooks = ""`, `config = ""`, `runner = ""`, `[studio.suites.<name>]` |
 | `[cloud]` | `project = ""`, `specs = [...]`, `script = ""`, `shards = []`, `shard_limit = 0`, `jobs = 8`, `max_workers = 10`, `timeout = 300` |
 | `[lint]` | `paths = ["src", "test"]`, `project = "default.project.json"`, `solvers = ["new", "old"]`, `ignore = []`, `stylua = true`, `selene = true`, `stub = true`, `extra = []`, `[[lint.analyze]]` |
 | `[types]` | `pass = ["test/types"]`, `fail = ["test/types/fail"]`, `solvers = []` |
-| `[coverage]` | `include = ["src"]`, `exclude = []`, `min = 80`, `badge = "coverage.json"` |
-| `[mutate]` | `include = ["src"]`, `exclude = []`, `specs = {}` (optional override; defaults to automatic coverage-map routing), `operators = []`, `min = 0`, `timeout = 0`, `jobs = 0`, `max_mutants = 0`, `benign_calls = []`, `cosmetic_props = []` |
+| `[coverage]` | `file = "coverage.out"`, `include = ["src"]`, `exclude = []`, `min = 80`, `badge = "coverage.json"` |
+| `[mutate]` | `include = ["src"]`, `exclude = []`, `specs = {}` (optional override; defaults to automatic coverage-map routing), `operators = []`, `codegen = true`, `cache = "scoped"`, `min = 0`, `timeout = 0`, `jobs = 0`, `max_mutants = 0`, `benign_calls = []`, `cosmetic_props = []` |
 | `[override]` | `sert = "../sert"` (local dev only; fails automatically when `CI=true`) |
 | `[release]` | Release metadata pass-through table (for example `kohltastrophe/release` version sync rules) |
 

@@ -17,45 +17,45 @@ python3 tools/sert.py check --changed --agent
 
 `sert check` runs `sert lint`, `sert run --coverage`, and the configured coverage floor in parallel. Adding `--changed [REV]` (or `--audit` / `--strict`) expands it into a four-stage closed-loop gate that exits early on hard failures:
 
-1. **Lint and impacted tests:** runs `sert lint` (StyLua, Selene, Luau analyze, and `.stub` checks) concurrently with `sert run --affected [REV] --coverage` (under `--changed`, defaulting `REV` to `HEAD`, or the full suite under `sert check --audit`).
+1. **Lint and impacted tests:** runs `sert lint` (StyLua, Selene, parallel Luau `analyze`/type probes, and `.stub` checks) concurrently with `sert run --affected [REV] --coverage` (under `--changed`, defaulting `REV` to `HEAD`, or the full suite under `sert check --audit`).
 2. **Diff coverage and audit:** runs `sert coverage` (with `--diff REV --uncovered` when a revision is supplied) and `sert audit` against Stage 1 telemetry (`coverage.out` and `.sert/last-telemetry.json`).
 3. **Incremental mutation testing:** under `--changed` or `--mutate`, runs `sert mutate --diff` against covered, modified lines under `src/` unless `--no-mutate` is passed or zero covered source lines changed.
 4. **Engine target fallback:** under `--changed`, when Stage 1 skips `roblox`, `server`, or `client` specs (`skippedByReason`), runs `sert studio --warm` (`--studio-id ID` pins an open Studio session) and falls back to cold headless `sert studio` only on a bridge infrastructure error (exit `2`). With `--no-studio`, exits `1` and prints the exact `sert studio` follow-up command unless `--allow-skipped-targets` is set.
 
-Pass `sert check --audit` (or `sert check --audit --diff REV`) to verify the full suite, `--strict` to fail audit on uncovered public exports, and `--allow-unfuzzed-remotes` to waive remote fuzz checks. You can also pass `-j N` (`--jobs N`), `--timeout S` per entry, and `--ci` for strict CI rules.
+Pass `sert check --audit` (or `sert check --audit --diff REV`) to verify the full suite, `--watch` for continuous TIA re-verification, `--strict` to fail audit on uncovered public exports and explicit skips, and `--allow-unfuzzed-remotes` to waive remote fuzz checks. You can also pass `-j N` (`--jobs N`), `--timeout S` per entry, and `--ci` for strict CI rules.
 
 ## Agent and JSON output modes
 
 | Output switch | Effect |
 | --- | --- |
-| `--agent` or `SERT_AGENT=1` | Strips passing noise, emits `OK` or `FAIL` headers, adds 3-line stack snippets, and prints snapshot diffs and `regressions = { "v1:..." }` hints |
-| `--format json` | Emits one JSON envelope `{ version: 1, command, status, exit_code, summary, errors, data }` to stdout (`status` is `"ok"`, `"failed"`, or `"error"`) |
+| `--agent` or `SERT_AGENT=1` | Strips passing noise, emits `OK` or `FAIL` headers, adds 3-line stack snippets and compact diffs, and prints `regressions = { "v2:..." }` hints |
+| `--format json` | Emits one JSON envelope `{ version: 1, command, status, exit_code, summary, errors, data }` to stdout (`status` is `"ok"`, `"failed"`, or `"error"`, preserving exit codes `0/1/2/3`) |
 | `--format human` | Restores colored terminal output even when `SERT_AGENT=1` is exported |
 
-Precedence is `--format`, then `--agent`, then `SERT_AGENT=1` (`1`, `true`, `yes`, or `on`), then `human`. Passing `--format json` or `--agent` works on `check`, `run`, `coverage`, `mutate`, `audit`, `bench`, `fuzz`, and `studio`.
+Precedence is `--format`, then `--agent`, then `SERT_AGENT=1` (`1`, `true`, `yes`, or `on`), then `human`. Passing `--format json` or `--agent` works across all ten verification subcommands: `check`, `run`, `lint`, `coverage`, `mutate`, `audit`, `bench`, `fuzz`, `studio`, and `cloud`.
 
-When tests fail, replay only the failing tests with their shrunk `v1:...` tapes or case seeds saved in `.sert/last-failed.json`:
+When tests fail, replay only the failing tests with their shrunk `v1:...` / `v2:...` tapes or case seeds saved in `.sert/last-failed.json`:
 
 ```bash
 python3 tools/sert.py run --failed --agent
 ```
 
-## Test Impact Analysis (`--affected`)
+## Test Impact Analysis (`--affected` and `--watch`)
 
-Passing `--affected [REV]` (or `--changed [REV]`, default `HEAD`) to `sert run`, `sert check`, or `sert studio` builds a hybrid impact graph. Static analysis parses `require(...)` strings, Rojo `*.project.json` `$path` mappings, and `.luaurc` aliases (with `extends` inheritance), while dynamic coverage reads per-spec line maps recorded in `.sert/coverage-map.json` during `--coverage` runs.
+Passing `--affected [REV]` (or `--changed [REV]`, default `HEAD`) to `sert run`, `sert check`, or `sert studio`—or `--watch` to `sert run` or `sert check`—queries a persistent TIA impact graph cached in `.sert/graph-cache.json`. Static analysis parses `require(...)` strings, `env.game` / `env:require(...)` chains, Rojo `*.project.json` `$path` mappings, and `.luaurc` aliases (with `extends` inheritance), while dynamic coverage reads per-spec line maps recorded in `.sert/coverage-map.json` during `--coverage` runs.
 
-Edits to global files (`sert.toml`, `sert.local.toml`, `.luaurc`, `rokit.toml`, `.config.luau`, `init.config.luau`, `*.project.json`, or `[test].setup`) invalidate the cache and select all specs. If zero specs are impacted by a non-Luau edit, `sert run --affected` exits `0` immediately.
+Edits to global files (`sert.toml`, `sert.local.toml`, `.luaurc`, `rokit.toml`, `.config.luau`, `init.config.luau`, `*.project.json`, `test/.sert-regressions.toml`, or `[test].setup`) invalidate the cache and select all specs, while `.snap` and `.meta.json` edits re-run their owning specs. If zero specs are impacted by a non-Luau edit, `sert run --affected` exits `0` immediately.
 
 ## Runtime tiers (`run` -> `studio --warm` -> `cloud`)
 
 | Tier | Command | Targets covered | Speed and fidelity |
 | --- | --- | --- | --- |
 | 1. Headless Luau | `sert run` | `portable`, `sert.env`, `sert.sim` | Sub-second execution under `luau --codegen` with deterministic virtual clocks and modeled DataModel |
-| 2. Warm Studio | `sert studio --warm` | `roblox`, `server`, `client` | Attaches to an open Studio instance via `studio_link.py` and reloads cloned `ModuleScript`s without a cold boot |
+| 2. Warm Studio | `sert studio --warm` | `roblox`, `server`, `client` | Attaches to an open Studio instance via the warm bridge without rebuilding or cold-booting |
 | 3. Cold Studio | `sert studio` | `roblox`, `server`, `client` | Launches headless Studio (`--mode edit\|play\|run`); multi-client play and viewport screenshots (`--device`, `--capture`) |
 | 4. Open Cloud | `sert cloud` | `server`, `roblox` | Runs sharded specs in Roblox Luau Execution over HTTPS (`ROBLOX_API_KEY`) |
 
-`--warm` locates `studio_link.py` from `SERT_STUDIO_BRIDGE`, `STUDIO_LINK`, the repository `scripts/` directory, or `~/.agents/skills/roblox-dev/scripts/studio_link.py`. Configure `[studio] warm = true` or `studio = "ID"` in `sert.toml` to make warm attachment the default locally.
+`--warm` locates the bridge executable or script from `[studio].bridge`, `SERT_STUDIO_BRIDGE`, `STUDIO_LINK`, or `sert-studio-bridge` / `studio-link` on `PATH`. Configure `[studio] warm = true` or `studio = "ID"` in `sert.toml` to make warm attachment the default locally.
 
 ## Zero-config mutation testing (`sert mutate`)
 

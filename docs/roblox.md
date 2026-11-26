@@ -59,9 +59,10 @@ end)
 
 ## Device presets, multi-client, and `--warm` Studio
 
-- **Device emulation (`--device <Preset>`):** Calls `StudioDeviceSimulatorService:SetDeviceAsync` before specs run. Built-in presets are `Phone` (`390x844@3`), `SmallPhone` (`320x568@2`), `Tablet` (`820x1180@2`), `Desktop` (`1920x1080@1`), `Console` (`1920x1080@1`), and `Ultrawide` (`2560x1080@1`), or pass custom geometry as `WxH` / `WxH@dpr` (`--device 412x915@2.6`).
+- **Device emulation (`--device <Preset>`):** Calls `StudioDeviceSimulatorService:SetDeviceAsync` before specs run. Built-in presets are `Phone` (`390x844@3`), `SmallPhone` (`375x667@2`), `Tablet` (`820x1180@2`), `Desktop` (`1920x1080@1`), `Console` (`1920x1080@1`), and `Ultrawide` (`2560x1080@1`), or pass custom geometry as `WxH` / `WxH@dpr` (`--device 412x915@2.6`).
 - **Multi-client sessions (`--clients N`):** Launches a `PlayServer` plus `N` concurrent player clients, isolates each side's test registry, and aggregates the server report alongside all `N` client reports by `runId`.
-- **Warm Studio bridge (`--warm`):** Connects to an already-open Roblox Studio via `studio_link.py` (`--studio ID` targets a named Studio instance; `--capture` records viewport PNGs into `<out>/<mode>.png`). On each warm run, `sert.roblox.Runner` clones spec `ModuleScript`s before calling `require`, bypassing Luau's module cache so edited specs re-execute without restarting Studio. `sert studio` also accepts `--affected [REV]`, `-u` / `--update-snapshots`, `--prune-snapshots`, `--strict-assertions`, `--save-regressions`, `--bench`, `--agent`, and `--format human|agent|json`.
+- **Warm Studio bridge (`--warm`):** Attaches to an already-open Roblox Studio instance without building an overlay place or cold-booting Studio (`--studio-id ID` targets a named session; `--capture` records viewport PNGs into `<out>/<mode>.png`). `sert` resolves the bridge executable from `[studio].bridge`, `SERT_STUDIO_BRIDGE`, `STUDIO_LINK`, or `sert-studio-bridge` / `studio-link` on `PATH`, runs a `Runner` readiness handshake before `ExecutePlayModeAsync`, and clones spec `ModuleScript`s before calling `require` so edited specs bypass Luau's module cache. Custom bridges must accept `[--studio ID] exec --code <luau>` (returning JSON on stdout) and optionally `[--studio ID] screenshot --out <png>`.
+- **Runner options & CI reporting:** `sert studio` accepts `--affected [REV]`, `--shuffle`, `--retry N`, `--junit FILE`, `--json-out FILE`, `-u` / `--update-snapshots`, `--prune-snapshots`, `--strict-assertions`, `--save-regressions`, `--bench`, `--agent`, and `--format human|agent|json`.
 
 ### Optional custom `sert.roblox.Runner`
 
@@ -71,7 +72,7 @@ Most projects need only `[studio].project` and `[studio].specs`. If your game ne
 
 ## Dual-target conformance (`sert.roblox.conformance`)
 
-`sert.roblox.conformance(name, fn, opts?)` registers two specs from one callback: `<name> [portable]` runs in headless `sert.env`, and `<name> [roblox]` (or `<name> [client]` when `opts.target = "client"`) runs in live Roblox Studio. Each run receives a fresh container (`Workspace` folder or `PlayerGui` `ScreenGui` selected by `opts.container`) and a unified `ConformanceContext` exposing `isRoblox`, `target`, `game`, `workspace`, `Instance`, `task`, `Enum`, datatypes, `SharedTable`, `getService(name)`, and `step(seconds?)`:
+`sert.roblox.conformance(name, fn, opts?)` registers two specs from one callback: `<name> [portable]` runs in headless `sert.env`, and `<name> [roblox]` (or `<name> [client]` when `opts.target = "client"`) runs in live Roblox Studio. Each run receives a fresh container (`Workspace` folder or `PlayerGui` `ScreenGui` selected by `opts.container`) and a unified `ConformanceContext` exposing `isRoblox`, `target`, `game`, `workspace`, `Instance`, `task`, `Enum`, datatypes (`Vector2`, `Vector3`, `CFrame`, `Color3`, `UDim`, `UDim2`, `Rect`, `NumberRange`, `TweenInfo`, `Font`, `ColorSequence`, `ColorSequenceKeypoint`, `NumberSequence`, `NumberSequenceKeypoint`, `BrickColor`), `SharedTable`, `getService(name)`, and `step(seconds?)`. `sert` ships an 8-domain parity suite in `test/roblox/specs/conformance/EngineParity.spec.luau` covering instances, signals, DataStores/MemoryStores, remotes, UI layout/insets/text, tags/attributes, Parallel Luau, and spatial/audio/tween checks:
 
 ```luau
 --!strict
