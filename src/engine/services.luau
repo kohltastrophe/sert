@@ -168,6 +168,16 @@ function lazy.CollectionService(env: any, ctx: any): any
 		HasTag = function(_self: any, instance: any, tag: string): boolean return instance:HasTag(tag) end,
 		GetTags = function(_self: any, instance: any): { string } return instance:GetTags() end,
 		GetTagged = function(_self: any, tag: string): { any } return InstanceDouble.getTagged(env, tag) end,
+		GetAllTags = function(_self: any): { string }
+			local out: { string } = {}
+			if type(env._tags) == "table" then
+				for tag, list in env._tags do
+					if type(list) == "table" and #list > 0 then table.insert(out, tag) end
+				end
+				table.sort(out)
+			end
+			return out
+		end,
 		GetInstanceAddedSignal = function(_self: any, tag: string): any
 			env._tagAddedSignals[tag] = env._tagAddedSignals[tag] or env:signal()
 			return env._tagAddedSignals[tag]
@@ -192,10 +202,11 @@ function lazy.ContentProvider(_env: any, ctx: any): any
 	})
 end
 
-function lazy.ContextActionService(_env: any, ctx: any): any
+function lazy.ContextActionService(env: any, ctx: any): any
 	local boundActions: { [string]: any } = {}
 	return defService(ctx, "ContextActionService", {
 		BindAction = function(_self: any, name: string, fn: any, createTouchButton: boolean?, ...: any)
+			Parallel.assertSerial(env, "Function ContextActionService.BindAction")
 			boundActions[name] = { fn = fn, createTouchButton = createTouchButton, inputTypes = { ... } }
 		end,
 		BindActionAtPriority = function(
@@ -206,10 +217,17 @@ function lazy.ContextActionService(_env: any, ctx: any): any
 			_priority: number,
 			...: any
 		)
+			Parallel.assertSerial(env, "Function ContextActionService.BindActionAtPriority")
 			boundActions[name] = { fn = fn, createTouchButton = createTouchButton, inputTypes = { ... } }
 		end,
-		UnbindAction = function(_self: any, name: string) boundActions[name] = nil end,
-		UnbindAllActions = function(_self: any) table.clear(boundActions) end,
+		UnbindAction = function(_self: any, name: string)
+			Parallel.assertSerial(env, "Function ContextActionService.UnbindAction")
+			boundActions[name] = nil
+		end,
+		UnbindAllActions = function(_self: any)
+			Parallel.assertSerial(env, "Function ContextActionService.UnbindAllActions")
+			table.clear(boundActions)
+		end,
 		GetBoundActionInfo = function(_self: any, name: string): any return boundActions[name] or {} end,
 		GetAllBoundActionInfo = function(_self: any): { [string]: any } return table.clone(boundActions) end,
 	})
@@ -226,10 +244,11 @@ function lazy.DataStoreService(_env: any, ctx: any): any
 	)
 end
 
-function lazy.Debris(_env: any, ctx: any): any
+function lazy.Debris(env: any, ctx: any): any
 	local taskDelay = ctx.task.delay
 	return defService(ctx, "Debris", {
 		AddItem = function(_self: any, item: any, lifetime: number?)
+			Parallel.assertSerial(env, "Function Debris.AddItem")
 			if item ~= nil then taskDelay(lifetime or 10, function() pcall(item.Destroy, item) end) end
 		end,
 	})
@@ -285,14 +304,17 @@ function lazy.GroupService(env: any, ctx: any): any
 end
 
 function lazy.GuiService(_env: any, ctx: any): any
-	local isStrict, Vector2, Rect = ctx.isStrict, ctx.dt.Vector2, ctx.dt.Rect
+	local Vector2, Rect = ctx.dt.Vector2, ctx.dt.Rect
 	return defService(ctx, "GuiService", {
 		GetGuiInset = function(self: any): (any, any)
 			local inset = self._props._guiInset
-			return if inset ~= nil then inset elseif isStrict then Vector2.zero else Vector2.new(0, 36), Vector2.zero
+			if inset ~= nil then return inset, Vector2.zero end
+			local tb = self._props.TopbarInset
+			local h = if tb ~= nil and type(tb.Height) == "number" then tb.Height else 58
+			return Vector2.new(0, h), Vector2.zero
 		end,
 		IsTenFootInterface = function(): boolean return false end,
-	}, if not isStrict then { TopbarInset = Rect.new(0, 0, 1280, 36) } else nil)
+	}, { TopbarInset = Rect.new(0, 0, 1280, 58) })
 end
 
 function lazy.HttpService(env: any, ctx: any): any
@@ -525,17 +547,22 @@ function lazy.SharedTableRegistry(_env: any, ctx: any): any
 	return defService(ctx, "SharedTableRegistry", Parallel.sharedTableRegistryMethods(ctx.sharedTableRegistry) :: any)
 end
 
-function lazy.PhysicsService(_env: any, ctx: any): any
+function lazy.PhysicsService(env: any, ctx: any): any
 	local groups: { [string]: { [string]: boolean } } = { Default = { Default = true } }
 	return defService(ctx, "PhysicsService", {
-		RegisterCollisionGroup = function(_self: any, name: string) groups[name] = groups[name] or { [name] = true } end,
+		RegisterCollisionGroup = function(_self: any, name: string)
+			Parallel.assertSerial(env, "Function PhysicsService.RegisterCollisionGroup")
+			groups[name] = groups[name] or { [name] = true }
+		end,
 		UnregisterCollisionGroup = function(_self: any, name: string)
+			Parallel.assertSerial(env, "Function PhysicsService.UnregisterCollisionGroup")
 			groups[name] = nil
 			for _, row in groups do
 				row[name] = nil
 			end
 		end,
 		RenameCollisionGroup = function(_self: any, from: string, to: string)
+			Parallel.assertSerial(env, "Function PhysicsService.RenameCollisionGroup")
 			if from == "Default" or groups[from] == nil then return end
 			groups[to] = groups[from]
 			groups[from] = nil
@@ -545,6 +572,7 @@ function lazy.PhysicsService(_env: any, ctx: any): any
 		end,
 		IsCollisionGroupRegistered = function(_self: any, name: string): boolean return groups[name] ~= nil end,
 		CollisionGroupSetCollidable = function(_self: any, g1: string, g2: string, collidable: boolean)
+			Parallel.assertSerial(env, "Function PhysicsService.CollisionGroupSetCollidable")
 			groups[g1], groups[g2] = groups[g1] or {}, groups[g2] or {}
 			groups[g1][g2], groups[g2][g1] = collidable, collidable
 		end,
@@ -780,18 +808,27 @@ function lazy.TextService(env: any, ctx: any): any
 	local textService = defService(ctx, "TextService")
 	local methods = {}
 	function methods.GetTextSize(_self: any, text: string, fontSize: number, _font: any, frameSize: any?): any
-		local sz = fontSize or 14
-		local w, h = #tostring(text) * math.ceil(sz * 0.55), sz
-		if frameSize ~= nil and frameSize.X > 0 and w > frameSize.X then
-			w, h = frameSize.X, math.ceil(w / frameSize.X) * sz
-		end
+		local sz = if type(fontSize) == "number" and fontSize > 0 then fontSize else 14
+		local availW = if frameSize ~= nil
+				and type(frameSize.X) == "number"
+				and frameSize.X > 0
+				and frameSize.X < 1e9
+			then frameSize.X
+			else 0
+		local w, h = InstanceDouble.measureText(tostring(text or ""), sz, availW > 0, availW)
 		return Vector2.new(w, h)
 	end
 	function methods.GetTextBoundsAsync(_self: any, params: any): any
-		local text = if params then params.Text or "" else ""
-		local size = if params then params.Size or 14 else 14
-		local width = if params and params.Width and params.Width > 0 then params.Width else math.huge
-		return methods.GetTextSize(textService, text, size, nil, Vector2.new(width, math.huge))
+		local text = if params then tostring(params.Text or "") else ""
+		local size = if params and type(params.Size) == "number" and params.Size > 0 then params.Size else 14
+		local availW = if params
+				and type(params.Width) == "number"
+				and params.Width > 0
+				and params.Width < 1e9
+			then params.Width
+			else 0
+		local w, h = InstanceDouble.measureText(text, size, availW > 0, availW)
+		return Vector2.new(w, h)
 	end
 	function methods.FilterStringAsync(_self: any, text: string, fromUserId: number): any
 		local filterFn: ((string, number) -> string)? = env.textFilter
@@ -812,7 +849,7 @@ for _, k in string.split("number boolean CFrame Rect Color3 UDim UDim2 Vector2 V
 	TWEENABLE[k] = true
 end
 
-function lazy.TweenService(_env: any, ctx: any): any
+function lazy.TweenService(env: any, ctx: any): any
 	local createInstance, Enum, dt, typeOf = ctx.createInstance, ctx.Enum, ctx.dt, ctx.typeof
 	local active: { any } = {}
 	ctx.activeTweens = active
@@ -919,6 +956,7 @@ function lazy.TweenService(_env: any, ctx: any): any
 
 	return defService(ctx, "TweenService", {
 		Create = function(_self: any, target: any, tweenInfo: any, propTable: { [string]: any }): any
+			Parallel.assertSerial(env, "Function TweenService.Create")
 			local schema = if type(target) == "table" and rawget(target, "_isInstance") == true
 				then InstanceDouble.CLASSES[target._props.ClassName]
 				else nil
@@ -1173,7 +1211,7 @@ function eager.Workspace(_env: any, ctx: any): any
 	return workspaceInst
 end
 
-function eager.RunService(_env: any, ctx: any): any
+function eager.RunService(env: any, ctx: any): any
 	local host = ctx.host
 	local isServer, isClient, isStudio = ctx.isServer, ctx.isClient, ctx.isStudio
 	local renderSteps: { { name: string, priority: number, seq: number, fn: (number) -> () } } = ctx.renderSteps
@@ -1212,6 +1250,7 @@ function eager.RunService(_env: any, ctx: any): any
 
 	local seq = 0
 	local function unbindRenderStep(_self: any, name: string)
+		Parallel.assertSerial(env, "Function RunService.UnbindFromRenderStep")
 		for i = #renderSteps, 1, -1 do
 			if renderSteps[i].name == name then table.remove(renderSteps, i) end
 		end
@@ -1225,6 +1264,7 @@ function eager.RunService(_env: any, ctx: any): any
 		IsRunMode = function(): boolean return if props.IsRunMode ~= nil then props.IsRunMode else false end,
 		IsEdit = function(): boolean return false end,
 		BindToRenderStep = function(self: any, name: string, priority: number, fn: (number) -> ())
+			Parallel.assertSerial(env, "Function RunService.BindToRenderStep")
 			if ctx.isStrict and not isClient then
 				error("RunService:BindToRenderStep() can only be called from a LocalScript", 2)
 			end

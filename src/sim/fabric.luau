@@ -30,6 +30,7 @@ type PendingCaller = {
 	active: boolean,
 	thread: thread,
 	clearPacket: (() -> ())?,
+	abortIfDead: (() -> ())?,
 }
 
 type Subscription = {
@@ -53,14 +54,20 @@ local function packValues(...: any): { [number]: any, n: number } return table.p
 
 local function unpackValues(packed: { [number]: any, n: number }): ...any return table.unpack(packed, 1, packed.n) end
 
-local function makeWorldSignal(w: any, owner: any?, syncFire: boolean?): any
+local function makeWorldSignal(w: any, owner: any?, syncFire: boolean?, onError: ((err: any) -> ())?): any
 	local s = w.scheduler
+	local behavior: Signal.SignalBehavior = if syncFire then "Immediate" else (w.signalBehavior or "Deferred")
 	return Signal.new({
+		signalBehavior = behavior,
+		onError = onError,
 		shouldPark = function(): boolean return s ~= nil and (s:running() or coroutine.running() == s.testThread) end,
 		park = function(onPark: (co: thread) -> ()): ...any
 			if s:running() then onPark(coroutine.running()) end
 			return s:park()
 		end,
+		deferSignal = if not syncFire and s ~= nil
+			then function(fn: (...any) -> (), ...: any) s:deferSignal(owner, fn, ...) end
+			else nil,
 		dispatch = if not syncFire
 				and s ~= nil
 				and owner ~= nil
@@ -82,7 +89,8 @@ local function serverCall(
 	service: string,
 	method: string,
 	mutates: boolean,
-	fn: (localAck: boolean) -> ...any
+	fn: (localAck: boolean) -> ...any,
+	onAfterFault: (() -> ())?
 ): ...any
 	checkAlive(server, method)
 	local key = `{service}.{method}`
@@ -97,7 +105,11 @@ local function serverCall(
 		end
 		fault(w, server, service, method, key, "before")
 		local results = packValues(fn(true))
-		fault(w, server, service, method, key, "after")
+		local okAfter, afterErr = pcall(fault :: (...any) -> ...any, w, server, service, method, key, "after")
+		if not okAfter then
+			if onAfterFault ~= nil then onAfterFault() end
+			error(afterErr, 0)
+		end
 		return unpackValues(results)
 	end
 
@@ -185,7 +197,10 @@ local function serverCall(
 
 	-- `after` fault: backing mutation already committed, but caller loses ACK (and local cache is invalidated).
 	local okAfter, afterErr = pcall(fault :: (...any) -> ...any, w, server, service, method, key, "after")
-	if not okAfter then error(afterErr, 0) end
+	if not okAfter then
+		if onAfterFault ~= nil then onAfterFault() end
+		error(afterErr, 0)
+	end
 
 	return unpackValues(results :: { [number]: any, n: number })
 end
@@ -435,7 +450,7 @@ local function wrapStore(w: any, server: any, raw: any, ordered: boolean, budget
 				cache[key] = { value = copy(snapVal), info = copy(info), expires = server:now() + CACHE_TTL }
 			end
 			return version
-		end)
+		end, function() cache[key] = nil end)
 	end
 
 	function store.IncrementAsync(_self: any, key: string, delta: number?, userIds: any?, options: any?): (any, any)
@@ -447,7 +462,7 @@ local function wrapStore(w: any, server: any, raw: any, ordered: boolean, budget
 				cache[key] = { value = copy(nextVal), info = copy(info), expires = server:now() + CACHE_TTL }
 			end
 			return copy(nextVal), copy(info)
-		end)
+		end, function() cache[key] = nil end)
 	end
 
 	function store.RemoveAsync(_self: any, key: string): (any, any)
@@ -458,7 +473,7 @@ local function wrapStore(w: any, server: any, raw: any, ordered: boolean, budget
 				cache[key] = { value = nil, info = nil, expires = server:now() + CACHE_TTL }
 			end
 			return copy(prev), copy(info)
-		end)
+		end, function() cache[key] = nil end)
 	end
 
 	function store.UpdateAsync(_self: any, key: string, transform: (any, any) -> (any, any?, any?)): (any, any)
@@ -475,11 +490,11 @@ local function wrapStore(w: any, server: any, raw: any, ordered: boolean, budget
 				end
 				return transform(copy(current), copy(keyInfo))
 			end)
-			if localAck and server.alive then
+			if localAck and server.alive and info ~= nil then
 				cache[key] = { value = copy(val), info = copy(info), expires = server:now() + CACHE_TTL }
 			end
 			return copy(val), copy(info)
-		end)
+		end, function() cache[key] = nil end)
 	end
 
 	if ordered then
@@ -546,6 +561,17 @@ function Fabric.attachDataStore(w: any, server: any)
 	local svc: any = { _budget = budget }
 
 	function svc.GetDataStore(_self: any, name: string, scope: string?, options: any?): any
+		local allScopes = type(options) == "table" and options.AllScopes == true
+		if allScopes then
+			if scope ~= nil and scope ~= "" then
+				error("GetDataStore: scope must be empty when AllScopes is true", 0)
+			end
+			local id = `all:{name}`
+			if stores[id] == nil then
+				stores[id] = wrapStore(w, server, backing:GetDataStore(name, scope, options), false, budget)
+			end
+			return stores[id]
+		end
 		local sc = scope or "global"
 		local id = `std:{name}:{sc}`
 		if stores[id] == nil then
@@ -801,7 +827,7 @@ function Fabric.attachMemoryStore(w: any, server: any)
 			waitTimeout: number?
 		): ({ any }, string?)
 			checkAlive(server, "ReadAsync")
-			local maxWait = if waitTimeout == nil then 30 elseif waitTimeout < 0 then 3600 else waitTimeout
+			local maxWait = if waitTimeout == nil or waitTimeout < 0 then 300 else waitTimeout
 			local deadline = w:now() + maxWait
 
 			while true do
@@ -1039,22 +1065,19 @@ local function translateServerToClient(server: any, client: any?): (any) -> any
 	end
 end
 
-local function serializeTuple(mapper: (any) -> any, ...: any): { [number]: any, n: number }
+local function serializeTuple(w: any, mapper: (any) -> any, ...: any): { [number]: any, n: number }
 	local count = select("#", ...)
 	local out: { [number]: any, n: number } = { n = count }
+	local strict = w ~= nil and w.strictRemotes == true
 	for i = 1, count do
 		local v = select(i, ...)
 		out[i] = serialize.remote(v, {
 			allowInstances = true,
 			mapInstance = mapper,
+			strict = strict,
 		})
 	end
 	return out
-end
-
-local function estimateBytes(packed: { [number]: any, n: number }): number
-	local ok, encoded = pcall(format.json, packed)
-	return if ok then #encoded else 0
 end
 
 local function computeRemoteTransit(w: any): (number, boolean)
@@ -1115,7 +1138,12 @@ function Fabric.attachRemotes(w: any, server: any): any
 	local nextCallerId = 1
 	local lastSendReadyAt = 0
 
-	local function makeSignal(): any return makeWorldSignal(w, server, true) end
+	local function makeSignal(owner: any, remoteName: string?): any
+		local errFn: ((err: any) -> ())? = if remoteName ~= nil and owner ~= nil
+			then function(err: any) recordRemoteError(w, owner.name or "?", remoteName, err) end
+			else nil
+		return makeWorldSignal(w, owner, false, errFn)
+	end
 
 	local function findClientForPlayer(player: any): any?
 		if player == nil then return nil end
@@ -1145,7 +1173,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 		deliverFn: (packed: { [number]: any, n: number }) -> ()
 	)
 		local firstPacked = packedFactory()
-		if unreliable and estimateBytes(firstPacked) > UNRELIABLE_MAX_BYTES then
+		if unreliable and serialize.estimateRemoteBytes(firstPacked) > UNRELIABLE_MAX_BYTES then
 			w:trace(`remoteOversizeDrop {remoteName}`)
 			return
 		end
@@ -1197,19 +1225,20 @@ function Fabric.attachRemotes(w: any, server: any): any
 	end
 
 	local function getOrCreateEvent(name: string, unreliable: boolean): any
-		local ev: any = serverEvents[name]
+		local evKey = (if unreliable then "U:" else "R:") .. name
+		local ev: any = serverEvents[evKey]
 		if ev ~= nil then return ev end
 		ev = {
 			name = name,
 			unreliable = unreliable,
-			OnServerEvent = makeSignal(),
+			OnServerEvent = makeSignal(server, name),
 			clientSignals = {} :: { [number]: any },
 		}
 
 		function ev.clientSignal(client: any): any
 			local sig = ev.clientSignals[client.id]
 			if sig == nil then
-				sig = makeSignal()
+				sig = makeSignal(client, name)
 				ev.clientSignals[client.id] = sig
 			end
 			return sig
@@ -1221,14 +1250,14 @@ function Fabric.attachRemotes(w: any, server: any): any
 			if target == nil or not target.connected or target.server ~= server then return end
 			local rawArgs = packValues(...)
 			-- Validate eagerly on sender side (matching Roblox RemoteEvent argument checks).
-			local validated = serializeTuple(translateServerToClient(server, target), unpackValues(rawArgs))
+			local validated = serializeTuple(w, translateServerToClient(server, target), unpackValues(rawArgs))
 			local firstUsed = false
 			schedulePacket(name, ev.unreliable, "s->c", `{server.name}->{target.name}`, function()
 				if not firstUsed then
 					firstUsed = true
 					return validated
 				end
-				return serializeTuple(translateServerToClient(server, target), unpackValues(rawArgs))
+				return serializeTuple(w, translateServerToClient(server, target), unpackValues(rawArgs))
 			end, function(packed)
 				if not server.alive or not target.connected or target.server ~= server then return end
 				target:spawn(function()
@@ -1246,7 +1275,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 			end
 		end
 
-		serverEvents[name] = ev
+		serverEvents[evKey] = ev
 		return ev
 	end
 
@@ -1257,9 +1286,20 @@ function Fabric.attachRemotes(w: any, server: any): any
 			name = name,
 			OnServerInvoke = nil :: ((any, ...any) -> ...any)?,
 			clientHandlers = {} :: { [number]: (...any) -> ...any },
+			serverWaiters = {} :: { thread },
+			clientWaiters = {} :: { [number]: { thread } },
 		}
 		serverRpcs[name] = rpc
 		return rpc
+	end
+
+	local function wakeWaiters(list: { thread }?)
+		if list == nil then return end
+		local snap = table.clone(list)
+		table.clear(list)
+		for _, wt in snap do
+			if coroutine.status(wt) == "suspended" then w.scheduler:resume(wt) end
+		end
 	end
 
 	local function invokeAcrossPeers(
@@ -1270,11 +1310,12 @@ function Fabric.attachRemotes(w: any, server: any): any
 		reqMapper: (any) -> any,
 		resMapper: (any) -> any,
 		getHandler: () -> ((...any) -> ...any)?,
+		addHandlerWaiter: ((co: thread) -> ())?,
 		prependArg: (() -> any)?,
 		...: any
 	): ...any
 		if not senderAlive() then error(`RemoteFunction '{name}': sender disconnected`, 0) end
-		local reqPacked = serializeTuple(reqMapper, ...)
+		local reqPacked = serializeTuple(w, reqMapper, ...)
 		if shouldDropPacket(w, false) or not receiverAlive() then
 			error(`RemoteFunction '{name}': connection lost`, 0)
 		end
@@ -1291,19 +1332,26 @@ function Fabric.attachRemotes(w: any, server: any): any
 		local function clearPacket()
 			if w._inflightRemotes ~= nil then w._inflightRemotes[pktId] = nil end
 		end
+		local done = false
+		local replyOk = false
+		local replyData: any = nil
+		local pendingCounted = true
+		local parkedHandlerThread: thread? = nil
+
 		local callerRecord: PendingCaller = {
 			id = nextCallerId,
 			active = true,
 			thread = callerThread,
 			clearPacket = clearPacket,
 		}
-		nextCallerId += 1
-		table.insert(pendingCallers, callerRecord)
-
 		local function removeCaller()
 			if not callerRecord.active then return end
 			callerRecord.active = false
 			clearPacket()
+			if pendingCounted then
+				pendingCounted = false
+				w.pendingRemotes = math.max(0, (w.pendingRemotes or 0) - 1)
+			end
 			for i = #pendingCallers, 1, -1 do
 				if pendingCallers[i] == callerRecord then
 					table.remove(pendingCallers, i)
@@ -1312,16 +1360,25 @@ function Fabric.attachRemotes(w: any, server: any): any
 			end
 		end
 
+		callerRecord.abortIfDead = function()
+			if not callerRecord.active or (senderAlive() and receiverAlive()) then return end
+			done = true
+			replyOk = false
+			replyData = `RemoteFunction '{name}': peer disconnected`
+			local wt = parkedHandlerThread
+			parkedHandlerThread = nil
+			removeCaller()
+			if wt ~= nil and coroutine.status(wt) == "suspended" then w.scheduler:resume(wt) end
+			if coroutine.status(callerThread) == "suspended" then w.scheduler:resume(callerThread) end
+		end
+		nextCallerId += 1
+		table.insert(pendingCallers, callerRecord)
+
 		local reqDelay = (computeRemoteTransit(w))
-		local done = false
-		local replyOk = false
-		local replyData: any = nil
 
 		w.pendingRemotes = (w.pendingRemotes or 0) + 1
 		w.scheduler:after(math.max(0, reqDelay), nil, function()
 			if not callerRecord.active or not senderAlive() or not receiverAlive() then
-				w.pendingRemotes = math.max(0, (w.pendingRemotes or 0) - 1)
-				clearPacket()
 				if callerRecord.active then
 					done = true
 					replyOk = false
@@ -1342,13 +1399,37 @@ function Fabric.attachRemotes(w: any, server: any): any
 
 			receiverSpawn(function()
 				local fn = getHandler()
+				while fn == nil do
+					if not callerRecord.active or not senderAlive() or not receiverAlive() then
+						if callerRecord.active then
+							done = true
+							replyOk = false
+							replyData = `RemoteFunction '{name}': peer disconnected`
+							removeCaller()
+							if coroutine.status(callerThread) == "suspended" then w.scheduler:resume(callerThread) end
+						end
+						return
+					end
+					local waitFn = addHandlerWaiter
+					if waitFn ~= nil then
+						local curThread = coroutine.running()
+						parkedHandlerThread = curThread
+						waitFn(curThread)
+						coroutine.yield()
+						parkedHandlerThread = nil
+						fn = getHandler()
+					else
+						break
+					end
+				end
 				local okCall, resOrErr: any
 				if fn == nil then
 					okCall, resOrErr = true, { n = 0 }
 				else
+					local fnCall = fn :: (...any) -> ...any
 					okCall, resOrErr = pcall(function()
-						if prependArg ~= nil then return packValues(fn(prependArg(), unpackValues(reqPacked))) end
-						return packValues(fn(unpackValues(reqPacked)))
+						if prependArg ~= nil then return packValues(fnCall(prependArg(), unpackValues(reqPacked))) end
+						return packValues(fnCall(unpackValues(reqPacked)))
 					end)
 				end
 
@@ -1363,8 +1444,6 @@ function Fabric.attachRemotes(w: any, server: any): any
 
 				local resDelay = (computeRemoteTransit(w))
 				w.scheduler:after(math.max(0, resDelay), nil, function()
-					w.pendingRemotes = math.max(0, (w.pendingRemotes or 0) - 1)
-					clearPacket()
 					if not callerRecord.active then return end
 					done = true
 					if not senderAlive() or not receiverAlive() or shouldDropPacket(w, false) then
@@ -1375,7 +1454,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 						replyData = format.errorText(resOrErr)
 					else
 						local okSer, serializedOrErr = pcall(
-							function() return serializeTuple(resMapper, unpackValues(resOrErr)) end
+							function() return serializeTuple(w, resMapper, unpackValues(resOrErr)) end
 						)
 						if okSer then
 							replyOk = true
@@ -1406,13 +1485,14 @@ function Fabric.attachRemotes(w: any, server: any): any
 	function net.abortDisconnected()
 		local snapshot = table.clone(pendingCallers)
 		for _, rec in snapshot do
-			if rec.active then
+			if rec.active and rec.abortIfDead ~= nil then
+				rec.abortIfDead()
+			elseif rec.active then
 				rec.active = false
 				if rec.clearPacket ~= nil then rec.clearPacket() end
 				if coroutine.status(rec.thread) == "suspended" then w.scheduler:resume(rec.thread) end
 			end
 		end
-		table.clear(pendingCallers)
 	end
 
 	function net.channel(_self: any, name: string, unreliable: boolean?, client: any?): any
@@ -1423,14 +1503,14 @@ function Fabric.attachRemotes(w: any, server: any): any
 			FireServer = function(_ch: any, ...: any)
 				if not client.connected or client.server ~= server or not server.alive then return end
 				local rawArgs = packValues(...)
-				local validated = serializeTuple(translateClientToServer(client, server), unpackValues(rawArgs))
+				local validated = serializeTuple(w, translateClientToServer(client, server), unpackValues(rawArgs))
 				local firstUsed = false
 				schedulePacket(name, ev.unreliable, "c->s", `{client.name}->{server.name}`, function()
 					if not firstUsed then
 						firstUsed = true
 						return validated
 					end
-					return serializeTuple(translateClientToServer(client, server), unpackValues(rawArgs))
+					return serializeTuple(w, translateClientToServer(client, server), unpackValues(rawArgs))
 				end, function(packed)
 					if not server.alive or not client.connected or client.server ~= server then return end
 					local playerArg = resolveServerPlayer(client)
@@ -1458,6 +1538,14 @@ function Fabric.attachRemotes(w: any, server: any): any
 						translateServerToClient(server, target),
 						translateClientToServer(target, server),
 						function() return rpc.clientHandlers[target.id] end,
+						function(wt: thread)
+							local list = rpc.clientWaiters[target.id]
+							if list == nil then
+								list = {}
+								rpc.clientWaiters[target.id] = list
+							end
+							table.insert(list, wt)
+						end,
 						nil,
 						...
 					)
@@ -1468,7 +1556,10 @@ function Fabric.attachRemotes(w: any, server: any): any
 					return nil
 				end,
 				__newindex = function(_t: any, k: string, v: any)
-					if k == "OnServerInvoke" then rpc.OnServerInvoke = v end
+					if k == "OnServerInvoke" then
+						rpc.OnServerInvoke = v
+						if v ~= nil then wakeWaiters(rpc.serverWaiters) end
+					end
 				end,
 			})
 		end
@@ -1485,6 +1576,7 @@ function Fabric.attachRemotes(w: any, server: any): any
 					translateClientToServer(client, server),
 					translateServerToClient(server, client),
 					function() return rpc.OnServerInvoke end,
+					function(wt: thread) table.insert(rpc.serverWaiters, wt) end,
 					function() return resolveServerPlayer(client) end,
 					...
 				)
@@ -1495,7 +1587,10 @@ function Fabric.attachRemotes(w: any, server: any): any
 				return nil
 			end,
 			__newindex = function(_t: any, k: string, v: any)
-				if k == "OnClientInvoke" then rpc.clientHandlers[client.id] = v end
+				if k == "OnClientInvoke" then
+					rpc.clientHandlers[client.id] = v
+					if v ~= nil then wakeWaiters(rpc.clientWaiters[client.id]) end
+				end
 			end,
 		})
 	end

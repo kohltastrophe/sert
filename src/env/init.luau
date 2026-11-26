@@ -489,6 +489,7 @@ export type Options = {
 	isClient: boolean?,
 	isStudio: boolean?,
 	strict: boolean?,
+	strictRemotes: boolean?,
 	signalBehavior: SignalBehavior?,
 	viewport: any?,
 	creatorId: number?,
@@ -537,6 +538,7 @@ export type Env = {
 	isClient: boolean,
 	isStudio: boolean,
 	strict: boolean,
+	strictRemotes: boolean,
 	signalBehavior: SignalBehavior,
 	now: number,
 	frameRate: number,
@@ -636,6 +638,7 @@ export type EnvNamespace = {
 	new: (options: Options?) -> Env,
 	active: () -> Env?,
 	getService: (selfOrName: any, maybeName: string?) -> any,
+	installGlobals: (target: { [string]: any }?) -> { [string]: any },
 	hooks: { wait: (() -> ())? },
 	isRoblox: boolean,
 	game: any,
@@ -1142,7 +1145,12 @@ local function mountCoreServices(
 			if isClient then
 				if #ctx.renderSteps > 0 then
 					for _, entry in table.clone(ctx.renderSteps) :: { any } do
-						entry.fn(step)
+						if sched ~= nil then
+							sched:spawn(envOwner, coroutine.create(entry.fn), step)
+						else
+							local ok, err = coroutine.resume(coroutine.create(entry.fn), step)
+							if not ok then error(err, 0) end
+						end
 					end
 				end
 				props.PreRender:Fire(step)
@@ -1151,9 +1159,9 @@ local function mountCoreServices(
 			end
 			props.PreAnimation:Fire(step)
 			drainIfSched()
-			props.Stepped:Fire(getClock(), step)
-			drainIfSched()
 			props.PreSimulation:Fire(step)
+			drainIfSched()
+			props.Stepped:Fire(getClock(), step)
 			drainIfSched()
 			props.PostSimulation:Fire(step)
 			drainIfSched()
@@ -1448,7 +1456,7 @@ local function snapshotGuiGeometry(env: any): GeomSnap
 		end
 	end
 	for _, lc in env._layerCollectorList do
-		visitTree(lc)
+		if rawget(lc, "_destroyed") ~= true then visitTree(lc) end
 	end
 	return snap
 end
@@ -1781,6 +1789,7 @@ function Env.new(options: Options?): Env
 		isClient = isClient,
 		isStudio = isStudio,
 		strict = isStrict,
+		strictRemotes = opts.strictRemotes == true,
 		signalBehavior = signalBehavior,
 		frameRate = frameRate,
 		viewport = defaultViewport,
@@ -1970,10 +1979,17 @@ for _, name in DATATYPE_GLOBALS do
 	STATELESS_DATATYPES[name] = true
 end
 
+--- Installs headless Roblox datatype globals (`Vector3`, `CFrame`, `Color3`, `Enum`, `typeof`, etc.) into `target` or the caller/global env. No-op in live Roblox.
+function Env.installGlobals(target: { [string]: any }?): { [string]: any }
+	if IS_ROBLOX then return target or {} end
+	return Datatypes.installGlobals(target)
+end
+
 exportedEnv = setmetatable({
 	new = Env.new,
 	active = Env.active,
 	getService = Env.getService,
+	installGlobals = Env.installGlobals,
 	_beginTest = Env._beginTest,
 	hooks = Env.hooks,
 	_sharedG = Env._sharedG,

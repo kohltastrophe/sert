@@ -344,6 +344,7 @@ local relayout: (inst: any) -> ()
 local flushLayouts: (env: any?) -> ()
 local markGeomSig: (inst: any) -> ()
 local parentDependsOnChildren: (parent: any) -> boolean
+local rebindRemoteSubtree: ((root: any) -> ())? = nil
 
 local NONE = table.freeze({})
 
@@ -397,6 +398,8 @@ export type MemberSpec = {
 	-- The dump's integer type: strict assignments truncate an `int` and round an `int64`, as the engine does.
 	integer: string?,
 	readOnly: boolean?,
+	pluginRead: boolean?,
+	pluginWrite: boolean?,
 	fn: ((...any) -> ...any)?,
 	-- From the API dump with no sert behaviour behind it (a method like this has no `fn`).
 	generated: boolean?,
@@ -436,7 +439,8 @@ local PRIMITIVE_TYPES: { [string]: string } = {
 	string = "string",
 }
 
-local STRING_DATATYPES: { [string]: boolean } = { ContentId = true, ProtectedString = true, BinaryString = true }
+local STRING_DATATYPES: { [string]: boolean } =
+	{ Content = true, ContentId = true, ProtectedString = true, BinaryString = true }
 
 local function generatedProperty(info: Generated.Property): MemberSpec
 	local category, typeName = info.category, info.typeName
@@ -465,6 +469,8 @@ local function generatedProperty(info: Generated.Property): MemberSpec
 		enum = enumName,
 		integer = if category == "Primitive" and (typeName == "int" or typeName == "int64") then typeName else nil,
 		readOnly = info.readOnly,
+		pluginRead = if info.pluginRead then true else nil,
+		pluginWrite = if info.pluginWrite then true else nil,
 		generated = true,
 	}
 end
@@ -505,14 +511,32 @@ local function buildSchema(name: string): ClassSchema?
 			defaults[k] = member.default
 			if member.default ~= nil then dumpDefaults[k] = name end
 		end
-		for k in own.events do
-			members[k] = { kind = "event", default = nil, generated = true }
+		for k, info in own.events do
+			members[k] = {
+				kind = "event",
+				default = nil,
+				pluginRead = if info.plugin then true else nil,
+				pluginWrite = if info.plugin then true else nil,
+				generated = true,
+			}
 		end
-		for k in own.functions do
-			members[k] = { kind = "method", default = nil, generated = true }
+		for k, info in own.functions do
+			members[k] = {
+				kind = "method",
+				default = nil,
+				pluginRead = if info.plugin then true else nil,
+				pluginWrite = if info.plugin then true else nil,
+				generated = true,
+			}
 		end
-		for k in own.callbacks do
-			members[k] = { kind = "property", default = nil, generated = true }
+		for k, info in own.callbacks do
+			members[k] = {
+				kind = "property",
+				default = nil,
+				pluginRead = if info.plugin then true else nil,
+				pluginWrite = if info.plugin then true else nil,
+				generated = true,
+			}
 		end
 	end
 	if spec ~= nil then
@@ -543,7 +567,14 @@ local function buildSchema(name: string): ClassSchema?
 		end
 		local specMethods: { [string]: (...any) -> ...any } = spec.methods or {}
 		for key, fn in specMethods do
-			members[key] = { kind = "method", default = nil, fn = fn }
+			local dumped = members[key]
+			members[key] = {
+				kind = "method",
+				default = nil,
+				fn = fn,
+				pluginRead = if dumped ~= nil then dumped.pluginRead else nil,
+				pluginWrite = if dumped ~= nil then dumped.pluginWrite else nil,
+			}
 		end
 	end
 	local creatable = if inDump
@@ -576,12 +607,14 @@ end
 local ATTRIBUTE_TYPES: { [string]: boolean } = {}
 for _, k in
 	string.split(
-		"boolean number string UDim UDim2 Color3 BrickColor Vector2 Vector3 CFrame Rect NumberRange ColorSequence NumberSequence EnumItem Font Instance",
+		"boolean number string UDim UDim2 Color3 BrickColor Vector2 Vector3 CFrame Rect NumberRange ColorSequence NumberSequence EnumItem Font",
 		" "
 	)
 do
 	ATTRIBUTE_TYPES[k] = true
 end
+
+local function samePropValue(a: any, b: any): boolean return a == b or (a ~= a and b ~= b) end
 
 -- Shared Instance & Class Methods ------------------------------------------------------------------------------------
 
@@ -770,6 +803,7 @@ local function setParent(inst: any, newParent: any?, allowDestroyedDetach: boole
 			end
 		end
 	end
+	if rebindRemoteSubtree ~= nil then (rebindRemoteSubtree :: (root: any) -> ())(inst) end
 	local nowInDataModel = if env ~= nil then isInDataModel(env, inst) else false
 	if oldParent ~= nil then
 		if not rawget(oldParent, "_destroying") then
@@ -918,6 +952,9 @@ LAYOUT_KEYS = {
 	GrowRatio = true,
 	ShrinkRatio = true,
 	ItemLineAlignment = true,
+	IgnoreGuiInset = true,
+	ScreenInsets = true,
+	Rotation = true,
 	HorizontalFlex = true,
 	VerticalFlex = true,
 }
@@ -942,6 +979,7 @@ LAYOUT_MODIFIER_CLASSES = {
 GEOMETRY_PROPS = {
 	AbsoluteSize = true,
 	AbsolutePosition = true,
+	AbsoluteRotation = true,
 	AbsoluteContentSize = true,
 	AbsoluteCellSize = true,
 	AbsoluteCellCount = true,
@@ -989,21 +1027,69 @@ local function axis(dim: any, field: string): (number, number)
 	return part.Scale or 0, part.Offset or 0
 end
 
-local function udimValue(u: any, basis: number): number
-	if u == nil then return 0 end
-	return (u.Scale or 0) * basis + (u.Offset or 0)
+local function safeUiScaleValue(s: any): number
+	if type(s) ~= "number" or s ~= s or s < 0 then return 0 end
+	return s
 end
 
-local function paddingOf(container: any, cw: number, ch: number): (number, number, number, number)
+local function localUiScale(inst: any): number
+	local children = rawget(inst, "_children")
+	if children == nil then return 1 end
+	local factor = 1
+	for _, child in children do
+		if child._props.ClassName == "UIScale" then
+			local s = child._props.Scale
+			if s ~= nil then
+				factor *= safeUiScaleValue(s)
+			end
+		end
+	end
+	return factor
+end
+
+local function ancestorUiScale(node: any): number
+	local factor = 1
+	local cur = rawget(node, "_parent")
+	while cur ~= nil do
+		if isClass(cur._props.ClassName, "GuiBase2d") then
+			factor *= localUiScale(cur)
+		end
+		cur = rawget(cur, "_parent")
+	end
+	return factor
+end
+
+local function ancestorRotation(node: any): number
+	local total = 0
+	local cur = rawget(node, "_parent")
+	while cur ~= nil do
+		if isClass(cur._props.ClassName, "GuiBase2d") then
+			local r = cur._props.Rotation
+			if type(r) == "number" then
+				total += r
+			end
+		end
+		cur = rawget(cur, "_parent")
+	end
+	return total
+end
+
+local function udimValueScaled(u: any, basis: number, offsetScale: number?): number
+	if u == nil then return 0 end
+	return (u.Scale or 0) * basis + (u.Offset or 0) * (offsetScale or 1)
+end
+
+local function paddingOf(container: any, cw: number, ch: number, offsetScale: number?): (number, number, number, number)
 	local children = rawget(container, "_children")
 	if children == nil then return 0, 0, 0, 0 end
+	local s = offsetScale or 1
 	for _, child in children do
 		if child._props.ClassName == "UIPadding" then
 			local p = child._props
-			local left = udimValue(p.PaddingLeft, cw)
-			local right = udimValue(p.PaddingRight, cw)
-			local top = udimValue(p.PaddingTop, ch)
-			local bottom = udimValue(p.PaddingBottom, ch)
+			local left = udimValueScaled(p.PaddingLeft, cw, s)
+			local right = udimValueScaled(p.PaddingRight, cw, s)
+			local top = udimValueScaled(p.PaddingTop, ch, s)
+			local bottom = udimValueScaled(p.PaddingBottom, ch, s)
 			return left, right, top, bottom
 		end
 	end
@@ -1015,10 +1101,13 @@ local function applyObjectConstraints(
 	w: number,
 	h: number,
 	parentW: number?,
-	parentH: number?
+	parentH: number?,
+	inheritedScale: number?,
+	skipLocalScale: boolean?
 ): (number, number)
 	local children = rawget(inst, "_children")
 	if children == nil then return w, h end
+	local inh = if type(inheritedScale) == "number" then safeUiScaleValue(inheritedScale) else 1
 	local scaleFactor = 1
 	local sizeConstraint: any = nil
 	local aspectConstraint: any = nil
@@ -1026,8 +1115,8 @@ local function applyObjectConstraints(
 		local cls = child._props.ClassName
 		if cls == "UIScale" then
 			local s = child._props.Scale
-			if type(s) == "number" then
-				scaleFactor *= s
+			if s ~= nil then
+				scaleFactor *= safeUiScaleValue(s)
 			end
 		elseif cls == "UISizeConstraint" and sizeConstraint == nil then
 			sizeConstraint = child._props
@@ -1038,12 +1127,12 @@ local function applyObjectConstraints(
 	if sizeConstraint ~= nil then
 		local minS = sizeConstraint.MinSize
 		local maxS = sizeConstraint.MaxSize
-		local minX = if minS ~= nil then minS.X else 0
-		local minY = if minS ~= nil then minS.Y else 0
-		local maxX = if maxS ~= nil then maxS.X else math.huge
-		local maxY = if maxS ~= nil then maxS.Y else math.huge
-		w = math.clamp(w, minX, maxX)
-		h = math.clamp(h, minY, maxY)
+		local minX = if minS ~= nil then minS.X * inh else 0
+		local minY = if minS ~= nil then minS.Y * inh else 0
+		local rawMaxX = if maxS ~= nil then (if maxS.X == math.huge then math.huge else maxS.X * inh) else math.huge
+		local rawMaxY = if maxS ~= nil then (if maxS.Y == math.huge then math.huge else maxS.Y * inh) else math.huge
+		w = math.clamp(w, minX, math.max(minX, rawMaxX))
+		h = math.clamp(h, minY, math.max(minY, rawMaxY))
 	end
 	if aspectConstraint ~= nil then
 		local ratio = aspectConstraint.AspectRatio
@@ -1082,8 +1171,10 @@ local function applyObjectConstraints(
 			end
 		end
 	end
-	w *= scaleFactor
-	h *= scaleFactor
+	if skipLocalScale ~= true then
+		w *= scaleFactor
+		h *= scaleFactor
+	end
 	return w, h
 end
 
@@ -1154,25 +1245,29 @@ local RICH_TEXT_ENTITIES: { [string]: string } = {
 	apos = "'",
 }
 
+InstanceDouble.measureText = measureTextWithFontSize
+
 local function stripRichText(rawText: string): string
 	local withNewlines = string.gsub(rawText, "<[bB][rR]%s*/?>", "\n")
 	local noTags = string.gsub(withNewlines, "<[^>]+>", "")
 	return (string.gsub(noTags, "&(%a+);", RICH_TEXT_ENTITIES))
 end
 
-local function updateTypography(inst: any, absSize: any)
+local function updateTypography(inst: any, absSize: any, effScale: number?)
 	local props = inst._props
 	if not TEXT_CLASSES[props.ClassName] then return end
 	local V2 = vectorOf(inst)
 	local rawText = tostring(props.Text or "")
 	local visibleText = if props.RichText == true then stripRichText(rawText) else rawText
 	setGeometry(inst, "ContentText", visibleText)
-	if #visibleText == 0 then
+	local scale = if effScale ~= nil then effScale else 1
+	if #visibleText == 0 or scale <= 0 then
 		setGeometry(inst, "TextBounds", V2.new(0, 0))
 		setGeometry(inst, "TextFits", true)
 		return
 	end
-	local textSize = if type(props.TextSize) == "number" and props.TextSize > 0 then props.TextSize else 14
+	local baseSize = if type(props.TextSize) == "number" and props.TextSize > 0 then props.TextSize else 14
+	local textSize = baseSize * scale
 	local textWrapped = props.TextWrapped == true
 	local textScaled = props.TextScaled == true
 	local availW = if absSize ~= nil then absSize.X else 0
@@ -1201,19 +1296,20 @@ local function updateTypography(inst: any, absSize: any)
 	setGeometry(inst, "TextFits", fits)
 end
 
-local function computeChildSize(inst: any, cw: number, ch: number): any
+local function computeChildSize(inst: any, cw: number, ch: number, inheritedScale: number?): any
 	local props = inst._props
 	local pin = rawget(inst, "_absPin")
 	if pin ~= nil and pin.size ~= nil then return pin.size end
 	local V2 = vectorOf(inst)
+	local s = inheritedScale or 1
 	local sxS, sxO = axis(props.Size, "X")
 	local syS, syO = axis(props.Size, "Y")
 	local sc = enumName(props.SizeConstraint, "RelativeXY")
 	local baseX = if sc == "RelativeYY" then ch else cw
 	local baseY = if sc == "RelativeXX" then cw else ch
-	local w = baseX * sxS + sxO
-	local h = baseY * syS + syO
-	w, h = applyObjectConstraints(inst, w, h, cw, ch)
+	local w = baseX * sxS + sxO * s
+	local h = baseY * syS + syO * s
+	w, h = applyObjectConstraints(inst, w, h, cw, ch, s)
 	return V2.new(w, h)
 end
 
@@ -1251,16 +1347,25 @@ local function containerScrollOffset(container: any): (number, number)
 	return 0, 0
 end
 
-local function computeChildPosition(inst: any, size: any, cx: number, cy: number, cw: number, ch: number): any
+local function computeChildPosition(
+	inst: any,
+	size: any,
+	cx: number,
+	cy: number,
+	cw: number,
+	ch: number,
+	inheritedScale: number?
+): any
 	local props = inst._props
 	local pin = rawget(inst, "_absPin")
 	if pin ~= nil and pin.position ~= nil then return pin.position end
 	local V2 = vectorOf(inst)
+	local s = inheritedScale or 1
 	local pxS, pxO = axis(props.Position, "X")
 	local pyS, pyO = axis(props.Position, "Y")
 	local anchor = props.AnchorPoint
 	local ax, ay = if anchor ~= nil then anchor.X else 0, if anchor ~= nil then anchor.Y else 0
-	return V2.new(cx + cw * pxS + pxO - ax * size.X, cy + ch * pyS + pyO - ay * size.Y)
+	return V2.new(cx + cw * pxS + pxO * s - ax * size.X, cy + ch * pyS + pyO * s - ay * size.Y)
 end
 
 type SortEntry = { child: any, idx: number, order: number, name: string }
@@ -1289,17 +1394,22 @@ local function sortGuiChildren(children: { any }, sortOrder: any): { any }
 	return out
 end
 
-local layoutSubtree: (node: any, positionedByParentLayout: boolean?) -> ()
+local layoutSubtree: (node: any, positionedByParentLayout: boolean?, inheritedScale: number?, parentRot: number?) -> ()
 
-function layoutSubtree(node: any, positionedByParentLayout: boolean?)
+function layoutSubtree(node: any, positionedByParentLayout: boolean?, inheritedScale: number?, parentRot: number?)
 	if rawget(node, "_hasGui") ~= true then return end
 	local props = node._props
 	local className = props.ClassName
 	local V2 = vectorOf(node)
 	local isGuiBase = isClass(className, "GuiBase2d")
 	local isGuiObj = isClass(className, "GuiObject")
+	local inhScale = if inheritedScale ~= nil then inheritedScale else ancestorUiScale(node)
+	local pRot = if parentRot ~= nil then parentRot else ancestorRotation(node)
+	local effScale = inhScale * (if isGuiBase then localUiScale(node) else 1)
+	local absRot = pRot + (if isGuiBase and type(props.Rotation) == "number" then props.Rotation else 0)
 
 	if isGuiBase then
+		setGeometry(node, "AbsoluteRotation", absRot)
 		local pin = rawget(node, "_absPin")
 		if isClass(className, "LayerCollector") then
 			if pin ~= nil and pin.size ~= nil then
@@ -1307,14 +1417,44 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 			else
 				local env = rawget(node, "_env")
 				local parent = rawget(node, "_parent")
+				local baseSize: any = nil
 				if
 					parent ~= nil
 					and isClass(parent._props.ClassName, "BasePlayerGui")
 					and parent._props.AbsoluteSize ~= nil
 				then
-					setGeometry(node, "AbsoluteSize", parent._props.AbsoluteSize)
+					baseSize = parent._props.AbsoluteSize
 				elseif env ~= nil and rawget(env, "_viewport") ~= nil then
-					setGeometry(node, "AbsoluteSize", rawget(env, "_viewport"))
+					baseSize = rawget(env, "_viewport")
+				end
+				if baseSize ~= nil then
+					local screenInsets = props.ScreenInsets
+					local insetName = if screenInsets ~= nil then screenInsets.Name else nil
+					local appliesTopbarInset = props.IgnoreGuiInset ~= true
+						and insetName ~= "None"
+						and insetName ~= "DeviceSafeInsets"
+					if isClass(className, "ScreenGui") and appliesTopbarInset and env ~= nil then
+						local gs = if env._services ~= nil then env._services.GuiService else nil
+						if gs == nil and env.getService ~= nil then
+							local okGs, svc = pcall(env.getService, env, "GuiService")
+							if okGs then gs = svc end
+						end
+						if gs ~= nil then
+							local guiSvc: any = gs
+							local okInset, topLeftAny, bottomRightAny = pcall(
+								function(): (any, any) return guiSvc:GetGuiInset() end
+							)
+							if okInset and topLeftAny ~= nil then
+								local tl: any = topLeftAny
+								local br: any = bottomRightAny
+								local brX = if br ~= nil then br.X else 0
+								local brY = if br ~= nil then br.Y else 0
+								baseSize =
+									V2.new(math.max(0, baseSize.X - tl.X - brX), math.max(0, baseSize.Y - tl.Y - brY))
+							end
+						end
+					end
+					setGeometry(node, "AbsoluteSize", baseSize)
 				end
 			end
 			if pin ~= nil and pin.position ~= nil then setGeometry(node, "AbsolutePosition", pin.position) end
@@ -1325,21 +1465,21 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 			local cw, ch = if cs ~= nil then cs.X else 0, if cs ~= nil then cs.Y else 0
 			local cx, cy = if cp ~= nil then cp.X else 0, if cp ~= nil then cp.Y else 0
 			if container ~= nil then
-				local pL, pR, pT, pB = paddingOf(container, cw, ch)
+				local pL, pR, pT, pB = paddingOf(container, cw, ch, inhScale)
 				local sX, sY = containerScrollOffset(container)
 				cx += pL - sX
 				cy += pT - sY
 				cw = math.max(0, cw - pL - pR)
 				ch = math.max(0, ch - pT - pB)
 			end
-			local size = computeChildSize(node, cw, ch)
-			local pos = computeChildPosition(node, size, cx, cy, cw, ch)
+			local size = computeChildSize(node, cw, ch, inhScale)
+			local pos = computeChildPosition(node, size, cx, cy, cw, ch, inhScale)
 			setGeometry(node, "AbsoluteSize", size)
 			setGeometry(node, "AbsolutePosition", pos)
 		end
 	end
 
-	if TEXT_CLASSES[className] then updateTypography(node, props.AbsoluteSize) end
+	if TEXT_CLASSES[className] then updateTypography(node, props.AbsoluteSize, effScale) end
 
 	local children = rawget(node, "_children")
 	local listLayout: any = nil
@@ -1362,7 +1502,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 	local absPos = props.AbsolutePosition or V2.new(0, 0)
 	local padLeft, padRight, padTop, padBottom = 0, 0, 0, 0
 	if isGuiBase then
-		padLeft, padRight, padTop, padBottom = paddingOf(node, absSize.X, absSize.Y)
+		padLeft, padRight, padTop, padBottom = paddingOf(node, absSize.X, absSize.Y, effScale)
 	end
 	local scrollOffX, scrollOffY = containerScrollOffset(node)
 	local contentX = absPos.X + padLeft - scrollOffX
@@ -1386,9 +1526,11 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 		end
 		local ordered = sortGuiChildren(visibleGuiChildren, listLayout._props.SortOrder)
 		for _, child in ordered do
-			local cSize = computeChildSize(child, contentW, contentH)
+			local cSize = computeChildSize(child, contentW, contentH, effScale)
 			setGeometry(child, "AbsoluteSize", cSize)
-			if enumName(child._props.AutomaticSize, "None") ~= "None" then layoutSubtree(child, true) end
+			if enumName(child._props.AutomaticSize, "None") ~= "None" then
+				layoutSubtree(child, true, effScale, absRot)
+			end
 		end
 		local lProps = listLayout._props
 		local isHoriz = enumName(lProps.FillDirection, "Vertical") == "Horizontal"
@@ -1397,7 +1539,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 		local mainFlex = enumName(if isHoriz then lProps.HorizontalFlex else lProps.VerticalFlex, "None")
 		local wraps = lProps.Wraps == true
 		local mainAvail = if isHoriz then contentW else contentH
-		local gap = udimValue(lProps.Padding, mainAvail)
+		local gap = udimValueScaled(lProps.Padding, mainAvail, effScale)
 
 		type Line = { items: { any }, mainSpan: number, crossSpan: number }
 		local lines: { Line } = {}
@@ -1450,9 +1592,13 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 							else
 								newH = math.max(0, newH + adj)
 							end
-							newW, newH = applyObjectConstraints(child, newW, newH, contentW, contentH)
+							local childEffScale = effScale * localUiScale(child)
+							newW, newH =
+								applyObjectConstraints(child, newW, newH, contentW, contentH, childEffScale, true)
 							setGeometry(child, "AbsoluteSize", V2.new(newW, newH))
-							if TEXT_CLASSES[child._props.ClassName] then updateTypography(child, V2.new(newW, newH)) end
+							if TEXT_CLASSES[child._props.ClassName] then
+								updateTypography(child, V2.new(newW, newH), childEffScale)
+							end
 						end
 						line.mainSpan += if isHoriz then newW else newH
 						local cCross = if isHoriz then newH else newW
@@ -1518,14 +1664,14 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 					end
 					setGeometry(child, "AbsolutePosition", V2.new(cx, cy))
 				end
-				layoutSubtree(child, true)
+				layoutSubtree(child, true, effScale, absRot)
 				mainCursor += (if isHoriz then cs.X else cs.Y) + gap
 			end
 			crossCursor += line.crossSpan + gap
 		end
 
 		for _, child in otherChildren do
-			layoutSubtree(child, false)
+			layoutSubtree(child, false, effScale, absRot)
 		end
 	elseif isGuiBase and gridLayout ~= nil and children ~= nil then
 		local visibleGuiChildren: { any } = {}
@@ -1545,12 +1691,12 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 		local ordered = sortGuiChildren(visibleGuiChildren, gProps.SortOrder)
 		local csX_S, csX_O = axis(gProps.CellSize, "X")
 		local csY_S, csY_O = axis(gProps.CellSize, "Y")
-		local cellW = contentW * csX_S + csX_O
-		local cellH = contentH * csY_S + csY_O
+		local cellW = contentW * csX_S + csX_O * effScale
+		local cellH = contentH * csY_S + csY_O * effScale
 		local cpX_S, cpX_O = axis(gProps.CellPadding, "X")
 		local cpY_S, cpY_O = axis(gProps.CellPadding, "Y")
-		local padX = contentW * cpX_S + cpX_O
-		local padY = contentH * cpY_S + cpY_O
+		local padX = contentW * cpX_S + cpX_O * effScale
+		local padY = contentH * cpY_S + cpY_O * effScale
 		local isVert = enumName(gProps.FillDirection, "Horizontal") == "Vertical"
 		local maxCells = gProps.FillDirectionMaxCells or 0
 		local cols: number
@@ -1594,7 +1740,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 			local row = if flipY and usedRows > 0 then (usedRows - 1) - row0 else row0
 			local pin = rawget(child, "_absPin")
 			if pin == nil or pin.size == nil then
-				local cw, ch = applyObjectConstraints(child, cellW, cellH, cellW, cellH)
+				local cw, ch = applyObjectConstraints(child, cellW, cellH, cellW, cellH, effScale)
 				setGeometry(child, "AbsoluteSize", V2.new(cw, ch))
 			end
 			if pin == nil or pin.position == nil then
@@ -1602,11 +1748,11 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 				local cy = startY + row * (cellH + padY)
 				setGeometry(child, "AbsolutePosition", V2.new(cx, cy))
 			end
-			layoutSubtree(child, true)
+			layoutSubtree(child, true, effScale, absRot)
 		end
 
 		for _, child in otherChildren do
-			layoutSubtree(child, false)
+			layoutSubtree(child, false, effScale, absRot)
 		end
 	elseif isGuiBase and pageLayout ~= nil and children ~= nil then
 		local visibleGuiChildren: { any } = {}
@@ -1633,7 +1779,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 			local hAlign = enumName(plProps.HorizontalAlignment, "Left")
 			local vAlign = enumName(plProps.VerticalAlignment, "Top")
 			local padBasis = if isHoriz then contentW else contentH
-			local padPx = udimValue(plProps.Padding, padBasis)
+			local padPx = udimValueScaled(plProps.Padding, padBasis, effScale)
 			local circular = plProps.Circular == true
 
 			local curPage = plProps.CurrentPage
@@ -1658,7 +1804,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 						rel += n
 					end
 				end
-				local sz = computeChildSize(child, contentW, contentH)
+				local sz = computeChildSize(child, contentW, contentH, effScale)
 				local pin = rawget(child, "_absPin")
 				if pin ~= nil and pin.size ~= nil then sz = pin.size end
 				setGeometry(child, "AbsoluteSize", sz)
@@ -1676,7 +1822,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 						else slotY
 					setGeometry(child, "AbsolutePosition", V2.new(px, py))
 				end
-				layoutSubtree(child, true)
+				layoutSubtree(child, true, effScale, absRot)
 			end
 			local totalW = if isHoriz then math.max(0, n * contentW + math.max(0, n - 1) * padPx) else contentW
 			local totalH = if not isHoriz then math.max(0, n * contentH + math.max(0, n - 1) * padPx) else contentH
@@ -1684,11 +1830,11 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 		end
 
 		for _, child in otherChildren do
-			layoutSubtree(child, false)
+			layoutSubtree(child, false, effScale, absRot)
 		end
 	elseif children ~= nil then
 		for _, child in children do
-			layoutSubtree(child, false)
+			layoutSubtree(child, false, effScale, absRot)
 		end
 	end
 
@@ -1703,9 +1849,15 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 			if TEXT_CLASSES[className] then
 				local rawText = tostring(props.Text or "")
 				local visibleText = if props.RichText == true then stripRichText(rawText) else rawText
-				local textSize = if type(props.TextSize) == "number" and props.TextSize > 0 then props.TextSize else 14
+				local baseTextSize = if type(props.TextSize) == "number" and props.TextSize > 0
+					then props.TextSize
+					else 14
+				local textSize = baseTextSize * effScale
 				local wrapForMeasure = props.TextWrapped == true and not autoX
-				local tw, th = measureTextWithFontSize(visibleText, textSize, wrapForMeasure, contentW)
+				local tw, th = 0, 0
+				if textSize > 0 then
+					tw, th = measureTextWithFontSize(visibleText, textSize, wrapForMeasure, contentW)
+				end
 				reqW = math.max(reqW, tw)
 				reqH = math.max(reqH, th)
 			end
@@ -1742,7 +1894,7 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 			local curSize = props.AbsoluteSize or V2.new(0, 0)
 			local newW = if autoX then math.max(curSize.X, reqW + padLeft + padRight) else curSize.X
 			local newH = if autoY then math.max(curSize.Y, reqH + padTop + padBottom) else curSize.Y
-			newW, newH = applyObjectConstraints(node, newW, newH)
+			newW, newH = applyObjectConstraints(node, newW, newH, nil, nil, effScale, true)
 			if newW ~= curSize.X or newH ~= curSize.Y then
 				local newSize = V2.new(newW, newH)
 				setGeometry(node, "AbsoluteSize", newSize)
@@ -1753,16 +1905,16 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 					local cw, ch = if cs ~= nil then cs.X else 0, if cs ~= nil then cs.Y else 0
 					local cx, cy = if cp ~= nil then cp.X else 0, if cp ~= nil then cp.Y else 0
 					if container ~= nil then
-						local pL, pR, pT, pB = paddingOf(container, cw, ch)
+						local pL, pR, pT, pB = paddingOf(container, cw, ch, inhScale)
 						local sX, sY = containerScrollOffset(container)
 						cx += pL - sX
 						cy += pT - sY
 						cw = math.max(0, cw - pL - pR)
 						ch = math.max(0, ch - pT - pB)
 					end
-					setGeometry(node, "AbsolutePosition", computeChildPosition(node, newSize, cx, cy, cw, ch))
+					setGeometry(node, "AbsolutePosition", computeChildPosition(node, newSize, cx, cy, cw, ch, inhScale))
 				end
-				if TEXT_CLASSES[className] then updateTypography(node, newSize) end
+				if TEXT_CLASSES[className] then updateTypography(node, newSize, effScale) end
 			end
 		end
 	end
@@ -1773,8 +1925,8 @@ function layoutSubtree(node: any, positionedByParentLayout: boolean?)
 		setGeometry(node, "AbsoluteWindowSize", curSize)
 		local csX_S, csX_O = axis(props.CanvasSize, "X")
 		local csY_S, csY_O = axis(props.CanvasSize, "Y")
-		local canvasW = curSize.X * csX_S + csX_O
-		local canvasH = curSize.Y * csY_S + csY_O
+		local canvasW = curSize.X * csX_S + csX_O * effScale
+		local canvasH = curSize.Y * csY_S + csY_O * effScale
 		local acMode = enumName(props.AutomaticCanvasSize, "None")
 		local acX = acMode == "X" or acMode == "XY"
 		local acY = acMode == "Y" or acMode == "XY"
@@ -1998,6 +2150,8 @@ function BaseMethods.GetFullName(self: any): string
 	return table.concat(parts, ".")
 end
 
+function BaseMethods.GetDebugId(self: any, _scopeLength: number?): string return tostring(rawget(self, "_id") or 0) end
+
 function BaseMethods.GetChildren(self: any): { any }
 	local children = rawget(self, "_children")
 	return if children ~= nil then table.clone(children) else {}
@@ -2062,14 +2216,18 @@ function BaseMethods.WaitForChild(self: any, name: string, timeOut: number?): an
 			if found ~= nil then return found end
 		end
 	end
+	if rawget(self, "_destroyed") == true then return nil end
+	if timeOut ~= nil and timeOut <= 0 then return nil end
 	if env == nil then
 		if not coroutine.isyieldable() then return nil end
 		local arrived = Signal.new()
 		local conn = self.ChildAdded:Connect(function(child: any)
 			if child._props.Name == name then arrived:Fire(child) end
 		end)
+		local destroyConn = self.Destroying:Connect(function() arrived:Fire(nil) end)
 		local result = arrived:Wait()
 		conn:Disconnect()
+		destroyConn:Disconnect()
 		return result
 	end
 	local makeImmediate: ((any) -> any)? = env._immediateSignal
@@ -2077,6 +2235,7 @@ function BaseMethods.WaitForChild(self: any, name: string, timeOut: number?): an
 	local conn = self.ChildAdded:Connect(function(child: any)
 		if child._props.Name == name then arrived:Fire(child) end
 	end)
+	local destroyConn = self.Destroying:Connect(function() arrived:Fire(nil) end)
 	local timer: thread? = nil
 	local warnTimer: thread? = nil
 	if timeOut ~= nil then
@@ -2108,6 +2267,7 @@ function BaseMethods.WaitForChild(self: any, name: string, timeOut: number?): an
 		failure = nil
 	end
 	conn:Disconnect()
+	destroyConn:Disconnect()
 	if timer ~= nil then env.task.cancel(timer) end
 	if warnTimer ~= nil then env.task.cancel(warnTimer) end
 	if failure ~= nil then
@@ -2177,7 +2337,7 @@ local function destroyNode(self: any, parentDestroying: boolean?)
 	if rawget(self, "_destroyed") == true or rawget(self, "_destroying") == true then return end
 	rawset(self, "_destroying", true)
 	local sigs = rawget(self, "_signals")
-	if sigs ~= nil and sigs.Destroying ~= nil then sigs.Destroying:Fire() end
+	if sigs ~= nil and sigs.Destroying ~= nil then sigs.Destroying:FireImmediate() end
 	local oldParent = rawget(self, "_parent")
 	if oldParent ~= nil then
 		if not parentDestroying then
@@ -2208,7 +2368,18 @@ local function destroyNode(self: any, parentDestroying: boolean?)
 			if rawget(child, "_parent") == self then destroyNode(child, true) end
 		end
 	end
-	if env ~= nil and env._focusedBox == self then env._focusedBox = nil end
+	if env ~= nil then
+		if env._focusedBox == self then env._focusedBox = nil end
+		local collectors = env._layerCollectors
+		if collectors ~= nil and collectors[self] then
+			collectors[self] = nil
+			local lcList = env._layerCollectorList
+			if lcList ~= nil then
+				local idx = table.find(lcList, self)
+				if idx ~= nil then table.remove(lcList, idx) end
+			end
+		end
+	end
 	rawset(self, "_destroyed", true)
 	rawset(self, "_destroying", nil)
 	Audio.onInstanceDestroy(self)
@@ -2225,6 +2396,17 @@ local function destroyNode(self: any, parentDestroying: boolean?)
 				conn:Disconnect()
 			end
 			table.clear(bound)
+		end
+	end
+	local rpcWaiters = rawget(self, "_rpcWaiters")
+	if type(rpcWaiters) == "table" then
+		for propKey, waiters in rpcWaiters do
+			rpcWaiters[propKey] = nil
+			if env ~= nil and env._sched ~= nil then
+				for _, wt in waiters do
+					if coroutine.status(wt) == "suspended" then env._sched:resume(wt) end
+				end
+			end
 		end
 	end
 	local boundRpcName = rawget(self, "_boundRpcName")
@@ -2374,7 +2556,13 @@ function BaseMethods.Clone(self: any): any
 	for srcInst, copyInst in clonedMap do
 		for k, v in srcInst._props do
 			if k ~= "ClassName" and k ~= "Parent" and customTypeof(v) == "Instance" then
-				copyInst._props[k] = clonedMap[v] or v
+				if clonedMap[v] ~= nil then
+					copyInst._props[k] = clonedMap[v]
+				elseif v == self or BaseMethods.IsDescendantOf(v, self) then
+					copyInst._props[k] = NONE
+				else
+					copyInst._props[k] = v
+				end
 			end
 		end
 		local copyAttrs = rawget(copyInst, "_attributes")
@@ -2446,7 +2634,7 @@ function BaseMethods.SetAttribute(self: any, attr: string, value: any)
 		rawset(self, "_attributes", attrs)
 	end
 	local old = attrs[attr]
-	if old ~= value then
+	if not samePropValue(old, value) then
 		attrs[attr] = value
 		local env = rawget(self, "_env")
 		local aSigs = rawget(self, "_attrSignals")
@@ -3029,12 +3217,63 @@ local function getNetFor(inst: any): (any?, any?)
 	return srv._net, env.client
 end
 
+local function remoteChannelKey(inst: any): string
+	local env = rawget(inst, "_env")
+	local sourceOf = if env ~= nil then rawget(env, "_sourceOf") else nil
+	local canonical = if sourceOf ~= nil and sourceOf[inst] ~= nil then sourceOf[inst] else inst
+	local okFull, fullName = pcall(function() return canonical:GetFullName() end)
+	local base = if okFull
+			and type(fullName) == "string"
+			and fullName ~= ""
+		then fullName
+		else (canonical._props.Name or "")
+	return `{canonical._props.ClassName}:{base}`
+end
+
+local function wakeRpcWaiters(inst: any, prop: string)
+	local rpcWaiters = rawget(inst, "_rpcWaiters")
+	if type(rpcWaiters) ~= "table" then return end
+	local list = rpcWaiters[prop]
+	if list == nil then return end
+	rpcWaiters[prop] = nil
+	local env = rawget(inst, "_env")
+	local sched = if env ~= nil then env._sched else nil
+	if sched ~= nil then
+		for _, wt in list do
+			if coroutine.status(wt) == "suspended" then sched:resume(wt) end
+		end
+	end
+end
+
+local function remoteSerializeOpts(inst: any, serverToClient: boolean): Serialize.RemoteOptions
+	local env = rawget(inst, "_env")
+	local gameInst = if env ~= nil then env.game else nil
+	return {
+		allowInstances = true,
+		strict = if env ~= nil and env.strictRemotes == true then true else false,
+		mapInstance = function(target: any): any
+			if type(target) ~= "table" then return target end
+			if rawget(target, "_parent") == nil and target ~= gameInst then return nil end
+			if serverToClient then
+				local cur: any = target
+				while cur ~= nil do
+					local props = rawget(cur, "_props")
+					local cn = if props ~= nil then props.ClassName else nil
+					if cn == "ServerStorage" or cn == "ServerScriptService" then return nil end
+					cur = rawget(cur, "_parent")
+				end
+			end
+			return target
+		end,
+	}
+end
+
 local function ensureRemoteBound(inst: any)
 	local className = inst._props.ClassName
 	if className ~= "RemoteEvent" and className ~= "UnreliableRemoteEvent" and className ~= "RemoteFunction" then
 		return
 	end
-	local name = inst._props.Name
+	local name = remoteChannelKey(inst)
 	local net, client = getNetFor(inst)
 	if net == nil then return end
 	if className == "RemoteEvent" or className == "UnreliableRemoteEvent" then
@@ -3061,7 +3300,7 @@ local function ensureRemoteBound(inst: any)
 				end
 				if not boundMap[name] then
 					boundMap[name] = chSig:Connect(function(...: any)
-						if inst._props.Name == name and not rawget(inst, "_destroyed") then sig:Fire(...) end
+						if remoteChannelKey(inst) == name and not rawget(inst, "_destroyed") then sig:Fire(...) end
 					end)
 				end
 			end
@@ -3091,7 +3330,7 @@ local function ensureRemoteBound(inst: any)
 				local wrapped: ((...any) -> ...any)? = nil
 				if rawCb ~= nil and not rawget(inst, "_destroyed") then
 					wrapped = function(...: any): ...any
-						if rawget(inst, "_destroyed") or inst._props.Name ~= name then return nil end
+						if rawget(inst, "_destroyed") or remoteChannelKey(inst) ~= name then return nil end
 						local cb: ((...any) -> ...any)? = if client == nil
 							then inst._props.OnServerInvoke
 							else inst._props.OnClientInvoke
@@ -3113,12 +3352,49 @@ end
 
 InstanceDouble.ensureRemoteBound = ensureRemoteBound
 
+local function rebindRemoteNode(inst: any)
+	local className = inst._props.ClassName
+	if className == "RemoteEvent" or className == "UnreliableRemoteEvent" or className == "RemoteFunction" then
+		ensureRemoteBound(inst)
+		local env = rawget(inst, "_env")
+		local ctx = if env ~= nil then rawget(env, "_ctx") else nil
+		local getClients = if ctx ~= nil then ctx.getAttachedClientEnvs else nil
+		if type(getClients) == "function" then
+			for _, cliEnv in getClients() do
+				local mirrorOf = rawget(cliEnv, "_mirrorOf")
+				local cliInst = if mirrorOf ~= nil then mirrorOf[inst] else nil
+				if cliInst ~= nil and not rawget(cliInst, "_destroyed") then ensureRemoteBound(cliInst) end
+			end
+		end
+	end
+end
+
+local function rebindRemoteSubtreeImpl(root: any)
+	rebindRemoteNode(root)
+	local children = rawget(root, "_children")
+	if children ~= nil then
+		for _, child in children do
+			rebindRemoteSubtreeImpl(child)
+		end
+	end
+end
+rebindRemoteSubtree = rebindRemoteSubtreeImpl
+
 local function remoteChannel(self: any): (any, any)
 	local net, client = getNetFor(self)
 	if net ~= nil then
-		return net:channel(self._props.Name, self._props.ClassName == "UnreliableRemoteEvent", client), client
+		return net:channel(remoteChannelKey(self), self._props.ClassName == "UnreliableRemoteEvent", client), client
 	end
 	return nil, nil
+end
+
+local function exceedsUnreliableCap(self: any, packed: { any }, packedN: number): boolean
+	if self._props.ClassName ~= "UnreliableRemoteEvent" then return false end
+	local box: { [number]: any, n: number } = { n = packedN }
+	for i = 1, packedN do
+		box[i] = packed[i]
+	end
+	return Serialize.estimateRemoteBytes(box) > 900
 end
 
 local function fireClientChannel(self: any, method: string, stripFirstOnFallback: boolean, ...: any)
@@ -3130,16 +3406,19 @@ local function fireClientChannel(self: any, method: string, stripFirstOnFallback
 	end
 	local env = rawget(self, "_env")
 	local handler: ((any, string, ...any) -> ...any)? = if env ~= nil then env.remoteHandler else nil
+	local serOpts = remoteSerializeOpts(self, true)
 	if stripFirstOnFallback then
 		local player = select(1, ...)
-		local packed, packedN = Serialize.remoteTuple({ allowInstances = true }, select(2, ...))
+		local packed, packedN = Serialize.remoteTuple(serOpts, select(2, ...))
+		if exceedsUnreliableCap(self, packed, packedN) then return end
 		if handler ~= nil then
 			handler(self, method, player, table.unpack(packed, 1, packedN))
 		else
 			getSignal(self, "OnClientEvent"):Fire(table.unpack(packed, 1, packedN))
 		end
 	else
-		local packed, packedN = Serialize.remoteTuple({ allowInstances = true }, ...)
+		local packed, packedN = Serialize.remoteTuple(serOpts, ...)
+		if exceedsUnreliableCap(self, packed, packedN) then return end
 		if handler ~= nil then
 			handler(self, method, table.unpack(packed, 1, packedN))
 		else
@@ -3155,7 +3434,8 @@ local RemoteEventMethods = {
 			(ch.FireServer :: any)(ch, ...)
 		else
 			local env = rawget(self, "_env")
-			local packed, packedN = Serialize.remoteTuple({ allowInstances = true }, ...)
+			local packed, packedN = Serialize.remoteTuple(remoteSerializeOpts(self, false), ...)
+			if exceedsUnreliableCap(self, packed, packedN) then return end
 			local handler: ((any, string, ...any) -> ...any)? = if env ~= nil then env.remoteHandler else nil
 			if handler ~= nil then
 				handler(self, "FireServer", table.unpack(packed, 1, packedN))
@@ -3175,39 +3455,56 @@ local function invokeRemote(self: any, method: string, prop: string, withPlayer:
 	if rawget(self, "_destroyed") then return nil end
 	local net, client = getNetFor(self)
 	if net ~= nil and net.rpc ~= nil then
-		local rpc: any = (net.rpc :: any)(net, self._props.Name, client)
+		local rpc: any = (net.rpc :: any)(net, remoteChannelKey(self), client)
 		if rpc ~= nil and rpc[method] ~= nil then return (rpc[method] :: any)(rpc, ...) end
 	end
 	local env = rawget(self, "_env")
 	local handler: ((any, string, ...any) -> ...any)? = if env ~= nil then env.remoteHandler else nil
+	local reqOpts = remoteSerializeOpts(self, not withPlayer)
+	local resOpts = remoteSerializeOpts(self, withPlayer)
 	if handler ~= nil then
 		if withPlayer then
-			local req, reqN = Serialize.remoteTuple({ allowInstances = true }, ...)
-			local res, resN =
-				Serialize.remoteTuple({ allowInstances = true }, handler(self, method, table.unpack(req, 1, reqN)))
+			local req, reqN = Serialize.remoteTuple(reqOpts, ...)
+			local res, resN = Serialize.remoteTuple(resOpts, handler(self, method, table.unpack(req, 1, reqN)))
 			return table.unpack(res, 1, resN)
 		else
 			local player = select(1, ...)
-			local req, reqN = Serialize.remoteTuple({ allowInstances = true }, select(2, ...))
-			local res, resN = Serialize.remoteTuple(
-				{ allowInstances = true },
-				handler(self, method, player, table.unpack(req, 1, reqN))
-			)
+			local req, reqN = Serialize.remoteTuple(reqOpts, select(2, ...))
+			local res, resN = Serialize.remoteTuple(resOpts, handler(self, method, player, table.unpack(req, 1, reqN)))
 			return table.unpack(res, 1, resN)
 		end
 	end
 	local cb: ((...any) -> ...any)? = self._props[prop]
-	if cb == nil then return nil end
+	while cb == nil do
+		if rawget(self, "_destroyed") then return nil end
+		local sched = if env ~= nil then env._sched else nil
+		if sched ~= nil and sched:running() and coroutine.isyieldable() then
+			local waiterMap = rawget(self, "_rpcWaiters")
+			if waiterMap == nil then
+				waiterMap = {}
+				rawset(self, "_rpcWaiters", waiterMap)
+			end
+			local list = waiterMap[prop]
+			if list == nil then
+				list = {}
+				waiterMap[prop] = list
+			end
+			table.insert(list, coroutine.running())
+			sched:park()
+			cb = self._props[prop]
+		else
+			return nil
+		end
+	end
+	local handlerFn = cb :: (...any) -> ...any
 	if withPlayer then
-		local req, reqN = Serialize.remoteTuple({ allowInstances = true }, ...)
-		local res, resN = Serialize.remoteTuple(
-			{ allowInstances = true },
-			cb(if env then env.LocalPlayer else nil, table.unpack(req, 1, reqN))
-		)
+		local req, reqN = Serialize.remoteTuple(reqOpts, ...)
+		local res, resN =
+			Serialize.remoteTuple(resOpts, handlerFn(if env then env.LocalPlayer else nil, table.unpack(req, 1, reqN)))
 		return table.unpack(res, 1, resN)
 	end
-	local req, reqN = Serialize.remoteTuple({ allowInstances = true }, select(2, ...))
-	local res, resN = Serialize.remoteTuple({ allowInstances = true }, cb(table.unpack(req, 1, reqN)))
+	local req, reqN = Serialize.remoteTuple(reqOpts, select(2, ...))
+	local res, resN = Serialize.remoteTuple(resOpts, handlerFn(table.unpack(req, 1, reqN)))
 	return table.unpack(res, 1, resN)
 end
 
@@ -3710,7 +4007,7 @@ defClass("GuiService", {
 		ReducedMotionEnabled = false,
 		SelectedObject = NONE,
 		ViewportDisplaySize = Enum.DisplaySize.Medium,
-		TopbarInset = Rect.new(0, 0, 1280, 36),
+		TopbarInset = Rect.new(0, 0, 1280, 58),
 		AutoSelectGuiEnabled = true,
 		GuiNavigationEnabled = true,
 		TouchControlsEnabled = true,
@@ -3832,6 +4129,9 @@ function InstanceMeta.__index(self: any, key: any): any
 	local isStrict = isStrictEnv(env)
 
 	if member ~= nil then
+		if isStrict and member.pluginRead == true and not (env ~= nil and env.isStudio == true) then
+			error(`The current thread cannot access '{tostring(key)}' (lacking capability Plugin)`, 2)
+		end
 		if member.kind == "method" then
 			if member.fn ~= nil then return member.fn end
 		elseif member.kind == "event" then
@@ -3923,6 +4223,7 @@ local function syncCoupledProps(
 ): (string?, any, string?, any)
 	local typeofFn = if dt ~= nil and dt.typeof ~= nil then dt.typeof else customTypeof
 	local cfLib = if dt ~= nil and dt.CFrame ~= nil then dt.CFrame else CFrame
+	local enumLib = if dt ~= nil and dt.Enum ~= nil then dt.Enum else Datatypes.Enum
 	local coupledKey1: string?, coupledVal1: any = nil, nil
 	local coupledKey2: string?, coupledVal2: any = nil, nil
 	if className == "Humanoid" and key == "MaxHealth" and type(value) == "number" then
@@ -3930,6 +4231,24 @@ local function syncCoupledProps(
 		if type(health) == "number" and health > math.max(value, 0) then
 			props.Health = math.max(value, 0)
 			coupledKey1, coupledVal1 = "Health", props.Health
+		end
+	elseif className == "ScreenGui" and key == "IgnoreGuiInset" and type(value) == "boolean" then
+		local curName = enumName(props.ScreenInsets, "CoreUISafeInsets")
+		if value == true and (curName == "CoreUISafeInsets" or curName == "TopbarSafeInsets") then
+			props.ScreenInsets = enumLib.ScreenInsets.DeviceSafeInsets
+			coupledKey1, coupledVal1 = "ScreenInsets", props.ScreenInsets
+		elseif value == false and (curName == "None" or curName == "DeviceSafeInsets") then
+			props.ScreenInsets = enumLib.ScreenInsets.CoreUISafeInsets
+			coupledKey1, coupledVal1 = "ScreenInsets", props.ScreenInsets
+		end
+	elseif className == "ScreenGui" and key == "ScreenInsets" then
+		local insetName = enumName(value, "")
+		if insetName ~= "" then
+			local nextIgnore = insetName == "None" or insetName == "DeviceSafeInsets"
+			if props.IgnoreGuiInset ~= nextIgnore then
+				props.IgnoreGuiInset = nextIgnore
+				coupledKey1, coupledVal1 = "IgnoreGuiInset", nextIgnore
+			end
 		end
 	elseif key == "CFrame" and isClass(className, "BasePart") and typeofFn(value) == "CFrame" then
 		if props.Position ~= value.Position then
@@ -3988,6 +4307,8 @@ function InstanceMeta.__newindex(self: any, key: any, value: any)
 	if isStrict then
 		if member == nil then
 			error(`{tostring(key)} is not a valid member of {className} "{self:GetFullName()}"`, 2)
+		elseif member.pluginWrite == true and not (env ~= nil and env.isStudio == true) then
+			error(`The current thread cannot write '{tostring(key)}' (lacking capability Plugin)`, 2)
 		elseif member.kind ~= "property" or (member.readOnly and not rawget(self, "_replicating")) then
 			error(`Unable to assign property {key}. Property is read only`, 2)
 		end
@@ -4023,6 +4344,8 @@ function InstanceMeta.__newindex(self: any, key: any, value: any)
 	local isHumanoid = className == "Humanoid"
 	if isHumanoid and key == "Health" and type(value) == "number" then
 		value = math.clamp(value, 0, math.max(props.MaxHealth or 100, 0))
+	elseif className == "UIScale" and key == "Scale" and type(value) == "number" then
+		value = safeUiScaleValue(value)
 	end
 
 	local old = props[key]
@@ -4031,12 +4354,17 @@ function InstanceMeta.__newindex(self: any, key: any, value: any)
 
 	local coupledKey1, coupledVal1, coupledKey2, coupledVal2 = syncCoupledProps(className, props, key, value, dt)
 
-	if key == "Name" or key == "OnServerInvoke" or key == "OnClientInvoke" then ensureRemoteBound(self) end
+	if key == "Name" then
+		rebindRemoteSubtreeImpl(self)
+	elseif key == "OnServerInvoke" or key == "OnClientInvoke" then
+		ensureRemoteBound(self)
+	end
+	if (key == "OnServerInvoke" or key == "OnClientInvoke") and value ~= nil then wakeRpcWaiters(self, key) end
 
 	local onPropSet: ((string, any) -> ())? = rawget(self, "_onPropSet")
 	if onPropSet ~= nil then onPropSet(key, value) end
 	rawset(self, "_replicating", nil)
-	if old ~= value then
+	if not samePropValue(old, value) then
 		if LAYOUT_KEYS[key] and (isClass(className, "GuiBase2d") or LAYOUT_MODIFIER_CLASSES[className]) then
 			relayout(self)
 		end

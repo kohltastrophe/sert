@@ -13,6 +13,8 @@ export type Operation<Arg = any, Res = any> = {
 	res: Res,
 	callAt: number,
 	retAt: number,
+	extraRes: { any }?,
+	err: string?,
 }
 
 export type SequentialModel<State, Arg = any, Res = any> = {
@@ -621,9 +623,14 @@ function Linearize.recorder(clockFn: (() -> number)?): Recorder
 		if type(fn) ~= "function" then error("Linearize.recorder:wrap: expected function callback", util.outside()) end
 		local handle = rec:call(proc, op, arg)
 		local packed = table.pack(pcall(fn :: () -> ...any))
-		if not packed[1] then error(packed[2], 0) end
+		if not packed[1] then
+			local entry = rec:finish(handle, nil)
+			entry.err = format.errorText(packed[2])
+			error(packed[2], 0)
+		end
 		local resValue: any = if packed.n >= 2 then packed[2] else nil
-		rec:finish(handle, resValue)
+		local entry = rec:finish(handle, resValue)
+		if packed.n > 2 then entry.extraRes = { (table.unpack :: any)(packed, 3, packed.n) } end
 		return (table.unpack :: any)(packed, 2, packed.n)
 	end
 

@@ -13,6 +13,33 @@ local ACTOR_BINDINGS: { [any]: { [string]: { { fn: (...any) -> (), parallel: boo
 local SharedTable: any = {}
 local SharedTableMeta: any = { __type = "SharedTable" }
 
+local ALLOWED_SHARED_DATATYPES: { [string]: boolean } = {
+	Axes = true,
+	BrickColor = true,
+	CFrame = true,
+	Color3 = true,
+	ColorSequence = true,
+	ColorSequenceKeypoint = true,
+	DateTime = true,
+	EnumItem = true,
+	Faces = true,
+	Font = true,
+	NumberRange = true,
+	NumberSequence = true,
+	NumberSequenceKeypoint = true,
+	PhysicalProperties = true,
+	Ray = true,
+	Rect = true,
+	Region3 = true,
+	Region3int16 = true,
+	UDim = true,
+	UDim2 = true,
+	Vector2 = true,
+	Vector2int16 = true,
+	Vector3 = true,
+	Vector3int16 = true,
+}
+
 local wrapValue: (value: any, seen: { [any]: any }?, freezeChildren: boolean?) -> any
 
 local function checkState(st: any, op: string, requireMutable: boolean?): { data: { [any]: any }, frozen: boolean }
@@ -25,7 +52,7 @@ end
 local function isValidKey(key: any): boolean
 	local kt = type(key)
 	if kt == "string" then return true end
-	return kt == "number" and key == key
+	return kt == "number" and key == key and key % 1 == 0 and math.abs(key) < 9007199254740992
 end
 
 local function newFromState(data: { [any]: any }, frozen: boolean): any
@@ -37,13 +64,16 @@ end
 function wrapValue(value: any, seen: { [any]: any }?, freezeChildren: boolean?): any
 	if value == nil then return nil end
 	local vt = type(value)
-	if vt == "boolean" or vt == "number" or vt == "string" then return value end
+	if vt == "boolean" or vt == "number" or vt == "string" or vt == "vector" then return value end
 	if vt == "table" then
 		if STATES[value] ~= nil then return value end
 		if rawget(value, "_isInstance") == true then error("SharedTable cannot store Instance values", 3) end
 		local mt = getmetatable(value :: any)
-		if mt ~= nil and type(rawget(mt, "__type")) == "string" then return value end
-		if mt ~= nil then error("SharedTable cannot store tables with custom metatables", 3) end
+		if mt ~= nil then
+			local dtTag = rawget(mt, "__type")
+			if type(dtTag) == "string" and ALLOWED_SHARED_DATATYPES[dtTag] == true then return value end
+			error("SharedTable cannot store tables with custom metatables", 3)
+		end
 		local tracker = seen or {}
 		if tracker[value] ~= nil then error("SharedTable.new: cyclic table reference", 3) end
 		tracker[value] = true
@@ -240,6 +270,42 @@ local function addMessageBinding(actor: any, topic: string, fn: (...any) -> (), 
 	return conn
 end
 
+local function cloneMessageArg(value: any, seen: { [any]: any }?): any
+	if value == nil then return nil end
+	local vt = type(value)
+	if vt == "buffer" then
+		local len = buffer.len(value)
+		local copyBuf = buffer.create(len)
+		buffer.copy(copyBuf, 0, value, 0, len)
+		return copyBuf
+	end
+	if vt ~= "table" then return value end
+	if STATES[value] ~= nil or rawget(value, "_isInstance") == true then return value end
+	local mt = getmetatable(value :: any)
+	if mt ~= nil then
+		local dtTag = rawget(mt, "__type")
+		if type(dtTag) == "string" and ALLOWED_SHARED_DATATYPES[dtTag] == true then return value end
+		return value
+	end
+	local tracker = seen or {}
+	if tracker[value] ~= nil then return tracker[value] end
+	local out: { [any]: any } = {}
+	tracker[value] = out
+	for k, v in next, value do
+		out[cloneMessageArg(k, tracker)] = cloneMessageArg(v, tracker)
+	end
+	return out
+end
+
+local function clonePackedArgs(packed: { [number]: any, n: number }): { [number]: any, n: number }
+	local out: { [number]: any, n: number } = { n = packed.n }
+	local tracker: { [any]: any } = {}
+	for i = 1, packed.n do
+		out[i] = cloneMessageArg(packed[i], tracker)
+	end
+	return out
+end
+
 Parallel.ActorMethods = {
 	BindToMessage = function(self: any, topic: string, fn: (...any) -> ()): any
 		return addMessageBinding(self, topic, fn, false)
@@ -256,12 +322,18 @@ Parallel.ActorMethods = {
 		local taskLib = if env ~= nil then env.task else nil
 		local setDesync: any = if env ~= nil then rawget(env, "_setDesynchronized") else nil
 		local snapshot = table.clone(list)
-		local packed = table.pack(...)
+		local activeEntries = {}
 		for _, entry in snapshot do
-			if not entry.active then continue end
+			if entry.active then table.insert(activeEntries, entry) end
+		end
+		if #activeEntries == 0 then return end
+		local packed = clonePackedArgs(table.pack(...))
+		local activeCount = #activeEntries
+		for idx, entry in activeEntries do
+			local argsForEntry = if idx < activeCount then clonePackedArgs(packed) else packed
 			local runner = function()
 				if type(setDesync) == "function" then (setDesync :: (boolean) -> ())(entry.parallel) end
-				entry.fn(table.unpack(packed, 1, packed.n))
+				entry.fn(table.unpack(argsForEntry, 1, argsForEntry.n))
 			end
 			if taskLib ~= nil and taskLib.spawn ~= nil then
 				taskLib.spawn(runner)

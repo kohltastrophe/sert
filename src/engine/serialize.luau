@@ -7,6 +7,7 @@ export type RemoteOptions = {
 	allowInstances: boolean?,
 	mapInstance: ((inst: any) -> any)?,
 	maxDepth: number?,
+	strict: boolean?,
 }
 
 export type DataStoreOptions = {
@@ -69,11 +70,13 @@ local function cloneParamState(v: any): any
 end
 
 --- Clones `value` across a `RemoteEvent` / `RemoteFunction` boundary, stripping user table metatables and mapping Instances.
+--- When `opts.strict ~= true`, matches Roblox wire sanitization (truncates sparse arrays at first `nil` hole and drops non-array keys on mixed tables).
 function serialize.remote(value: any, opts: RemoteOptions?): any
 	local o: RemoteOptions = opts or DEFAULT_REMOTE
 	local allowInstances = o.allowInstances ~= false
 	local mapInstance = o.mapInstance
 	local maxDepth = o.maxDepth or 128
+	local strict = o.strict == true
 	local active: { [any]: boolean } = {}
 
 	local function walk(v: any, depth: number): any
@@ -112,38 +115,58 @@ function serialize.remote(value: any, opts: RemoteOptions?): any
 		if depth > maxDepth then error(`Remote payload table exceeds maximum depth of {maxDepth}`, 0) end
 		active[v] = true
 
-		local count, intCount, strCount, maxInt = 0, 0, 0, 0
+		local intCount, strCount, maxInt = 0, 0, 0
 		for k in next, v do
-			count += 1
 			local kt = type(k)
 			if kt == "string" then
 				strCount += 1
 			elseif kt == "number" and k == k and k >= 1 and k % 1 == 0 and k < 2 ^ 31 then
 				intCount += 1
 				if k > maxInt then maxInt = k end
-			else
+			elseif strict then
 				active[v] = nil
 				error(`Cannot pass table with {Datatypes.typeof(k)} keys across remote boundary`, 0)
 			end
 		end
 
-		if strCount > 0 and intCount > 0 then
+		if strict then
+			if strCount > 0 and intCount > 0 then
+				active[v] = nil
+				error("Cannot pass mixed array and dictionary table across remote boundary", 0)
+			elseif intCount > 0 and maxInt ~= intCount then
+				active[v] = nil
+				error("Cannot pass sparse array with holes across remote boundary", 0)
+			end
+
+			-- Plain `{}` intentionally omits any metatable from `v` so OOP methods/metamethods never cross remotes.
+			local out: { [any]: any } = if intCount > 0 then table.create(intCount) else {}
+			if intCount > 0 then
+				for i = 1, intCount do
+					out[i] = walk(rawget(v, i), depth + 1)
+				end
+			else
+				for k, item in next, v do
+					out[k] = walk(item, depth + 1)
+				end
+			end
+
 			active[v] = nil
-			error("Cannot pass mixed array and dictionary table across remote boundary", 0)
-		elseif intCount > 0 and maxInt ~= intCount then
-			active[v] = nil
-			error("Cannot pass sparse array with holes across remote boundary", 0)
+			return out
 		end
 
-		-- Plain `{}` intentionally omits any metatable from `v` so OOP methods/metamethods never cross remotes.
-		local out: { [any]: any } = if intCount > 0 then table.create(intCount) else {}
-		if intCount > 0 then
-			for i = 1, intCount do
-				out[i] = walk(rawget(v, i), depth + 1)
+		-- Roblox wire sanitization: dense arrays from index 1..hole (dropping dict keys on mixed tables); otherwise string-keyed dicts.
+		local out: { [any]: any } = {}
+		if rawget(v, 1) ~= nil then
+			local i = 1
+			while true do
+				local elem = rawget(v, i)
+				if elem == nil then break end
+				out[i] = walk(elem, depth + 1)
+				i += 1
 			end
-		else
+		elseif not (intCount > 0 and strCount == 0) then
 			for k, item in next, v do
-				out[k] = walk(item, depth + 1)
+				if type(k) == "string" then out[k] = walk(item, depth + 1) end
 			end
 		end
 
@@ -152,6 +175,55 @@ function serialize.remote(value: any, opts: RemoteOptions?): any
 	end
 
 	return walk(value, 0)
+end
+
+local TAG_BYTES: { [string]: number } = {
+	Instance = 8,
+	CFrame = 48,
+	Vector3 = 12,
+	Color3 = 12,
+	Vector2 = 8,
+	UDim = 8,
+	UDim2 = 16,
+}
+
+--- Estimates encoded wire byte size for packed remote arguments (accounting accurately for `buffer` byte length).
+function serialize.estimateRemoteBytes(packed: { [number]: any, n: number }): number
+	local seen: { [any]: boolean } = {}
+
+	local function measure(v: any): number
+		local kind = type(v)
+		if v == nil or kind == "boolean" then
+			return 1
+		elseif kind == "number" then
+			return 8
+		elseif kind == "string" then
+			return 2 + #v
+		elseif kind == "buffer" then
+			return 4 + buffer.len(v)
+		elseif kind == "vector" then
+			return 12
+		elseif kind ~= "table" then
+			return TAG_BYTES[typeof(v)] or 16
+		end
+
+		local tag = Datatypes.doubleTag(v)
+		if tag ~= nil then return TAG_BYTES[tag] or 16 end
+		if seen[v] then return 4 end
+		seen[v] = true
+		local total = 2
+		for k, item in next, v do
+			total += measure(k) + measure(item)
+		end
+		seen[v] = nil
+		return total
+	end
+
+	local total = 0
+	for i = 1, packed.n do
+		total += measure(packed[i])
+	end
+	return total
 end
 
 --- Serializes a packed vararg tuple across a remote boundary while preserving trailing/interior `nil` slots.

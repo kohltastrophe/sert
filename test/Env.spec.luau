@@ -269,7 +269,7 @@ describe("Scheduler, task library & RunService frame pipeline", function()
 	)
 
 	test(
-		"fires BindToRenderStep, PreRender, RenderStepped, PreAnimation, Stepped(elapsed, dt), PreSimulation, PostSimulation, and Heartbeat in engine order",
+		"fires BindToRenderStep, PreRender, RenderStepped, PreAnimation, PreSimulation, Stepped(elapsed, dt), PostSimulation, and Heartbeat in engine order and isolates yielding BindToRenderStep callbacks",
 		function()
 			local e = sert.env.new({ isClient = true, isServer = false, dt = 0.025 })
 			local rs = e:getService("RunService")
@@ -278,6 +278,11 @@ describe("Scheduler, task library & RunService frame pipeline", function()
 			local steppedDt = -1
 			local heartbeatDt = -1
 
+			rs:BindToRenderStep("YieldPass", 50, function(_dt: number)
+				table.insert(order, "YieldPass:start")
+				e.task.wait(0.1)
+				table.insert(order, "YieldPass:end")
+			end)
 			rs:BindToRenderStep(
 				"CamPass",
 				100,
@@ -290,14 +295,14 @@ describe("Scheduler, task library & RunService frame pipeline", function()
 			rs.PreAnimation:Connect(
 				function(dt: number) table.insert(order, string.format("PreAnimation:%.3f", dt)) end
 			)
+			rs.PreSimulation:Connect(
+				function(dt: number) table.insert(order, string.format("PreSimulation:%.3f", dt)) end
+			)
 			rs.Stepped:Connect(function(elapsed: number, dt: number)
 				steppedElapsed = elapsed
 				steppedDt = dt
 				table.insert(order, "Stepped")
 			end)
-			rs.PreSimulation:Connect(
-				function(dt: number) table.insert(order, string.format("PreSimulation:%.3f", dt)) end
-			)
 			rs.PostSimulation:Connect(
 				function(dt: number) table.insert(order, string.format("PostSimulation:%.3f", dt)) end
 			)
@@ -307,14 +312,15 @@ describe("Scheduler, task library & RunService frame pipeline", function()
 			end)
 
 			e:step(0.025)
-			-- Deferred RunService signals drain in exact fire order at the end of the frame step.
+			-- Engine phase order: BindToRenderStep -> PreRender -> RenderStepped -> PreAnimation -> PreSimulation -> Stepped -> PostSimulation -> Heartbeat
 			sert.eq(order, {
+				"YieldPass:start",
 				"BindToRenderStep:0.025",
 				"PreRender:0.025",
 				"RenderStepped:0.025",
 				"PreAnimation:0.025",
-				"Stepped",
 				"PreSimulation:0.025",
+				"Stepped",
 				"PostSimulation:0.025",
 				"Heartbeat",
 			})
@@ -322,6 +328,7 @@ describe("Scheduler, task library & RunService frame pipeline", function()
 			sert.near(steppedDt, 0.025, 1e-6)
 			sert.near(heartbeatDt, 0.025, 1e-6)
 
+			rs:UnbindFromRenderStep("YieldPass")
 			rs:UnbindFromRenderStep("CamPass")
 			table.clear(order)
 			e:step(0.025)
@@ -576,7 +583,33 @@ describe("Remote boundary serialization (serialize.remote)", function()
 			sert.eq(getmetatable(receivedOnClient), nil)
 			sert.eq(receivedOnClient.tag, "server")
 
-			-- Illegal remote payloads throw cleanly.
+			-- Default Roblox wire sanitization truncates sparse arrays at nil holes and drops non-array keys on mixed tables.
+			local mixedOut: any = nil
+			local sparseOut: any = nil
+			local hole1Out: any = nil
+			local sSan = sEnv.Instance.new("RemoteEvent")
+			sSan.Name = "SanitizeCheck"
+			sSan.Parent = sEnv:getService("ReplicatedStorage")
+			w:step()
+			local cSan = cEnv:getService("ReplicatedStorage"):FindFirstChild("SanitizeCheck") :: any
+			sSan.OnServerEvent:Connect(function(_plr: any, kind: string, payload: any)
+				if kind == "mixed" then
+					mixedOut = payload
+				elseif kind == "sparse" then
+					sparseOut = payload
+				else
+					hole1Out = payload
+				end
+			end)
+			cSan:FireServer("mixed", { [1] = "a", named = "b" })
+			cSan:FireServer("sparse", { [1] = "a", [3] = "c" })
+			cSan:FireServer("hole1", { [2] = "b" })
+			w:step()
+			sert.eq(mixedOut, { "a" })
+			sert.eq(sparseOut, { "a" })
+			sert.eq(hole1Out, {})
+
+			-- Illegal remote payloads (and mixed/sparse under opt-in strictRemotes) throw cleanly.
 			sert.throws(function()
 				cRem:FireServer(function() end)
 			end, "function")
@@ -588,8 +621,39 @@ describe("Remote boundary serialization (serialize.remote)", function()
 				cyc.self = cyc
 				cRem:FireServer(cyc)
 			end, "cyclic")
-			sert.throws(function() cRem:FireServer({ [1] = "a", named = "b" }) end, "mixed")
-			sert.throws(function() cRem:FireServer({ [1] = "a", [3] = "c" }) end, "sparse")
+
+			local sw = sert.sim.new({ seed = 7, instant = true, strictRemotes = true })
+			local ssrv = sw:server()
+			local scli = ssrv:client(102)
+			local strictRemS = ssrv:env().Instance.new("RemoteEvent")
+			strictRemS.Name = "StrictCheck"
+			strictRemS.Parent = ssrv:env():getService("ReplicatedStorage")
+			sw:step()
+			local strictRemC = scli:env():getService("ReplicatedStorage"):FindFirstChild("StrictCheck") :: any
+			sert.throws(function() strictRemC:FireServer({ [1] = "a", named = "b" }) end, "mixed")
+			sert.throws(function() strictRemC:FireServer({ [1] = "a", [3] = "c" }) end, "sparse")
+
+			-- Standalone sert.env enforces 900B UnreliableRemoteEvent cap (including buffers) and hides ServerStorage instances from clients.
+			local solo = sert.env.new()
+			local soloUre = solo.Instance.new("UnreliableRemoteEvent", solo:getService("ReplicatedStorage"))
+			local ureHits = 0
+			soloUre.OnServerEvent:Connect(function()
+				ureHits += 1
+			end)
+			soloUre:FireServer(buffer.create(1024))
+			solo:step()
+			sert.eq(ureHits, 0)
+			soloUre:FireServer(buffer.create(128))
+			solo:step()
+			sert.eq(ureHits, 1)
+
+			local soloRe = solo.Instance.new("RemoteEvent", solo:getService("ReplicatedStorage"))
+			local gotSecretInst: any = "unset"
+			soloRe.OnClientEvent:Connect(function(inst: any) gotSecretInst = inst end)
+			local secretFolder = solo.Instance.new("Folder", solo:getService("ServerStorage"))
+			soloRe:FireAllClients(secretFolder)
+			solo:step()
+			sert.eq(gotSecretInst, nil)
 		end
 	)
 end)
@@ -850,6 +914,8 @@ describe("Extended UI layout, UIScale, AutomaticSize, typography, UIPageLayout, 
 			local e = sert.env.new({ isClient = true, isServer = false, viewport = sert.env.Vector2.new(800, 600) })
 			local pg = e.LocalPlayer.PlayerGui
 			local sg = e.Instance.new("ScreenGui", pg)
+			sert.eq(sg.AbsoluteSize, e.Vector2.new(800, 542))
+			sg.IgnoreGuiInset = true
 			sert.eq(sg.AbsoluteSize, e.Vector2.new(800, 600))
 
 			-- Wrapped UIListLayout with Center/Top alignments and SortOrder.Name + AutomaticSize.Y container
@@ -1619,16 +1685,19 @@ describe("env:mount, env:settle, extended input driver, client replication & RBX
 			sCore.Name = "Core"
 			sCore.Size = sEnv.Vector3.new(6, 6, 6)
 			sModel.PrimaryPart = sCore
-			sModel:SetAttribute("CoreRef", sCore)
+			local sRef = sEnv.Instance.new("ObjectValue", sModel)
+			sRef.Name = "CoreRef"
+			sRef.Value = sCore
 			sModel.Parent = sEnv.workspace
 			sModel:AddTag("Enemy")
 
 			local cModel = cEnv.workspace:FindFirstChild("Boss") :: any
 			sert.ok(cModel ~= nil and cModel ~= sModel)
 			local cCore = cModel:FindFirstChild("Core") :: any
+			local cRef = cModel:FindFirstChild("CoreRef") :: any
 			sert.ok(cCore ~= nil and cCore ~= sCore)
 			sert.eq(cModel.PrimaryPart, cCore)
-			sert.eq(cModel:GetAttribute("CoreRef"), cCore)
+			sert.eq(cRef.Value, cCore)
 			sert.eq(cModel:GetAttribute("Phase"), 1)
 			sert.eq(cModel:HasTag("Enemy"), true)
 			sert.eq(cEnv:getService("CollectionService"):GetTagged("Enemy"), { cModel })
@@ -1647,7 +1716,7 @@ describe("env:mount, env:settle, extended input driver, client replication & RBX
 			sCore.Parent = sEnv:getService("ServerStorage")
 			sert.eq(cCore.Parent, nil)
 			sert.eq(cModel.PrimaryPart, nil)
-			sert.eq(cModel:GetAttribute("CoreRef"), nil)
+			sert.eq(cRef.Value, nil)
 
 			-- Destroying server instance destroys mirrored client instance
 			sModel:Destroy()
@@ -2324,4 +2393,295 @@ describe("InputAction, Audio.hasPlaying, _immediateSignal, and mutant waitGuard"
 		registry.mutant.set(nil)
 		registry.mutant.waitGuard()
 	end)
+end)
+
+describe("M3b engine parity: Attributes, NaN, Destroy, Clone, WaitForChild, UI, Parallel & PluginSecurity", function()
+	test(
+		"SetAttribute rejects Instance, NaN->NaN suppresses redundant Changed signals, and Destroying runs synchronously before child teardown",
+		function()
+			local e = sert.env.new({ signalBehavior = "Deferred" })
+			local parent = e.Instance.new("Folder", e.workspace)
+			local child = e.Instance.new("Folder", parent)
+			local refTarget = e.Instance.new("Part", e.workspace)
+
+			sert.throws(function() parent:SetAttribute("Ref", refTarget) end, "not a supported attribute type")
+
+			-- NaN -> NaN no-op on both Numeric property and attribute
+			local numVal = e.Instance.new("NumberValue", parent)
+			local propChanges = 0
+			numVal:GetPropertyChangedSignal("Value"):Connect(function()
+				propChanges += 1
+			end)
+			numVal.Value = 0 / 0
+			e:flush()
+			sert.eq(propChanges, 1)
+			numVal.Value = 0 / 0
+			e:flush()
+			sert.eq(propChanges, 1)
+
+			local attrChanges = 0
+			parent:GetAttributeChangedSignal("Nano"):Connect(function()
+				attrChanges += 1
+			end)
+			parent:SetAttribute("Nano", 0 / 0)
+			e:flush()
+			sert.eq(attrChanges, 1)
+			parent:SetAttribute("Nano", 0 / 0)
+			e:flush()
+			sert.eq(attrChanges, 1)
+
+			-- Destroying fires synchronously BEFORE Parent == nil and BEFORE child Destroy cascades under Deferred mode
+			local events: { string } = {}
+			parent.Destroying:Connect(
+				function()
+					table.insert(
+						events,
+						"parent:" .. tostring(parent.Parent ~= nil) .. ":" .. tostring(child.Parent == parent)
+					)
+				end
+			)
+			child.Destroying:Connect(function() table.insert(events, "child") end)
+			parent:Destroy()
+			sert.eq(events, { "parent:true:true", "child" })
+		end
+	)
+
+	test(
+		"Clone clears Archivable=false internal refs to nil and WaitForChild handles timeOut=0 and parent Destroying",
+		function()
+			local e = sert.env.new()
+			local root = e.Instance.new("Folder", e.workspace)
+			local ext = e.Instance.new("Part", e.workspace)
+			local keepChild = e.Instance.new("Part", root)
+			keepChild.Name = "Keep"
+			local unarchivable = e.Instance.new("Part", root)
+			unarchivable.Name = "Ephemeral"
+			unarchivable.Archivable = false
+
+			local ovKeep = e.Instance.new("ObjectValue", root)
+			ovKeep.Name = "KeepRef"
+			ovKeep.Value = keepChild
+			local ovDrop = e.Instance.new("ObjectValue", root)
+			ovDrop.Name = "DropRef"
+			ovDrop.Value = unarchivable
+			local ovExt = e.Instance.new("ObjectValue", root)
+			ovExt.Name = "ExtRef"
+			ovExt.Value = ext
+
+			local cloned = root:Clone() :: any
+			sert.ok(cloned ~= nil)
+			sert.eq((cloned:FindFirstChild("KeepRef") :: any).Value, cloned:FindFirstChild("Keep"))
+			sert.eq((cloned:FindFirstChild("DropRef") :: any).Value, nil)
+			sert.eq((cloned:FindFirstChild("ExtRef") :: any).Value, ext)
+
+			-- WaitForChild timeOut <= 0 returns nil immediately; waiting wakes and returns nil when parent is destroyed
+			sert.eq(root:WaitForChild("NeverThere", 0), nil)
+			local waitedResult: any = "unset"
+			e.task.spawn(function() waitedResult = root:WaitForChild("NeverArrives") end)
+			e:flush()
+			sert.eq(waitedResult, "unset")
+			root:Destroy()
+			e:flush()
+			sert.eq(waitedResult, nil)
+		end
+	)
+
+	test(
+		"GuiService:GetGuiInset, TextService:GetTextBoundsAsync, UIScale propagation, AbsoluteRotation & CollectionService:GetAllTags",
+		function()
+			local e = sert.env.new({ isClient = true, isServer = false, viewport = sert.env.Vector2.new(800, 600) })
+			local gs = e:getService("GuiService")
+			local topLeft, bottomRight = gs:GetGuiInset()
+			sert.eq(topLeft, e.Vector2.new(0, 58))
+			sert.eq(bottomRight, e.Vector2.zero)
+			sert.eq(gs.TopbarInset, e.Rect.new(0, 0, 1280, 58))
+
+			local cs = e:getService("CollectionService")
+			local pA = e.Instance.new("Part", e.workspace)
+			cs:AddTag(pA, "Zeta")
+			cs:AddTag(pA, "Alpha")
+			sert.eq(cs:GetAllTags(), { "Alpha", "Zeta" })
+			cs:RemoveTag(pA, "Zeta")
+			sert.eq(cs:GetAllTags(), { "Alpha" })
+			pA:Destroy()
+			sert.eq(cs:GetAllTags(), {})
+
+			local sg = e.Instance.new("ScreenGui", e.LocalPlayer.PlayerGui)
+			sg.IgnoreGuiInset = true
+			local host = e.Instance.new("Frame", sg)
+			host.Size = e.UDim2.fromOffset(200, 100)
+			host.Rotation = 15
+			local scale = e.Instance.new("UIScale", host)
+			scale.Scale = 2
+			local pad = e.Instance.new("UIPadding", host)
+			pad.PaddingLeft = e.UDim.new(0, 10)
+			pad.PaddingTop = e.UDim.new(0, 5)
+			local childLbl = e.Instance.new("TextLabel", host)
+			childLbl.Position = e.UDim2.fromOffset(10, 5)
+			childLbl.Size = e.UDim2.fromOffset(80, 20)
+			childLbl.Rotation = 30
+			childLbl.TextSize = 14
+			childLbl.Text = "Hello"
+
+			sert.eq(host.AbsoluteSize, e.Vector2.new(400, 200))
+			sert.eq(childLbl.AbsoluteSize, e.Vector2.new(160, 40))
+			-- PaddingLeft(10*2=20) + Position.X(10*2=20) = 40; PaddingTop(5*2=10) + Position.Y(5*2=10) = 20
+			sert.eq(childLbl.AbsolutePosition, e.Vector2.new(40, 20))
+			sert.eq(childLbl.AbsoluteRotation, 45)
+
+			-- Compare scaled TextLabel.TextBounds with TextService:GetTextBoundsAsync at matching effective fontSize (28)
+			local ts = e:getService("TextService")
+			local params = e.Instance.new("GetTextBoundsParams")
+			params.Text = "Hello"
+			params.Size = 28
+			params.Width = 0
+			sert.eq(childLbl.TextBounds, ts:GetTextBoundsAsync(params))
+
+			local insetGui = e.Instance.new("ScreenGui", e.LocalPlayer.PlayerGui)
+			sert.eq(insetGui.AbsoluteSize, e.Vector2.new(800, 542))
+			insetGui.ScreenInsets = e.Enum.ScreenInsets.DeviceSafeInsets
+			sert.eq(insetGui.IgnoreGuiInset, true)
+			sert.eq(insetGui.AbsoluteSize, e.Vector2.new(800, 600))
+			insetGui.ScreenInsets = e.Enum.ScreenInsets.None
+			sert.eq(insetGui.IgnoreGuiInset, true)
+			sert.eq(insetGui.AbsoluteSize, e.Vector2.new(800, 600))
+			insetGui.ScreenInsets = e.Enum.ScreenInsets.TopbarSafeInsets
+			sert.eq(insetGui.IgnoreGuiInset, false)
+			sert.eq(insetGui.AbsoluteSize, e.Vector2.new(800, 542))
+			insetGui.ScreenInsets = e.Enum.ScreenInsets.CoreUISafeInsets
+			sert.eq(insetGui.IgnoreGuiInset, false)
+			sert.eq(insetGui.AbsoluteSize, e.Vector2.new(800, 542))
+			insetGui.IgnoreGuiInset = true
+			sert.eq(insetGui.ScreenInsets, e.Enum.ScreenInsets.DeviceSafeInsets)
+			insetGui.ScreenInsets = e.Enum.ScreenInsets.CoreUISafeInsets
+			sert.eq(insetGui.IgnoreGuiInset, false)
+			sert.eq(insetGui.AbsoluteSize, e.Vector2.new(800, 542))
+
+			-- UIListLayout flex sizing must not double-apply child UIScale; negative UIScale clamps cleanly
+			local flexHost = e.Instance.new("Frame", insetGui)
+			flexHost.Size = e.UDim2.fromOffset(300, 100)
+			local flexLayout = e.Instance.new("UIListLayout", flexHost)
+			flexLayout.FillDirection = e.Enum.FillDirection.Horizontal
+			flexLayout.HorizontalFlex = e.Enum.UIFlexAlignment.Fill
+			local flexItem = e.Instance.new("Frame", flexHost)
+			flexItem.Size = e.UDim2.fromOffset(50, 40)
+			local flexScale = e.Instance.new("UIScale", flexItem)
+			flexScale.Scale = 2
+			sert.eq(flexItem.AbsoluteSize, e.Vector2.new(300, 80))
+
+			local negScale = e.Instance.new("UIScale", flexHost)
+			negScale.Scale = -1
+			sert.eq(negScale.Scale, 0)
+			local sizeBound = e.Instance.new("UISizeConstraint", flexItem)
+			sizeBound.MinSize = e.Vector2.new(20, 20)
+			sizeBound.MaxSize = e.Vector2.new(100, 100)
+			sert.eq(flexItem.AbsoluteSize, e.Vector2.new(0, 0))
+			insetGui:Destroy()
+		end
+	)
+
+	test(
+		"SharedTable key/value validation, Actor:SendMessage isolation, assertSerial & PluginSecurity parity",
+		function()
+			local e = sert.env.new()
+			local st = e.SharedTable.new({ ok = 1, [2] = vector.create(1, 2, 3), c = e.Color3.new(1, 0, 0) })
+			sert.eq(st[2], vector.create(1, 2, 3))
+			sert.throws(function() (st :: any)[1.5] = 10 end, "invalid key")
+			sert.throws(function() (st :: any)[math.huge] = 10 end, "invalid key")
+			local spoofed = setmetatable({ x = 1 }, { __type = "Spoofed" })
+			sert.throws(function() st.bad = spoofed end, "custom metatables")
+
+			-- Actor:SendMessage deep-copies plain tables/buffers while sharing SharedTable & Instance
+			local actor = e.Instance.new("Actor", e.workspace)
+			local markerPart = e.Instance.new("Part", e.workspace)
+			local payload = { count = 1, nested = { tag = "a" } }
+			local buf = buffer.fromstring("ab")
+			local gotPayload: any = nil
+			local gotBuf: any = nil
+			local gotShared: any = nil
+			local gotInst: any = nil
+			actor:BindToMessage("msg", function(t: any, b: buffer, s: any, inst: any)
+				gotPayload, gotBuf, gotShared, gotInst = t, b, s, inst
+			end)
+			actor:SendMessage("msg", payload, buf, st, markerPart)
+			payload.count = 99
+			payload.nested.tag = "mutated"
+			buffer.writeu8(buf, 0, 0x5A)
+			e:flush()
+			sert.eq(gotPayload, { count = 1, nested = { tag = "a" } })
+			sert.eq(buffer.tostring(gotBuf), "ab")
+			sert.eq(gotShared, st)
+			sert.eq(gotInst, markerPart)
+
+			-- Multi-listener Actor:SendMessage isolates listener 1 synchronous mutations from listener 2
+			local multiActor = e.Instance.new("Actor", e.workspace)
+			local secondSeen: { n: number, buf: string }? = nil
+			multiActor:BindToMessage("iso", function(tbl: any, b: buffer)
+				tbl.n = 999
+				buffer.writeu8(b, 0, 0x58)
+			end)
+			multiActor:BindToMessage(
+				"iso",
+				function(tbl: any, b: buffer) secondSeen = { n = tbl.n, buf = buffer.tostring(b) } end
+			)
+			multiActor:SendMessage("iso", { n = 1 }, buffer.fromstring("ok"))
+			e:flush()
+			sert.eq(secondSeen, { n = 1, buf = "ok" })
+
+			-- Parallel.assertSerial rejects TweenService:Create and Debris:AddItem while desynchronized
+			local tweenPart = e.Instance.new("Part", e.workspace)
+			e.task.desynchronize()
+			sert.throws(
+				function() e:getService("TweenService"):Create(tweenPart, e.TweenInfo.new(0.1), { Transparency = 0.5 }) end,
+				"parallel"
+			)
+			sert.throws(function() e:getService("Debris"):AddItem(tweenPart, 1) end, "parallel")
+			e.task.synchronize()
+
+			-- PluginSecurity & Content datatype parity
+			local mv = e.Instance.new("MaterialVariant", e.workspace)
+			sert.eq(mv.BaseMaterial, e.Enum.Material.Plastic)
+			sert.throws(function() mv.BaseMaterial = e.Enum.Material.Wood end, "lacking capability Plugin")
+			sert.throws(function() return (tweenPart :: any):GetDebugId() end, "lacking capability Plugin")
+
+			local img = e.Instance.new("ImageLabel")
+			sert.eq(img.ImageContent, nil)
+			img.ImageContent = "rbxassetid://12345"
+			sert.eq(img.ImageContent, "rbxassetid://12345")
+			sert.throws(function() (img :: any).ImageContent = true end, "string expected")
+
+			local studioEnv = sert.env.new({ isStudio = true })
+			local studioPart = studioEnv.Instance.new("Part", studioEnv.workspace)
+			local studioMv = studioEnv.Instance.new("MaterialVariant", studioEnv.workspace)
+			studioMv.BaseMaterial = studioEnv.Enum.Material.Wood
+			sert.eq(studioMv.BaseMaterial, studioEnv.Enum.Material.Wood)
+			sert.ok(type((studioPart :: any):GetDebugId()) == "string")
+
+			-- sert.env.installGlobals populates explicit target table headlessly
+			local sandbox: { [string]: any } = {}
+			sert.env.installGlobals(sandbox)
+			if not sert.isRoblox then
+				sert.eq(type(sandbox.Vector3), "table")
+				sert.eq(sandbox.Vector3.new(1, 2, 3), sert.env.Vector3.new(1, 2, 3))
+				sert.eq(type(sandbox.Color3), "table")
+				sert.eq(type(sandbox.CFrame), "table")
+			end
+
+			-- Destroying ScreenGuis prunes `_layerCollectorList` so repeated UI runs do not leak
+			local uiEnv = sert.env.new({ isClient = true, isServer = false })
+			for i = 1, 60 do
+				local gui = uiEnv.Instance.new("ScreenGui", uiEnv.LocalPlayer.PlayerGui)
+				gui.Name = `Transient_{i}`
+				gui:Destroy()
+			end
+			sert.eq(#(uiEnv :: any)._layerCollectorList, 0)
+			local liveGui = uiEnv.Instance.new("ScreenGui", uiEnv.LocalPlayer.PlayerGui)
+			liveGui.IgnoreGuiInset = true
+			sert.eq(#(uiEnv :: any)._layerCollectorList, 1)
+			uiEnv:setViewport(uiEnv.Vector2.new(800, 600))
+			sert.eq(liveGui.AbsoluteSize, uiEnv.Vector2.new(800, 600))
+			liveGui:Destroy()
+			sert.eq(#(uiEnv :: any)._layerCollectorList, 0)
+		end
+	)
 end)

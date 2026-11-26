@@ -8,6 +8,7 @@ local Spec = require("@self/spec")
 local World = require("@self/world")
 local format = require("./core/format")
 local prop = require("./prop")
+local propInternal = require("./prop/internal")
 local registry = require("./core/registry")
 local util = require("./core/util")
 
@@ -182,7 +183,7 @@ local function executeVoprTrial<State, Sut>(spec: Spec<State, Sut>, opts: VoprOp
 				if cand.gen ~= nil then
 					arg = cand.gen(util.copy(state), g)
 				elseif type(cand.args) == "function" then
-					local list = (cand.args :: (State) -> { any })(state)
+					local list = (cand.args :: (State) -> { any })(util.copy(state))
 					if #list > 0 then arg = g:pick(list) end
 				elseif type(cand.args) == "table" and #(cand.args :: { any }) > 0 then
 					arg = g:pick(cand.args :: { any })
@@ -261,7 +262,7 @@ local function runVoprSuite<State, Sut>(
 		if rSeed == nil or rSize == nil or rTape == nil then
 			error(`Sim: malformed replay token {format.repr(replaySpec)}`, util.outside())
 		end
-		local g = prop.gen(rSeed, rSize, rTape)
+		local g = propInternal.gen(rSeed, rSize, rTape)
 		local ok, rawPayload: any = pcall(function(): nil
 			executeVoprTrial(spec, opts, g)
 			return nil
@@ -319,7 +320,7 @@ local function runVoprSuite<State, Sut>(
 			return nil
 		end)
 		if not ok then
-			local currentTape = prop.tape(g)
+			local currentTape = propInternal.tape(g)
 			local innerErr = if type(rawPayload) == "table" and rawPayload.err ~= nil
 				then rawPayload.err
 				else rawPayload
@@ -340,6 +341,28 @@ local function runVoprSuite<State, Sut>(
 
 	local finalTape = (res :: any).shrunk or bestTape or {}
 	local finalSeed = res.seed or opts.seed or 1
+	local function sameTape(a: { number }?, b: { number }?): boolean
+		if a == nil or b == nil or #a ~= #b then return false end
+		for i = 1, #a do
+			if a[i] ~= b[i] then return false end
+		end
+		return true
+	end
+	if (res :: any).shrunk ~= nil and not sameTape(bestTape, finalTape) then
+		local shrunkGen = propInternal.gen(finalSeed, size, finalTape)
+		local okRep, repPayload: any = pcall(function(): nil
+			executeVoprTrial(spec, opts, shrunkGen)
+			return nil
+		end)
+		if not okRep then
+			local repErr = if type(repPayload) == "table" and repPayload.err ~= nil then repPayload.err else repPayload
+			bestErrText = format.errorText(repErr)
+			if type(repPayload) == "table" then
+				bestWorld = repPayload.world
+				bestSteps = repPayload.steps
+			end
+		end
+	end
 	local token = encodeReplayToken(finalSeed, finalTape, size)
 	local lines = {
 		`VOPR counterexample in "{name}": {bestErrText or res.message or "failed"}`,
@@ -352,7 +375,7 @@ local function runVoprSuite<State, Sut>(
 	end
 	if bestWorld ~= nil then
 		-- Format `w:summary()` ONLY ONCE on the final shrunk counterexample!
-		table.insert(lines, bestWorld:summary())
+		table.insert(lines, (bestWorld :: World):summary())
 	end
 	table.insert(lines, `Replay: \{ replay = "{token}" \}`)
 	return false, table.concat(lines, "\n"), res.cases
@@ -445,6 +468,7 @@ Sim.verifyTrace = Spec.verifyTrace
 Sim.toItfJson = Spec.toItfJson
 Sim.canonicalize = Spec.canonicalize
 Sim.linearizable = Linearize.linearizable
+--- @deprecated Use `sert.sim.linearizable`.
 Sim.checkLinearizable = Linearize.check
 Sim.recorder = Linearize.recorder
 Sim.vopr = voprApi
@@ -651,6 +675,111 @@ local function defaultWorldStateHash(world: World): string
 		`net=c:{w.pendingCloud or 0};r:{w.pendingRemotes or 0};p:[{table.concat(remoteParts, ",")}];s:[{table.concat(
 			serverParts,
 			","
+		)}]`
+	)
+
+	-- Include receipts, active network partitions, kicks, remote errors, actions, HTTP request history, and server DataModels.
+	local receiptParts: { string } = {}
+	if type(w.receipts) == "table" then
+		for _, rec in w.receipts do
+			if type(rec) == "table" then
+				table.insert(
+					receiptParts,
+					Spec.canonicalize({
+						id = rec.purchaseId,
+						pl = rec.playerId,
+						pr = rec.productId,
+						gr = rec.granted == true,
+						inf = rec.inFlight == true,
+						dup = rec.duplicatedOnce == true,
+						att = rec.attempts or 0,
+					})
+				)
+			end
+		end
+	end
+	local partParts: { string } = {}
+	if type(w.partitions) == "table" then
+		for _, p in w.partitions do
+			if type(p) == "table" and (type(p.untilAt) ~= "number" or p.untilAt > msNow) then
+				local srvName = if type(p.server) == "table" then tostring(p.server.name) else tostring(p.server)
+				local rem = if type(p.untilAt) == "number" then math.round((p.untilAt - msNow) * 1e9) else -1
+				table.insert(partParts, `{srvName}:{rem}`)
+			end
+		end
+		table.sort(partParts)
+	end
+	local kickParts: { string } = {}
+	if type(w.kicks) == "table" then
+		for _, k in w.kicks do
+			if type(k) == "table" then
+				local srvName = if type(k.server) == "table" then tostring(k.server.name) else tostring(k.server)
+				table.insert(kickParts, `{srvName}:{tostring(k.userId)}:{tostring(k.message or "")}`)
+			end
+		end
+	end
+	local rerrParts: { string } = {}
+	if type(w.remoteErrors) == "table" then
+		for _, re in w.remoteErrors do
+			if type(re) == "table" then
+				table.insert(rerrParts, `{tostring(re.peer)}:{tostring(re.remote)}:{tostring(re.err)}`)
+			end
+		end
+	end
+	local reqParts: { string } = {}
+	if type(w.http) == "table" and type(w.http._requests) == "table" then
+		for _, req in w.http._requests do
+			table.insert(reqParts, Spec.canonicalize(req))
+		end
+	end
+	local dmParts: { string } = {}
+	local function hashDataModelNode(node: any, acc: { string })
+		if type(node) ~= "table" or rawget(node, "_destroyed") == true then return end
+		local cls = node.ClassName or "?"
+		local nm = node.Name or "?"
+		local okAttrs, attrs = pcall(function() return node:GetAttributes() end)
+		local okTags, tags = pcall(function() return node:GetTags() end)
+		local valPart = ""
+		if string.sub(cls, -5) == "Value" then
+			local okV, v = pcall(function() return node.Value end)
+			if okV then valPart = Spec.canonicalize(v) end
+		end
+		table.insert(
+			acc,
+			`{cls}:{nm}:{if okAttrs then Spec.canonicalize(attrs) else ""}:{if okTags
+				then Spec.canonicalize(tags)
+				else ""}:{valPart}`
+		)
+		local children = rawget(node, "_children")
+		if type(children) == "table" then
+			for _, child in children do
+				hashDataModelNode(child, acc)
+			end
+		end
+	end
+	if type(w.servers) == "table" then
+		local srvList = table.clone(w.servers)
+		table.sort(srvList, function(a: any, b: any): boolean return tostring(a.name) < tostring(b.name) end)
+		for _, srv in srvList do
+			local srvEnv: any = rawget(srv, "_env")
+			if srvEnv ~= nil then
+				local nodes: { string } = {}
+				for _, svcName in { "ReplicatedStorage", "Workspace", "Players", "ServerStorage" } do
+					local okS, svc = pcall(function() return srvEnv:getService(svcName) end)
+					if okS and svc ~= nil then hashDataModelNode(svc, nodes) end
+				end
+				table.insert(dmParts, `{tostring(srv.name)}=[{table.concat(nodes, ",")}]`)
+			end
+		end
+	end
+	table.insert(
+		parts,
+		`obs=rc:[{table.concat(receiptParts, ",")}];pt:[{table.concat(partParts, ",")}];k:[{table.concat(kickParts, ",")}];re:[{table.concat(
+			rerrParts,
+			","
+		)}];act:{Spec.canonicalize(w.actions or {})};http:[{table.concat(reqParts, ",")}];dm:[{table.concat(
+			dmParts,
+			";"
 		)}]`
 	)
 

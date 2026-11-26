@@ -570,8 +570,6 @@ function Scheduler.crash(s: State, owner: any)
 	fold(s, "c")
 end
 
-function Scheduler.crashed(s: State, owner: any): boolean return s.dead[keyOf(owner)] == true end
-
 function Scheduler.onFrame(s: State, fn: (dt: number) -> (), owner: any, fast: boolean?): () -> ()
 	local hook: Hook = { fn = fn, owner = keyOf(owner), active = true, fast = fast }
 	table.insert(s.hooks, hook)

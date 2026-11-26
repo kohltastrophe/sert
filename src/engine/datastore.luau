@@ -455,7 +455,7 @@ local function listStandardStores(
 ): any
 	local byName: { [string]: { created: number, updated: number } } = {}
 	for _, handle in mock.stores do
-		if not handle.ordered then
+		if type(handle) == "table" and handle.ordered == false and type(handle.name) == "string" then
 			local entry, updated = byName[handle.name], handle.updated or handle.created
 			if entry == nil then
 				byName[handle.name] = { created = handle.created, updated = updated }
@@ -625,9 +625,22 @@ function DataStore.new(options: { [string]: any }?): any
 			local prev = if ordered then normalizeOrderedRow(rawPrev, handle.created) else rawPrev
 			handle.data[key] = nil
 			if prev == nil then return nil, nil end
-			if not ordered and handle.versions[key] ~= nil then
-				local verRow = handle.versions[key][tostring(prev.version)]
-				if verRow ~= nil then verRow.deleted = true end
+			if not ordered then
+				local tombVer = math.max(prev.version + 1, (handle.nextVersion[key] or 0) + 1)
+				handle.nextVersion[key] = tombVer
+				local t = nowMs()
+				handle.versions[key] = handle.versions[key] or {}
+				handle.versions[key][tostring(tombVer)] = {
+					key = key,
+					value = nil,
+					version = tombVer,
+					deleted = true,
+					created = prev.created,
+					updated = t,
+					userIds = {},
+					metadata = {},
+				}
+				handle.updated = t
 			end
 			return copy(prev.value), makeKeyInfo(prev)
 		end)
@@ -642,7 +655,87 @@ function DataStore.new(options: { [string]: any }?): any
 		return handle
 	end
 
-	function mock.GetDataStore(_self: any, name: string, scope: string?, _options: any?): any
+	local function splitScopedKey(fullKey: any): (string, string)
+		if type(fullKey) ~= "string" then error("AllScopes key must be a string", 0) end
+		local slash = string.find(fullKey, "/", 1, true)
+		if slash == nil or slash == 1 or slash == #fullKey then
+			error(`AllScopes key '{fullKey}' must have format '<scope>/<key>'`, 0)
+		end
+		return string.sub(fullKey, 1, slash - 1), string.sub(fullKey, slash + 1)
+	end
+
+	local allScopesStores: { [string]: any } = {}
+
+	local function getAllScopesStore(name: string): any
+		checkName("DataStore name", name)
+		if allScopesStores[name] ~= nil then return allScopesStores[name] end
+		local allHandle: any = {}
+		for _, op in
+			{
+				"GetAsync",
+				"SetAsync",
+				"IncrementAsync",
+				"UpdateAsync",
+				"RemoveAsync",
+				"GetVersionAsync",
+				"RemoveVersionAsync",
+				"ListVersionsAsync",
+			}
+		do
+			allHandle[op] = function(_self: any, fullKey: string, ...: any): ...any
+				local sc, subKey = splitScopedKey(fullKey)
+				local target = createStore(name, sc, false)
+				return target[op](target, subKey, ...)
+			end
+		end
+		function allHandle.ListKeysAsync(
+			_self: any,
+			prefix: string?,
+			pageSize: number?,
+			cursor: string?,
+			excludeDeleted: boolean?
+		): any
+			record(name, "*", "ListKeysAsync", nil)
+			return guarded(REQUEST_TYPES.standard, "ListKeysAsync", function(): any
+				local present: { [string]: boolean } = {}
+				for _, h in mock.stores do
+					if type(h) == "table" and h.ordered == false and h.name == name and type(h.data) == "table" then
+						for key in h.data do
+							present[`{h.scope}/{key}`] = true
+						end
+						if not excludeDeleted and type(h.versions) == "table" then
+							for key, map in h.versions do
+								if next(map) ~= nil then present[`{h.scope}/{key}`] = true end
+							end
+						end
+					end
+				end
+				local names, items = {}, {}
+				for fullKey in present do
+					table.insert(names, fullKey)
+				end
+				for _, fullKey in listing(names, prefix, cursor) do
+					table.insert(items, { KeyName = fullKey })
+				end
+				return makePages(
+					items,
+					pageSize,
+					function() chargePageAdvance(REQUEST_TYPES.standard.ListKeysAsync) end,
+					function(item: any): string return item.KeyName end
+				)
+			end)
+		end
+		allScopesStores[name] = allHandle
+		return allHandle
+	end
+
+	function mock.GetDataStore(_self: any, name: string, scope: string?, storeOptions: any?): any
+		if type(storeOptions) == "table" and storeOptions.AllScopes == true then
+			if scope ~= nil and scope ~= "" then
+				error("GetDataStore: scope must be empty when AllScopes is true", 0)
+			end
+			return getAllScopesStore(name)
+		end
 		return createStore(name, scope, false)
 	end
 

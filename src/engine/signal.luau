@@ -44,6 +44,7 @@ export type Signal = {
 	connectParallel: (self: Signal, fn: (...any) -> ()) -> Connection,
 	wait: (self: Signal, yieldFn: (() -> ...any)?) -> ...any,
 	Fire: (self: Signal, ...any) -> (),
+	FireImmediate: (self: Signal, ...any) -> (),
 	DisconnectAll: (self: Signal) -> (),
 	connections: (self: Signal) -> number,
 	connected: (self: Signal) -> boolean,
@@ -211,10 +212,17 @@ local function invokeConnection(
 	else
 		local fn = conn._fn
 		if fn ~= nil then
+			local fnCall: (...any) -> any = fn :: any
+			local targetFn: (...any) -> () = if onError ~= nil
+				then function(...: any)
+					local ok: boolean, err: any = pcall(fnCall, ...)
+					if not ok then onError(err) end
+				end
+				else fn
 			if dispatch ~= nil then
-				dispatch(fn, ...)
+				dispatch(targetFn, ...)
 			else
-				fn(...)
+				targetFn(...)
 			end
 		end
 	end
@@ -260,7 +268,15 @@ function Signal.Fire(self: Signal, ...: any)
 					end
 				else
 					local fn = conn._fn
-					if fn ~= nil then fn(table.unpack(args, 1, args.n)) end
+					if fn ~= nil then
+						if onError ~= nil then
+							local fnCall: (...any) -> any = fn :: any
+							local ok: boolean, err: any = pcall(fnCall, table.unpack(args, 1, args.n))
+							if not ok then onError(err) end
+						else
+							fn(table.unpack(args, 1, args.n))
+						end
+					end
 				end
 			end)
 		end
@@ -269,6 +285,19 @@ function Signal.Fire(self: Signal, ...: any)
 
 	for _, conn in snapshot do
 		invokeConnection(conn, dispatch, resume, onError, ...)
+	end
+end
+
+function Signal.FireImmediate(self: Signal, ...: any)
+	local internal = self :: SignalInternal
+	local listeners = internal._listeners
+	if #listeners == 0 then return end
+	local snapshot = table.clone(listeners)
+	local host = internal._host
+	local resume = if host ~= nil then host.resume else nil
+	local onError = if host ~= nil then host.onError else nil
+	for _, conn in snapshot do
+		invokeConnection(conn, nil, resume, onError, ...)
 	end
 end
 
@@ -338,7 +367,5 @@ function Module.fromWorld(world: any, owner: any, onEmpty: (() -> ())?, immediat
 end
 
 function Module.is(value: any): boolean return type(value) == "table" and getmetatable(value) == SignalMT end
-
-function Module.isConnection(value: any): boolean return type(value) == "table" and getmetatable(value) == ConnectionMT end
 
 return Module

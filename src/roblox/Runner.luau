@@ -59,6 +59,8 @@ export type Request = {
 	deadline: number?,
 	repeatCount: number?,
 	["repeat"]: number?,
+	retry: number?,
+	shuffle: boolean?,
 	slowest: number?,
 	failFast: boolean?,
 	compact: boolean?,
@@ -440,6 +442,8 @@ local function buildRunOptions(
 	elseif request["repeat"] ~= nil then
 		base.repeatCount = request["repeat"]
 	end
+	if request.retry ~= nil then base.retry = request.retry end
+	if request.shuffle ~= nil then base.shuffle = request.shuffle end
 	if request.slowest ~= nil then base.slowest = request.slowest end
 	if request.failFast ~= nil then base.failFast = request.failFast end
 	if request.compact ~= nil then base.compact = request.compact end
@@ -519,7 +523,16 @@ local function executeSide(
 
 	registry.withState(sideState, function()
 		if sideDef ~= nil and sideDef.setup ~= nil then
-			local okSetup, cleanupOrErr = pcall(sideDef.setup, ctx)
+			local setupFn = sideDef.setup
+			local okSetup: boolean, cleanupOrErr: any = xpcall(
+				function(): any return setupFn(ctx) end,
+				function(e: any): any
+					local msg = format.errorText(e)
+					local loc = string.match(msg, "^(.-:%d+):")
+					local tb = util.cleanTraceback(debug.traceback(), loc)
+					return if tb ~= "" then `{msg}\n   stack:\n{tb}` else msg
+				end
+			)
 			if not okSetup then
 				table.insert(loadErrors, {
 					side = sideName,
@@ -574,7 +587,16 @@ local function executeSide(
 					})
 				elseif type(exported) == "function" then
 					sideState.file = entry.path
-					local okFn, fnErr = pcall(exported, ctx)
+					local expFn = exported :: (any) -> ()
+					local okFn: boolean, fnErr: any = xpcall(function(): any
+						expFn(ctx)
+						return nil
+					end, function(e: any): any
+						local msg = format.errorText(e)
+						local loc = string.match(msg, "^(.-:%d+):")
+						local tb = util.cleanTraceback(debug.traceback(), loc)
+						return if tb ~= "" then `{msg}\n   stack:\n{tb}` else msg
+					end)
 					sideState.file = nil
 					if not okFn then
 						table.insert(loadErrors, {
@@ -614,7 +636,13 @@ local function executeSide(
 		if envObj ~= nil then registry.setActiveEnv(prevActiveEnv) end
 
 		if teardownSetup ~= nil then
-			local okTd, tdErr = pcall(teardownSetup :: () -> ...any)
+			local fnTd = teardownSetup :: () -> ...any
+			local okTd, tdErr = xpcall(fnTd, function(e: any)
+				local msg = format.errorText(e)
+				local loc = string.match(msg, "^(.-:%d+):")
+				local tb = util.cleanTraceback(debug.traceback(), loc)
+				return if tb ~= "" then `{msg}\n   stack:\n{tb}` else msg
+			end)
 			if not okTd then
 				table.insert(loadErrors, {
 					side = sideName,

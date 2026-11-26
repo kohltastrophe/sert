@@ -89,7 +89,30 @@ function SpecModule.canonicalize(value: any): string
 			return `buf:{bytes.hex(v)}`
 		elseif t == "table" then
 			local tag = util.doubleTag(v)
-			if tag ~= nil then return `dt:{tag}:{format.repr(v)}` end
+			if tag == "Instance" then
+				local instName = "?"
+				pcall(function() instName = v:GetFullName() end)
+				return `dt:Instance:{v.ClassName or "?"}:{instName}:{rawget(v, "_id") or 0}`
+			elseif tag == "SharedTable" then
+				if active[v] then return "dt:SharedTable:<cycle>" end
+				active[v] = true
+				type StPair = { k: string, pair: string }
+				local pairsList: { StPair } = {}
+				for rawK, rawV in v do
+					local ks = encode(rawK)
+					local vs = encode(rawV)
+					table.insert(pairsList, { k = ks, pair = `{ks}={vs}` })
+				end
+				active[v] = nil
+				table.sort(pairsList, function(a: StPair, b: StPair): boolean return a.k < b.k end)
+				local entries = table.create(#pairsList)
+				for i, p in pairsList do
+					entries[i] = p.pair
+				end
+				return `dt:SharedTable:\{{table.concat(entries, ",")}\}`
+			elseif tag ~= nil then
+				return `dt:{tag}:{format.repr(v, 64)}`
+			end
 			if active[v] then return "t:<cycle>" end
 			active[v] = true
 			type PairEntry = { k: string, pair: string }

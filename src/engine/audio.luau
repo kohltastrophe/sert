@@ -313,9 +313,6 @@ function Audio.hasPlaying(env: any): boolean
 	return false
 end
 
---- Checks whether `cls` is a supported audio node class name.
-function Audio.isAudioNodeClass(cls: string): boolean return NODE_PINS[cls] ~= nil end
-
 local SharedNodeMethods = {
 	GetConnectedWires = function(self: any, pin: string): { any }
 		assert(type(pin) == "string", "GetConnectedWires: pin must be a string")

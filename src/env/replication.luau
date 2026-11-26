@@ -354,8 +354,8 @@ local function syncSubtree(rep: Replicator, srvInst: any, cliEnv: any, touched: 
 		end
 	end
 	remapRefs(rep, srvInst, cliInst, cliEnv, true, existed)
-	ctx.ensureRemoteBound(cliInst)
 	if rawget(cliInst, "_parent") ~= cliParent then cliInst.Parent = cliParent end
+	ctx.ensureRemoteBound(cliInst)
 	return cliInst
 end
 
@@ -534,6 +534,7 @@ return function(env: any, ctx: any)
 		local cliChild = syncSubtree(rep, srvChild, cliEnv, touched)
 		resolveRefsTo(rep, cliEnv, touched)
 		if cliChild ~= nil and rawget(cliChild, "_parent") ~= cliParent then cliChild.Parent = cliParent end
+		if cliChild ~= nil then ctx.ensureRemoteBound(cliChild) end
 		return cliChild
 	end
 

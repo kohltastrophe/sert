@@ -148,6 +148,16 @@ describe("sert.roblox.Layout: visibility, rotated AABB containment & viewport in
 			header.Position = e.UDim2.fromOffset(0, 0)
 			Layout.fitsViewport(sg :: any)
 
+			-- ScreenInsets = DeviceSafeInsets bypasses top-bar inset; CoreUISafeInsets shrinks usable height to 542.
+			local fullHeight = e.Instance.new("Frame")
+			fullHeight.Size = e.UDim2.fromOffset(100, 600)
+			fullHeight.Parent = sg
+			sert.throws(function() Layout.fitsViewport(sg :: any) end, "Layout.fitsViewport")
+			sg.ScreenInsets = e.Enum.ScreenInsets.DeviceSafeInsets
+			Layout.fitsViewport(sg :: any)
+			sg.ScreenInsets = e.Enum.ScreenInsets.CoreUISafeInsets
+			fullHeight:Destroy()
+
 			-- Unrotated ClipsDescendants clips overflowing children, whereas Rotation ~= 0 disables ClipsDescendants in Roblox!
 			local clipper = e.Instance.new("Frame")
 			clipper.Position = e.UDim2.fromOffset(700, 100)
@@ -741,5 +751,25 @@ describe("UIPageLayout, RichText stripping, and Layout/Flicker assertion auditin
 
 		sert.eq(res.passed, 12)
 		sert.eq(res.failed, 0)
+	end)
+
+	test("Layout.noTextOverflow scales UIPadding offsets under an ancestor UIScale", function()
+		local e = sert.env.new({ isClient = true, viewport = { X = 800, Y = 600 } })
+		local pg = e.LocalPlayer:FindFirstChild("PlayerGui")
+		local sg = e.Instance.new("ScreenGui", pg)
+		sg.IgnoreGuiInset = true
+		local uiScale = e.Instance.new("UIScale", sg)
+		uiScale.Scale = 0.7
+
+		local lbl = e.Instance.new("TextLabel", sg)
+		lbl.Size = e.UDim2.fromOffset(60, 40)
+		lbl.TextSize = 14
+		lbl.Text = "Bank"
+		local pad = e.Instance.new("UIPadding", lbl)
+		pad.PaddingLeft = e.UDim.new(0, 10)
+		pad.PaddingRight = e.UDim.new(0, 10)
+
+		e:step()
+		Layout.noTextOverflow(lbl)
 	end)
 end)

@@ -417,6 +417,38 @@ describe("Engine services via sert.env.new()", function()
 			local afterRemove = store:GetAsync("counter")
 			sert.eq(afterRemove, nil)
 
+			-- RemoveAsync appends a tombstone version instead of mutating the previous version row.
+			store:SetAsync("verKey", "v1")
+			local _v1Val, v1Info = store:GetAsync("verKey")
+			store:RemoveAsync("verKey")
+			local restoredVal, restoredInfo = store:GetVersionAsync("verKey", v1Info.Version)
+			sert.eq(restoredVal, "v1")
+			sert.eq(restoredInfo.Version, v1Info.Version)
+			local verPages = store:ListVersionsAsync("verKey")
+			local verEntries = verPages:GetCurrentPage()
+			sert.eq(#verEntries, 2)
+			sert.eq(verEntries[1].IsDeleted, false)
+			sert.eq(verEntries[2].IsDeleted, true)
+
+			-- DataStoreOptions.AllScopes = true spans across scopes via `<scope>/<key>`
+			local allOpts = e.Instance.new("DataStoreOptions")
+			allOpts.AllScopes = true
+			sert.throws(function() dss:GetDataStore("ScopedStore", "nonempty", allOpts) end, "AllScopes")
+			local allStore = dss:GetDataStore("ScopedStore", "", allOpts)
+			allStore:SetAsync("alpha/k1", { v = 1 })
+			allStore:SetAsync("beta/k2", { v = 2 })
+			sert.eq(allStore:GetAsync("alpha/k1"), { v = 1 })
+			sert.eq(dss:GetDataStore("ScopedStore", "alpha"):GetAsync("k1"), { v = 1 })
+			local allKeys = allStore:ListKeysAsync():GetCurrentPage()
+			local keyNames = {}
+			for _, entry in allKeys do
+				table.insert(keyNames, entry.KeyName)
+			end
+			sert.eq(keyNames, { "alpha/k1", "beta/k2" })
+			local listedAfterAllScopes = dss:ListDataStoresAsync("ScopedStore"):GetCurrentPage()
+			sert.eq(#listedAfterAllScopes, 1)
+			sert.eq(listedAfterAllScopes[1].DataStoreName, "ScopedStore")
+
 			-- OrderedDataStore: integer-only, ascending/descending, minValue/maxValue, DataStoreKeyInfo
 			local ods = dss:GetOrderedDataStore("Leaderboard")
 			sert.throws(function() ods:SetAsync("u1", 12.5) end, "integer")
@@ -507,6 +539,12 @@ describe("Engine services via sert.env.new()", function()
 		queue:RemoveAsync(id3)
 		local emptyAfter = queue:ReadAsync(1, false, 0)
 		sert.eq(emptyAfter, {})
+
+		-- MemoryStore enforces 32KB item cap and positive expiration > 0
+		sert.throws(function() hash:SetAsync("tooBig", string.rep("x", 33 * 1024), 60) end, "MemoryStore")
+		sert.throws(function() hash:SetAsync("zeroExp", "val", 0) end, "positive number")
+		sert.throws(function() sorted:SetAsync("zeroExp", "val", 0, 1) end, "positive number")
+		sert.throws(function() queue:AddAsync("val", 0, 1) end, "positive number")
 	end)
 
 	test("EncodingService, HttpService, Marketplace, Teleport, Collection, Tween, Input, and Players", function()

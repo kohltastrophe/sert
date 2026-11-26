@@ -455,6 +455,40 @@ describe("sert.sim.recorder() monotonic timestamps and World integration", funct
 				function() Sim.linearizable(counterModel, recBad:operations(), "lost update") end,
 				"lost update"
 			)
+
+			-- Deep (>depth 3) nested states remain distinct in linearizability state key memoization, and recorder:wrap captures extraRes and err.
+			local deepRec = Sim.recorder()
+			local d1, d2 = deepRec:wrap("p1", "multi", 1, function(): (string, number) return "ok", 99 end)
+			sert.eq(d1, "ok")
+			sert.eq(d2, 99)
+			sert.throws(function()
+				deepRec:wrap("p1", "fail", 2, function(): number error("boomWrap", 0) end)
+			end, "boomWrap")
+			local dOps = deepRec:operations()
+			sert.eq(dOps[1].extraRes, { 99 })
+			sert.contains(dOps[2].err :: string, "boomWrap")
+
+			local deepModel: SimMod.SequentialModel<any, number, number> = {
+				init = function() return { a = { b = { c = { d = { tag = "x" } } } } } end,
+				step = function(st: any, op: string, _arg: number, res: number): (boolean, any)
+					if op == "setA" then
+						st.a.b.c.d.tag = "a"
+						return res == 1, st
+					elseif op == "setB" then
+						st.a.b.c.d.tag = "b"
+						return res == 1, st
+					elseif op == "expectB" then
+						return st.a.b.c.d.tag == "b", st
+					end
+					return false, st
+				end,
+			}
+			local deepStateRes = Sim.checkLinearizable(deepModel, {
+				{ proc = "p1", op = "setA", arg = 0, res = 1, callAt = 1, retAt = 4 },
+				{ proc = "p2", op = "setB", arg = 0, res = 1, callAt = 1, retAt = 4 },
+				{ proc = "p3", op = "expectB", arg = 0, res = 1, callAt = 5, retAt = 6 },
+			})
+			sert.eq(deepStateRes.ok, true)
 		end
 	)
 end)

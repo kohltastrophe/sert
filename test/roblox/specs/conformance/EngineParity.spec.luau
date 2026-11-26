@@ -343,6 +343,21 @@ conformance("SharedTable, SharedTableRegistry, Actor, and Instance:GetActor conf
 	sert.eq(ST.size(frozen), 2)
 	sert.throws(function() (frozen :: any).hp = 99 end)
 
+	local cloned = ST.clone(st, true)
+	cloned.hp = 99
+	sert.eq(st.hp, 30)
+	sert.eq(cloned.hp, 99)
+
+	st.vec = vector.create(1, 2, 3)
+	st.pos = ctx.Vector3.new(4, 5, 6)
+	st.nested = ST.new({ tag = "sub" })
+	sert.eq(st.vec, vector.create(1, 2, 3))
+	sert.eq(st.nested.tag, "sub")
+	sert.throws(function()
+		st.badFn = function() end
+	end)
+	sert.throws(function() st.badInst = root end)
+
 	ST.clear(st)
 	sert.eq(ST.size(st), 0)
 
@@ -385,6 +400,15 @@ conformance("SharedTable, SharedTableRegistry, Actor, and Instance:GetActor conf
 	sert.eq(childPart:GetActor(), actor)
 	sert.eq(grandchildPart:GetActor(), actor)
 	sert.eq(outsidePart:GetActor(), nil)
+
+	if not ctx.isRoblox then
+		local gotMsg = ""
+		local msgConn = actor:BindToMessage("parity-ping", function(txt: string) gotMsg = txt end)
+		actor:SendMessage("parity-ping", "pong")
+		ctx.step(1 / 60)
+		sert.eq(gotMsg, "pong")
+		msgConn:Disconnect()
+	end
 end)
 
 local audioOpts = { target = "client" :: "client", container = "workspace" :: "workspace" }
@@ -648,3 +672,587 @@ conformance(
 		sert.eq(decodedMarkers[2].actual, "{\n  y = 2,\n}")
 	end
 )
+
+conformance(
+	"Instance lifecycle: Destroy order, Clone Archivable refs, WaitForChild, and NaN Changed",
+	function(root: Instance, ctx)
+		-- 1) Destroying fires synchronously BEFORE child teardown and locks Parent
+		local model: any = ctx.Instance.new("Model")
+		model.Name = "DestroyHost"
+		model.Parent = root
+		local child: any = ctx.Instance.new("Part")
+		child.Name = "DestroyChild"
+		child.Parent = model
+
+		local events: { string } = {}
+		local childParentDuringDestroying: any = nil
+		model.Destroying:Connect(function()
+			table.insert(events, "destroying")
+			childParentDuringDestroying = child.Parent
+		end)
+		local changedCount = 0
+		model.Changed:Connect(function()
+			changedCount += 1
+		end)
+
+		model:Destroy()
+		sert.eq(events, { "destroying" })
+		sert.eq(childParentDuringDestroying, model)
+		sert.eq(model.Parent, nil)
+		sert.eq(child.Parent, nil)
+		sert.throws(function() model.Parent = root end)
+
+		-- 2) Clone excludes Archivable = false children and clears internal refs pointing to them
+		local ext: any = ctx.Instance.new("Folder")
+		ext.Name = "ExternalRef"
+		ext.Parent = root
+
+		local proto: any = ctx.Instance.new("Folder")
+		proto.Name = "Proto"
+		proto.Parent = root
+
+		local keptPart: any = ctx.Instance.new("Part")
+		keptPart.Name = "KeptPart"
+		keptPart.Parent = proto
+
+		local skippedPart: any = ctx.Instance.new("Part")
+		skippedPart.Name = "SkippedPart"
+		skippedPart.Archivable = false
+		skippedPart.Parent = proto
+
+		local refKept: any = ctx.Instance.new("ObjectValue")
+		refKept.Name = "RefKept"
+		refKept.Value = keptPart
+		refKept.Parent = proto
+
+		local refSkipped: any = ctx.Instance.new("ObjectValue")
+		refSkipped.Name = "RefSkipped"
+		refSkipped.Value = skippedPart
+		refSkipped.Parent = proto
+
+		local refExternal: any = ctx.Instance.new("ObjectValue")
+		refExternal.Name = "RefExternal"
+		refExternal.Value = ext
+		refExternal.Parent = proto
+
+		local cloned: any = proto:Clone()
+		sert.ok(cloned ~= nil, "Clone should return new Folder")
+		local clonedKept = cloned:FindFirstChild("KeptPart")
+		sert.ok(clonedKept ~= nil)
+		sert.ne(clonedKept, keptPart)
+		sert.eq(cloned:FindFirstChild("SkippedPart"), nil)
+		sert.eq(cloned:FindFirstChild("RefKept").Value, clonedKept)
+		sert.eq(cloned:FindFirstChild("RefSkipped").Value, nil)
+		sert.eq(cloned:FindFirstChild("RefExternal").Value, ext)
+		cloned:Destroy()
+
+		-- 3) WaitForChild(name, 0) immediate/timeout and delayed resolution + ClearAllChildren
+		sert.eq(proto:WaitForChild("KeptPart", 0), keptPart)
+		sert.eq(proto:WaitForChild("MissingNow", 0), nil)
+
+		ctx.task.delay(0.02, function()
+			local late: any = ctx.Instance.new("StringValue")
+			late.Name = "DelayedChild"
+			late.Value = "ready"
+			late.Parent = proto
+		end)
+		local foundLate = proto:WaitForChild("DelayedChild", 2)
+		sert.ok(foundLate ~= nil, "WaitForChild should resume when DelayedChild arrives")
+		sert.eq(foundLate.Value, "ready")
+
+		proto:ClearAllChildren()
+		sert.eq(#proto:GetChildren(), 0)
+		sert.eq(proto.Parent, root)
+
+		-- 4) GetPropertyChangedSignal suppresses NaN -> NaN self-updates
+		local numPart: any = ctx.Instance.new("Part")
+		numPart.Parent = root
+		local propFires = 0
+		local cProp = numPart:GetPropertyChangedSignal("Transparency"):Connect(function()
+			propFires += 1
+		end)
+		local nan = 0 / 0
+		numPart.Transparency = nan
+		ctx.step(1 / 60)
+		local afterFirstNan = propFires
+		numPart.Transparency = nan
+		ctx.step(1 / 60)
+		sert.eq(propFires, afterFirstNan)
+		cProp:Disconnect()
+	end
+)
+
+conformance("BindableEvent cancellation, disconnect-during-fire, and RunService phases", function(root: Instance, ctx)
+	local ev: any = ctx.Instance.new("BindableEvent")
+	ev.Name = "ParityBindable"
+	ev.Parent = root
+
+	local log: { string } = {}
+	local c2: any = nil
+	local c1 = ev.Event:Connect(function(tag: string)
+		table.insert(log, `c1:{tag}`)
+		if c2 ~= nil then
+			c2:Disconnect()
+			c2 = nil
+		end
+	end)
+	c2 = ev.Event:Connect(function(tag: string) table.insert(log, `c2:{tag}`) end)
+	ev.Event:Once(function(tag: string) table.insert(log, `once:{tag}`) end)
+
+	ev:Fire("first")
+	ctx.step(1 / 60)
+	sert.eq(log[1], "c1:first")
+	sert.contains(log, "once:first")
+
+	table.clear(log)
+	ev:Fire("second")
+	ctx.step(1 / 60)
+	sert.eq(log, { "c1:second" })
+
+	-- Task cancellation of Wait() coroutine
+	local resumed = false
+	local waiterThread = ctx.task.spawn(function()
+		ev.Event:Wait()
+		resumed = true
+	end)
+	ctx.task.cancel(waiterThread)
+	ev:Fire("after-cancel")
+	ctx.step(1 / 60)
+	sert.eq(resumed, false)
+	c1:Disconnect()
+
+	-- RunService frame phase signals
+	local rs: any = ctx.getService("RunService")
+	local order: { string } = {}
+	local conns: { any } = {
+		rs.PreSimulation:Connect(function() table.insert(order, "PreSimulation") end),
+		rs.Stepped:Connect(function() table.insert(order, "Stepped") end),
+		rs.PostSimulation:Connect(function() table.insert(order, "PostSimulation") end),
+		rs.Heartbeat:Connect(function() table.insert(order, "Heartbeat") end),
+	}
+	ctx.step(1 / 60)
+	for _, conn in conns do
+		conn:Disconnect()
+	end
+	sert.contains(order, "PreSimulation")
+	sert.contains(order, "Stepped")
+	sert.contains(order, "PostSimulation")
+	sert.contains(order, "Heartbeat")
+
+	local preIdx = table.find(order, "PreSimulation") :: number
+	local postIdx = table.find(order, "PostSimulation") :: number
+	local stepIdx = table.find(order, "Stepped") :: number
+	local hbIdx = table.find(order, "Heartbeat") :: number
+	sert.lt(preIdx, postIdx)
+	sert.lt(stepIdx, hbIdx)
+
+	-- Headless Immediate vs Deferred re-entrancy depth guard parity
+	if ctx.env ~= nil then
+		for _, behavior in { "Immediate", "Deferred" } do
+			local subEnv = sert.env.new({ signalBehavior = behavior :: any })
+			local be = subEnv.Instance.new("BindableEvent", subEnv.workspace)
+			local fires = 0
+			be.Event:Connect(function(depth: number)
+				fires += 1
+				if depth < 120 then be:Fire(depth + 1) end
+			end)
+			be:Fire(1)
+			local okStep, stepErr = pcall(function() subEnv:step(1 / 60) end)
+			if behavior == "Deferred" then
+				sert.eq(okStep, false)
+				sert.contains(tostring(stepErr), "re-entrancy")
+				sert.eq(fires, 80)
+			else
+				sert.eq(okStep, true)
+				sert.eq(fires, 120)
+			end
+			subEnv:destroy()
+		end
+	end
+end)
+
+conformance(
+	"DataStore & MemoryStore validation, UpdateAsync nil-cancel, and collections",
+	function(_root: Instance, ctx)
+		local dss: any = ctx.getService("DataStoreService")
+		local mss: any = ctx.getService("MemoryStoreService")
+
+		sert.throws(function() dss:GetDataStore("") end)
+		sert.throws(function() mss:GetSortedMap("") end)
+
+		local runStateful = not ctx.isRoblox
+		if ctx.isRoblox then
+			local probeStore = dss:GetDataStore("SertParityProbe")
+			local okProbe = pcall(function() return probeStore:GetAsync("__sert_parity_probe") end)
+			runStateful = okProbe
+		end
+
+		if runStateful then
+			local ds = dss:GetDataStore("SertParityStore")
+			local key = `k_{math.floor(os.clock() * 1000)}`
+			ds:SetAsync(key, { coins = 10 })
+			local got = ds:GetAsync(key)
+			sert.eq(got.coins, 10)
+
+			-- Returning nil cancels UpdateAsync cleanly
+			local cancelRes = ds:UpdateAsync(key, function(_cur: any): any return nil end)
+			sert.eq(cancelRes, nil)
+			sert.eq(ds:GetAsync(key).coins, 10)
+
+			local incVal = ds:IncrementAsync(`cnt_{key}`, 5)
+			sert.eq(incVal, 5)
+			ds:RemoveAsync(key)
+			ds:RemoveAsync(`cnt_{key}`)
+
+			local ods = dss:GetOrderedDataStore("SertParityOrdered")
+			sert.throws(function() ods:SetAsync("badFloat", 1.5) end)
+
+			local sm = mss:GetSortedMap("SertParitySorted")
+			sert.throws(function() sm:SetAsync("badExp", 1, 0) end)
+			sert.throws(function() sm:SetAsync("tooBig", string.rep("x", 33 * 1024), 30) end)
+			sm:SetAsync("s1", "val1", 30, 5)
+			local sVal = sm:GetAsync("s1")
+			sert.eq(sVal, "val1")
+			sm:RemoveAsync("s1")
+
+			local hm = mss:GetHashMap("SertParityHash")
+			hm:SetAsync("h1", 42, 30)
+			sert.eq(hm:GetAsync("h1"), 42)
+			hm:RemoveAsync("h1")
+
+			local q = mss:GetQueue("SertParityQueue", 1)
+			q:AddAsync("job1", 30)
+			local items, readId = q:ReadAsync(1, false, 0)
+			sert.eq(items, { "job1" })
+			if readId ~= nil then q:RemoveAsync(readId) end
+		end
+	end
+)
+
+conformance("Remotes: event/function contracts and payload sanitization parity", function(_root: Instance, ctx)
+	local rs: any = ctx.getService("ReplicatedStorage")
+	local re: any = ctx.Instance.new("RemoteEvent")
+	re.Name = "ParityRE"
+	re.Parent = rs
+	local ure: any = ctx.Instance.new("UnreliableRemoteEvent")
+	ure.Name = "ParityURE"
+	ure.Parent = rs
+	local rf: any = ctx.Instance.new("RemoteFunction")
+	rf.Name = "ParityRF"
+	rf.Parent = rs
+
+	sert.eq(re.ClassName, "RemoteEvent")
+	sert.eq(ure.ClassName, "UnreliableRemoteEvent")
+	sert.eq(rf.ClassName, "RemoteFunction")
+	sert.eq(re:IsA("BaseRemoteEvent"), true)
+	sert.eq(ure:IsA("BaseRemoteEvent"), true)
+	sert.eq(rf:IsA("BaseRemoteEvent"), false)
+
+	local connS = re.OnServerEvent:Connect(function() end)
+	local connU = ure.OnServerEvent:Connect(function() end)
+	re:FireAllClients("ok", 1)
+	ure:FireAllClients("fast", 2)
+	rf.OnServerInvoke = function(_plr: any, v: number): number return v + 1 end
+	rf.OnServerInvoke = nil
+	connS:Disconnect()
+	connU:Disconnect()
+	re:Destroy()
+	ure:Destroy()
+	rf:Destroy()
+
+	if not ctx.isRoblox then
+		local w = sert.sim.new({ seed = 11, instant = true })
+		local srv = w:server()
+		local cli = srv:client(201)
+		local sEnv = srv:env()
+		local cEnv = cli:env()
+
+		local sRe = sEnv.Instance.new("RemoteEvent", sEnv:getService("ReplicatedStorage"))
+		sRe.Name = "SimRE"
+		local sUre = sEnv.Instance.new("UnreliableRemoteEvent", sEnv:getService("ReplicatedStorage"))
+		sUre.Name = "SimURE"
+		local sRf = sEnv.Instance.new("RemoteFunction", sEnv:getService("ReplicatedStorage"))
+		sRf.Name = "SimRF"
+		w:step()
+
+		local cRe = cEnv:getService("ReplicatedStorage"):FindFirstChild("SimRE") :: any
+		local cUre = cEnv:getService("ReplicatedStorage"):FindFirstChild("SimURE") :: any
+		local cRf = cEnv:getService("ReplicatedStorage"):FindFirstChild("SimRF") :: any
+
+		local mixedRecv: any = nil
+		local instRecv: any = "unset"
+		sRe.OnServerEvent:Connect(function(_plr: any, mixed: any, secret: any)
+			mixedRecv = mixed
+			instRecv = secret
+		end)
+		local clientHidden = cEnv.Instance.new("Folder")
+		cRe:FireServer({ [1] = "first", extra = "dropped" }, clientHidden)
+		w:step()
+		sert.eq(mixedRecv, { "first" })
+		sert.eq(instRecv, nil)
+
+		local ureCount = 0
+		sUre.OnServerEvent:Connect(function()
+			ureCount += 1
+		end)
+		cUre:FireServer(buffer.create(1024))
+		w:step()
+		sert.eq(ureCount, 0)
+		cUre:FireServer(buffer.create(64))
+		w:step()
+		sert.eq(ureCount, 1)
+
+		sRf.OnServerInvoke = function() error("bad request", 0) end
+		local invOk: boolean? = nil
+		local invErr: any = nil
+		cli:spawn(function()
+			invOk, invErr = pcall(function() return cRf:InvokeServer() end)
+		end)
+		w:run(0.5)
+		sert.eq(invOk, false)
+		sert.contains(tostring(invErr), "bad request")
+	end
+end)
+
+conformance(
+	"UI Layout & Text: List/Grid/Padding/Scale/Constraints, AutomaticSize, Insets, Rotation & GetTextBoundsAsync",
+	function(root: Instance, ctx)
+		-- 1) Wrapped UIListLayout + UIPadding + UIScale + AbsoluteRotation
+		local listHost: any = ctx.Instance.new("Frame")
+		listHost.Name = "ListHost"
+		listHost.Size = ctx.UDim2.fromOffset(120, 0)
+		listHost.AutomaticSize = ctx.Enum.AutomaticSize.Y
+		listHost.Rotation = 15
+		listHost.Parent = root
+
+		local hostPad: any = ctx.Instance.new("UIPadding")
+		hostPad.PaddingLeft = ctx.UDim.new(0, 10)
+		hostPad.PaddingTop = ctx.UDim.new(0, 8)
+		hostPad.Parent = listHost
+
+		local listLayout: any = ctx.Instance.new("UIListLayout")
+		listLayout.FillDirection = ctx.Enum.FillDirection.Horizontal
+		listLayout.Wraps = true
+		listLayout.SortOrder = ctx.Enum.SortOrder.LayoutOrder
+		listLayout.Padding = ctx.UDim.new(0, 5)
+		listLayout.Parent = listHost
+
+		local c1: any = ctx.Instance.new("Frame")
+		c1.LayoutOrder = 1
+		c1.Size = ctx.UDim2.fromOffset(60, 20)
+		c1.Rotation = 10
+		c1.Parent = listHost
+
+		local c2: any = ctx.Instance.new("Frame")
+		c2.LayoutOrder = 2
+		c2.Size = ctx.UDim2.fromOffset(60, 20)
+		c2.Parent = listHost
+
+		-- 2) UIScale + UISizeConstraint + UIAspectRatioConstraint
+		local scaledHost: any = ctx.Instance.new("Frame")
+		scaledHost.Size = ctx.UDim2.fromOffset(200, 200)
+		scaledHost.Position = ctx.UDim2.fromOffset(0, 150)
+		scaledHost.Parent = root
+		local sc: any = ctx.Instance.new("UIScale")
+		sc.Scale = 2
+		sc.Parent = scaledHost
+		local box: any = ctx.Instance.new("Frame")
+		box.Size = ctx.UDim2.fromOffset(40, 20)
+		box.Parent = scaledHost
+		local szConstraint: any = ctx.Instance.new("UISizeConstraint")
+		szConstraint.MinSize = ctx.Vector2.new(50, 20)
+		szConstraint.MaxSize = ctx.Vector2.new(120, 80)
+		szConstraint.Parent = box
+
+		local ratioBox: any = ctx.Instance.new("Frame")
+		ratioBox.Size = ctx.UDim2.fromOffset(100, 100)
+		ratioBox.Position = ctx.UDim2.fromOffset(0, 40)
+		ratioBox.Parent = scaledHost
+		local aspect: any = ctx.Instance.new("UIAspectRatioConstraint")
+		aspect.AspectRatio = 2
+		aspect.Parent = ratioBox
+
+		-- 3) UIGridLayout
+		local gridHost: any = ctx.Instance.new("Frame")
+		gridHost.Size = ctx.UDim2.fromOffset(200, 100)
+		gridHost.Position = ctx.UDim2.fromOffset(250, 0)
+		gridHost.Parent = root
+		local grid: any = ctx.Instance.new("UIGridLayout")
+		grid.CellSize = ctx.UDim2.fromOffset(40, 20)
+		grid.CellPadding = ctx.UDim2.fromOffset(10, 5)
+		grid.SortOrder = ctx.Enum.SortOrder.LayoutOrder
+		grid.Parent = gridHost
+		local g1: any = ctx.Instance.new("Frame")
+		g1.LayoutOrder = 1
+		g1.Parent = gridHost
+		local g2: any = ctx.Instance.new("Frame")
+		g2.LayoutOrder = 2
+		g2.Parent = gridHost
+
+		ctx.step(1 / 60)
+
+		sert.near(c1.AbsoluteRotation, 25, 1e-3)
+		sert.gt(c2.AbsolutePosition.Y, c1.AbsolutePosition.Y)
+		sert.ge(listHost.AbsoluteSize.Y, 40)
+		sert.near(box.AbsoluteSize.X, 100, 1e-2)
+		sert.near(ratioBox.AbsoluteSize.X, ratioBox.AbsoluteSize.Y * 2, 1e-2)
+		sert.near(g2.AbsolutePosition.X - g1.AbsolutePosition.X, 50, 1e-2)
+
+		-- 4) GuiService:GetGuiInset + ScreenGui.IgnoreGuiInset
+		local guiService: any = ctx.getService("GuiService")
+		local tlInset, brInset = guiService:GetGuiInset()
+		sert.ge(tlInset.Y, 0)
+		sert.ge(brInset.X, 0)
+		local origIgnore = (root :: any).IgnoreGuiInset
+		local fullY = (root :: any).AbsoluteSize.Y
+		if tlInset.Y > 0 then
+			(root :: any).IgnoreGuiInset = false
+			ctx.step(1 / 60)
+			sert.lt((root :: any).AbsoluteSize.Y, fullY);
+			(root :: any).IgnoreGuiInset = origIgnore
+		end
+
+		-- 5) TextService:GetTextBoundsAsync
+		local textService: any = ctx.getService("TextService")
+		local pShort: any = ctx.Instance.new("GetTextBoundsParams")
+		pShort.Font = ctx.Font.fromEnum(ctx.Enum.Font.SourceSans)
+		pShort.Size = 18
+		pShort.Text = "Hi"
+		pShort.Width = 400
+		local bShort = textService:GetTextBoundsAsync(pShort)
+
+		local pLong: any = ctx.Instance.new("GetTextBoundsParams")
+		pLong.Font = ctx.Font.fromEnum(ctx.Enum.Font.SourceSans)
+		pLong.Size = 18
+		pLong.Text = "Hello Parity World"
+		pLong.Width = 400
+		local bLong = textService:GetTextBoundsAsync(pLong)
+		sert.gt(bShort.X, 0)
+		sert.gt(bShort.Y, 0)
+		sert.gt(bLong.X, bShort.X)
+	end,
+	uiOpts
+)
+
+conformance("CollectionService tags, DataModel signals, and Attribute validation", function(root: Instance, ctx)
+	local cs: any = ctx.getService("CollectionService")
+	local tag = "SertParityTag"
+	local p: any = ctx.Instance.new("Part")
+	p.Name = "TaggedPart"
+
+	local addedLog: { any } = {}
+	local removedLog: { any } = {}
+	local cAdd = cs:GetInstanceAddedSignal(tag):Connect(function(inst: any) table.insert(addedLog, inst) end)
+	local cRem = cs:GetInstanceRemovedSignal(tag):Connect(function(inst: any) table.insert(removedLog, inst) end)
+
+	cs:AddTag(p, tag)
+	sert.eq(cs:HasTag(p, tag), true)
+	sert.eq(#addedLog, 0)
+
+	p.Parent = root
+	ctx.step(1 / 60)
+	sert.eq(#addedLog, 1)
+	sert.contains(cs:GetTagged(tag), p)
+	sert.contains(cs:GetAllTags(), tag)
+
+	p.Parent = nil
+	ctx.step(1 / 60)
+	sert.eq(#removedLog, 1)
+	cs:RemoveTag(p, tag)
+	sert.eq(cs:GetTags(p), {})
+	cAdd:Disconnect()
+	cRem:Disconnect()
+
+	-- Attribute datatype support & forbidden values
+	local attrChangeCount = 0
+	local cAttr = p:GetAttributeChangedSignal("Pos"):Connect(function()
+		attrChangeCount += 1
+	end)
+	local targetVec = ctx.Vector3.new(3, 4, 5)
+	p:SetAttribute("Pos", targetVec)
+	p:SetAttribute("Tint", ctx.Color3.fromRGB(10, 20, 30))
+	p:SetAttribute("Brick", ctx.BrickColor.new(194))
+	p:SetAttribute("Range", ctx.NumberRange.new(1, 5))
+	p:SetAttribute("Gradient", ctx.ColorSequence.new(ctx.Color3.new(1, 0, 0), ctx.Color3.new(0, 0, 1)))
+	p:SetAttribute("Curve", ctx.NumberSequence.new(0, 1))
+	ctx.step(1 / 60)
+	sert.eq(attrChangeCount, 1)
+	sert.near(p:GetAttribute("Pos"), targetVec, 1e-4)
+	sert.throws(function() p:SetAttribute("BadInst", root) end)
+	sert.throws(function() p:SetAttribute("BadTbl", { a = 1 }) end)
+	p:SetAttribute("Pos", nil)
+	sert.eq(p:GetAttribute("Pos"), nil)
+	cAttr:Disconnect()
+end)
+
+conformance("Spatial Cylinder/CanQuery, AudioPlayer, and TweenService parity", function(root: Instance, ctx)
+	local ws: any = ctx.workspace
+	local v3: any = ctx.Vector3
+	local cf: any = ctx.CFrame
+
+	-- 1) Cylinder OBB vs AABB corner + GetPartBoundsInRadius + CanQuery
+	local cyl: any = ctx.Instance.new("Part")
+	cyl.Name = "ParityCylinder"
+	cyl.Shape = ctx.Enum.PartType.Cylinder
+	cyl.Size = v3.new(6, 4, 4) -- cylinder axis along local X; radius = 2 in YZ
+	cyl.CFrame = cf.new(120, 10, 0)
+	cyl.Anchored = true
+	cyl.Parent = root
+
+	local cylParams = makeRaycastInclude(ctx, { cyl })
+	local hitCenter = ws:Raycast(v3.new(120, 18, 0), v3.new(0, -12, 0), cylParams)
+	sert.ok(hitCenter ~= nil, "ray on cylinder center should hit")
+	sert.near(hitCenter.Distance, 6, 1e-2)
+
+	local missCorner = ws:Raycast(v3.new(115, 11.8, 1.8), v3.new(10, 0, 0), cylParams)
+	sert.eq(missCorner, nil)
+
+	local ovParams = makeOverlapInclude(ctx, { cyl })
+	sert.eq(namesOf(ws:GetPartBoundsInRadius(v3.new(120, 10, 2.5), 1, ovParams)), { "ParityCylinder" })
+
+	cyl.CanQuery = false
+	sert.eq(ws:Raycast(v3.new(120, 18, 0), v3.new(0, -12, 0), cylParams), nil)
+	sert.eq(ws:GetPartBoundsInRadius(v3.new(120, 10, 0), 3, ovParams), {})
+
+	-- 2) AudioPlayer play/stop parity
+	local ap: any = ctx.Instance.new("AudioPlayer")
+	ap.Looping = false
+	ap.Volume = 0.75
+	ap.Parent = root
+	ap:Play()
+	if not ctx.isRoblox then sert.eq(ap.IsPlaying, true) end
+	ap:Stop()
+	if not ctx.isRoblox then sert.eq(ap.IsPlaying, false) end
+
+	-- 3) TweenService linear play & cancel
+	local tweenSvc: any = ctx.getService("TweenService")
+	local target: any = ctx.Instance.new("Part")
+	target.Anchored = true
+	target.Transparency = 0
+	target.Parent = root
+
+	local info = ctx.TweenInfo.new(0.08, ctx.Enum.EasingStyle.Linear, ctx.Enum.EasingDirection.Out)
+	local tw = tweenSvc:Create(target, info, { Transparency = 0.5 })
+	sert.eq(tw.PlaybackState, ctx.Enum.PlaybackState.Begin)
+	local completedState: any = nil
+	tw.Completed:Once(function(state: any) completedState = state end)
+	tw:Play()
+	if not ctx.isRoblox then sert.eq(tw.PlaybackState, ctx.Enum.PlaybackState.Playing) end
+	ctx.step(0.12)
+	sert.eq(completedState, ctx.Enum.PlaybackState.Completed)
+	sert.eq(tw.PlaybackState, ctx.Enum.PlaybackState.Completed)
+	sert.near(target.Transparency, 0.5, 1e-2)
+
+	local tw2 =
+		tweenSvc:Create(target, ctx.TweenInfo.new(0.5, ctx.Enum.EasingStyle.Linear, ctx.Enum.EasingDirection.Out), {
+			Transparency = 1,
+		})
+	local cancelState: any = nil
+	tw2.Completed:Once(function(state: any) cancelState = state end)
+	tw2:Play()
+	ctx.step(0.02)
+	tw2:Cancel()
+	ctx.step(1 / 60)
+	sert.eq(tw2.PlaybackState, ctx.Enum.PlaybackState.Cancelled)
+	sert.eq(cancelState, ctx.Enum.PlaybackState.Cancelled)
+end)

@@ -12,7 +12,7 @@ local DEFAULT_WAIT_CAP = 300
 local MAX_EXPIRATION = 3888000
 local MAX_KEY_BYTES = 128
 local MAX_SORT_KEY_BYTES = 128
-local MAX_ITEM_BYTES = 128 * 1024
+local MAX_ITEM_BYTES = 32 * 1024
 
 local function checkMapName(where: string, name: any)
 	if type(name) ~= "string" or #name == 0 or #name > 128 then
@@ -27,8 +27,8 @@ local function checkKey(where: string, key: any)
 end
 
 local function checkExpiration(where: string, expiry: any)
-	if type(expiry) ~= "number" or expiry ~= expiry or expiry < 0 or expiry > MAX_EXPIRATION then
-		error(`{where}: expiration must be a number in 0..{MAX_EXPIRATION}`, 0)
+	if type(expiry) ~= "number" or expiry ~= expiry or expiry <= 0 or expiry > MAX_EXPIRATION then
+		error(`{where}: expiration must be a positive number in (0, {MAX_EXPIRATION}]`, 0)
 	end
 end
 

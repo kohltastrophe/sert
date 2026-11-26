@@ -21,7 +21,7 @@ export type ViewportPreset = {
 
 local PRESET_MAP: { [string]: Vector2 } = {
 	Phone = v2(390, 844),
-	SmallPhone = v2(320, 568),
+	SmallPhone = v2(375, 667),
 	Tablet = v2(820, 1180),
 	Desktop = v2(1920, 1080),
 	Console = v2(1920, 1080),
@@ -347,10 +347,14 @@ local function resolveViewportBounds(root: Instance, override: Vector2?): (Vecto
 	end
 
 	local usableW, usableH = rawVp.X, rawVp.Y
+	local screenInsets = if layer ~= nil and layer:IsA("ScreenGui") then (layer :: any).ScreenInsets else nil
+	local insetName = if screenInsets ~= nil then screenInsets.Name else nil
 	if
 		layer ~= nil
 		and layer:IsA("ScreenGui")
 		and not (layer :: ScreenGui).IgnoreGuiInset
+		and insetName ~= "None"
+		and insetName ~= "DeviceSafeInsets"
 		and not fromNativeLayerSize
 	then
 		if dm ~= nil then
@@ -633,16 +637,36 @@ function Layout.fitsViewport(root: Instance, opts: FitsViewportOptions?)
 	visit(root)
 end
 
+local function effectiveUiScale(inst: Instance): number
+	local factor = 1
+	local cur: Instance? = inst
+	while cur ~= nil do
+		if cur:IsA("GuiBase2d") then
+			for _, ch in cur:GetChildren() do
+				if ch:IsA("UIScale") then
+					local scale = (ch :: UIScale).Scale
+					if type(scale) == "number" then
+						factor *= if scale ~= scale or scale < 0 then 0 else scale
+					end
+				end
+			end
+		end
+		cur = cur.Parent
+	end
+	return factor
+end
+
 local function innerTextSize(gui: GuiObject): (number, number)
 	local size = gui.AbsoluteSize
+	local scale = effectiveUiScale(gui)
 	local padL, padR, padT, padB = 0, 0, 0, 0
 	for _, ch in gui:GetChildren() do
 		if ch:IsA("UIPadding") then
 			local p = ch :: UIPadding
-			padL += size.X * p.PaddingLeft.Scale + p.PaddingLeft.Offset
-			padR += size.X * p.PaddingRight.Scale + p.PaddingRight.Offset
-			padT += size.Y * p.PaddingTop.Scale + p.PaddingTop.Offset
-			padB += size.Y * p.PaddingBottom.Scale + p.PaddingBottom.Offset
+			padL += size.X * p.PaddingLeft.Scale + p.PaddingLeft.Offset * scale
+			padR += size.X * p.PaddingRight.Scale + p.PaddingRight.Offset * scale
+			padT += size.Y * p.PaddingTop.Scale + p.PaddingTop.Offset * scale
+			padB += size.Y * p.PaddingBottom.Scale + p.PaddingBottom.Offset * scale
 		end
 	end
 	return math.max(0, size.X - padL - padR), math.max(0, size.Y - padT - padB)

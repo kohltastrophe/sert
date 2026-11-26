@@ -210,6 +210,16 @@ describe("Unified Spec<State, Sut>, sert.sim.vopr, shrinking & replay tokens", f
 		local cStr = Sim.canonicalize({ ["1"] = "same" })
 		sert.ne(cNum, cStr)
 
+		-- SharedTable integer-keyed and mixed entries must hash distinct contents (not nil)
+		local stEnv = sert.env.new()
+		local stAlpha = stEnv.SharedTable.new({ "alpha", "beta" })
+		local stGamma = stEnv.SharedTable.new({ "gamma", "delta" })
+		sert.ne(Sim.canonicalize(stAlpha), Sim.canonicalize(stGamma))
+		sert.ne(
+			Sim.canonicalize(stEnv.SharedTable.new({ [1] = "same" })),
+			Sim.canonicalize(stEnv.SharedTable.new({ ["1"] = "same" }))
+		)
+
 		type CounterState = { n: number }
 		local counterSpec = Sim.spec({
 			name = "BoundedCounter",
@@ -324,7 +334,7 @@ describe("Unified Spec<State, Sut>, sert.sim.vopr, shrinking & replay tokens", f
 			})
 
 			local ok, errObj = pcall(
-				function() Sim.check(buggySpec, { runs = 30, steps = 12, seed = 1337, bfs = false }) end
+				function() Sim.check(buggySpec, { runs = 30, steps = 12, seed = 1337, bfs = false, capMutant = false }) end
 			)
 			sert.eq(ok, false)
 			local report = tostring(errObj)
@@ -1867,6 +1877,7 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 				maxRuns = 32,
 				seed = 7,
 				stateHash = mode,
+				capMutant = false,
 			}, function(w: sert.SimWorld)
 				exactRuns += 1
 				local _a = w.scheduler:choose(2, "a")
@@ -1883,6 +1894,7 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 					maxRuns = 32,
 					seed = 7,
 					stateHash = mode,
+					capMutant = false,
 				}, function(w: sert.SimWorld)
 					local secret = if w.scheduler:choose(2, "c1") == 1 then "left" else "right"
 					local _mid = w.scheduler:choose(2, "mid")
@@ -1899,6 +1911,7 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 			maxRuns = 64,
 			seed = 19,
 			stateHash = "backing" :: "backing",
+			capMutant = false,
 		}, function(w: sert.SimWorld)
 			observedRuns += 1
 			w:setLatency("DataStoreService", 0)
@@ -1957,6 +1970,7 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 				frame = 0.05,
 				faults = "none",
 				stateHash = "backing" :: "backing",
+				capMutant = false,
 			}, function(w: sert.SimWorld)
 				w:setLatency("remote", 0.5)
 				local srv = w:server({ name = "srv", skew = 0 })
@@ -1980,6 +1994,7 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 				frame = 0.05,
 				faults = "none",
 				stateHash = "backing" :: "backing",
+				capMutant = false,
 			}, function(w: sert.SimWorld)
 				w:setLatency("MessagingService", 0)
 				w:setLatency("delivery", 0.5)
@@ -2007,6 +2022,7 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 				seenWorlds += 1
 				return `{#world.servers}:{math.round(world:now() * 1000)}`
 			end,
+			capMutant = false,
 		}, function(w: sert.SimWorld)
 			w:server({ name = "alpha", skew = 0 })
 			local _a = w.scheduler:choose(2, "pickA")
@@ -2152,4 +2168,216 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 			sert.eq((expUncapped :: SimMod.ExploreOutcome).runs, 8)
 		end
 	)
+
+	test(
+		"Milestone 3a parity: deferred signals, RPC disconnect/nil wait, remote isolation, DataStore faults, and stateHash",
+		function()
+			-- 1. Deferred signal behavior on World/Fabric (disconnect before step cancels delivery) & explicit slot
+			local w = Sim.new({ seed = 31 })
+			local srv3 = w:server({ slot = 3 })
+			sert.eq(w.servers[3], srv3)
+			local joinedAfterDisconnect = 0
+			local cJoin = srv3.Players.PlayerAdded:Connect(function()
+				joinedAfterDisconnect += 1
+			end)
+			srv3:join(701)
+			cJoin:Disconnect()
+			w:step()
+			sert.eq(joinedAfterDisconnect, 0)
+
+			-- 2. RemoteFunction disconnect abort keeps unrelated client alive & nil handler yields cleanly until assigned
+			local srv = w:server()
+			local cDrop = srv:client(1)
+			local cStay = srv:client(2)
+			local rfs = srv.remotes
+			rfs:rpc("SlowRpc").OnServerInvoke = function(_plr: any, x: number): number
+				w:sleep(0.2)
+				return x * 2
+			end
+			cDrop.remotes:rpc("SlowClientRpc").OnClientInvoke = function(x: number): number
+				w:sleep(0.2)
+				return x * 3
+			end
+			local dropRpcErr: any = nil
+			local stayVal: any = nil
+			srv:spawn(function()
+				local ok, res = pcall(function() return rfs:rpc("SlowClientRpc"):InvokeClient(cDrop.player, 10) end)
+				if not ok then dropRpcErr = res end
+			end)
+			cStay:spawn(function() stayVal = cStay.remotes:rpc("SlowRpc"):InvokeServer(21) end)
+			w:step()
+			cDrop:disconnect()
+			w:converge()
+			sert.eq(stayVal, 42)
+			sert.contains(tostring(dropRpcErr), "disconnected")
+
+			-- Nil OnServerInvoke yields until handler is later assigned
+			local delayedRpc = rfs:rpc("DelayedRpc")
+			local delayedOut: any = nil
+			cStay:spawn(function() delayedOut = cStay.remotes:rpc("DelayedRpc"):InvokeServer(9) end)
+			w:run(0.05)
+			sert.eq(delayedOut, nil)
+			delayedRpc.OnServerInvoke = function(_plr: any, x: number): number return x + 1 end
+			w:converge()
+			sert.eq(delayedOut, 10)
+
+			-- 3. Folder-scoped remote channel isolation + UnreliableRemoteEvent 2KB buffer cap
+			local sEnv = srv:env()
+			local cEnv = cStay:env()
+			local sRS = sEnv:getService("ReplicatedStorage")
+			local cRS = cEnv:getService("ReplicatedStorage")
+			local fA = sEnv.Instance.new("Folder", sRS)
+			fA.Name = "FolderA"
+			local fB = sEnv.Instance.new("Folder", sRS)
+			fB.Name = "FolderB"
+			local rA = sEnv.Instance.new("RemoteEvent", fA)
+			rA.Name = "Ping"
+			local rB = sEnv.Instance.new("RemoteEvent", fB)
+			rB.Name = "Ping"
+			local ure = sEnv.Instance.new("UnreliableRemoteEvent", fA)
+			ure.Name = "Ping"
+			w:step()
+
+			local hitsA, hitsB, hitsU = 0, 0, 0
+			rA.OnServerEvent:Connect(function()
+				hitsA += 1
+			end)
+			rB.OnServerEvent:Connect(function()
+				hitsB += 1
+			end)
+			ure.OnServerEvent:Connect(function()
+				hitsU += 1
+			end)
+			local cFA = cRS:FindFirstChild("FolderA") :: any
+			local cA = cFA:FindFirstChild("Ping") :: any
+			local cU: any = nil
+			for _, child in cFA:GetChildren() do
+				if child.ClassName == "UnreliableRemoteEvent" then cU = child end
+			end
+			cA:FireServer("hello")
+			cU:FireServer(buffer.create(2048))
+			w:step()
+			sert.eq(hitsA, 1)
+			sert.eq(hitsB, 0)
+			sert.eq(hitsU, 0)
+
+			-- 4. DataStore UpdateAsync nil-cancel preserves 4s cache; `after` fault invalidates cache
+			local ds = srv.DataStoreService:GetDataStore("SimCache")
+			local cancelGet: any = nil
+			local afterGet: any = nil
+			srv:spawn(function()
+				ds:SetAsync("k", { count = 1 })
+				ds:UpdateAsync("k", function() return nil end)
+				cancelGet = ds:GetAsync("k")
+				w:fail("DataStore", "SetAsync", "after", "ack lost")
+				pcall(function() ds:SetAsync("k", { count = 2 }) end)
+				afterGet = ds:GetAsync("k")
+			end)
+			w:converge()
+			sert.eq(cancelGet, { count = 1 })
+			sert.eq(afterGet, { count = 2 })
+
+			-- 5. stateHash = "backing" distinguishes DataModel mutations so Sim.explore does not prune distinct states
+			local exp = Sim.explore({ maxRuns = 8, stateHash = "backing" :: "backing" }, function(ew: sert.SimWorld)
+				local es = ew:server()
+				local envS = es:env()
+				if ew.scheduler:choose(2, "branch") == 1 then
+					envS.Instance.new("Part", envS.workspace).Name = "BranchA"
+				end
+				if ew.scheduler:choose(2, "bug") == 1 and envS.workspace:FindFirstChild("BranchA") ~= nil then
+					ew.actions[1] = "reached"
+				end
+			end) :: SimMod.ExploreOutcome
+			sert.eq(exp.failure, nil)
+			sert.ge(exp.pruned, 0)
+			sert.ge(exp.runs, 3)
+		end
+	)
+
+	test("remote channels rebind cleanly on ancestor rename, reparent, and _syncChildInto shadow parents", function()
+		local w = Sim.new({ seed = 23, faults = "none" })
+		local srv = w:server()
+		local cli = srv:client(404, { name = "ShadowPeer" })
+		local sEnv = srv:env()
+		local cEnv = cli:env()
+		local sRS = sEnv:getService("ReplicatedStorage")
+		local cRS = cEnv:getService("ReplicatedStorage")
+
+		-- 1. Rename server ancestor Folder after connecting OnServerEvent
+		local sPkg = sEnv.Instance.new("Folder", sRS)
+		sPkg.Name = "PkgInitial"
+		local sRemote = sEnv.Instance.new("RemoteEvent", sPkg)
+		sRemote.Name = "Action"
+		w:step()
+
+		local srvHits, cliHits = 0, 0
+		sRemote.OnServerEvent:Connect(function(_plr: any, tag: string)
+			if tag == "renamed" or tag == "reparented" then
+				srvHits += 1
+			end
+		end)
+		local cPkg = cRS:FindFirstChild("PkgInitial") :: any
+		local cRemote = cPkg:FindFirstChild("Action") :: any
+		cRemote.OnClientEvent:Connect(function(tag: string)
+			if tag == "renamed" or tag == "reparented" then
+				cliHits += 1
+			end
+		end)
+
+		sPkg.Name = "PkgRenamed"
+		cRemote:FireServer("renamed")
+		sRemote:FireAllClients("renamed")
+		w:converge()
+		sert.eq(srvHits, 1)
+		sert.eq(cliHits, 1)
+
+		-- 2. Reparent unparented Folder containing a RemoteEvent into ReplicatedStorage
+		local movedFolder = sEnv.Instance.new("Folder")
+		movedFolder.Name = "MovedPkg"
+		local movedRemote = sEnv.Instance.new("RemoteEvent", movedFolder)
+		movedRemote.Name = "MovedAction"
+		local movedHits = 0
+		movedRemote.OnServerEvent:Connect(function(_plr: any, tag: string)
+			if tag == "arrived" then
+				movedHits += 1
+			end
+		end)
+		movedFolder.Parent = sRS
+		w:step()
+		local cMovedFolder = cRS:FindFirstChild("MovedPkg") :: any
+		local cMovedRemote = cMovedFolder:FindFirstChild("MovedAction") :: any
+		cMovedRemote:FireServer("arrived")
+		w:converge()
+		sert.eq(movedHits, 1)
+
+		-- 3. Shadow parent on client paired via _syncChildInto resolves canonical server key
+		local srvTarget = sEnv.Instance.new("Folder", sRS)
+		srvTarget.Name = "RenamedRoot"
+		local srvTwin = sEnv.Instance.new("RemoteEvent", srvTarget)
+		srvTwin.Name = "ShadowEvent"
+		local shadowHits = 0
+		srvTwin.OnServerEvent:Connect(function(_plr: any, v: number)
+			shadowHits += v
+		end)
+
+		local cShadowRoot = cEnv.Instance.new("Folder", cRS)
+		cShadowRoot.Name = "OriginalRoot"
+		local cSynced = sEnv:_syncChildInto(srvTwin, cEnv, cShadowRoot)
+		cSynced:FireServer(7)
+		w:converge()
+		sert.eq(shadowHits, 7)
+
+		-- 4. External resume of a WaitForChild waiter owned by world.scheduler exercises Scheduler.owns
+		local arrivedName: string? = nil
+		srv:spawn(function()
+			local node = sRS:WaitForChild("OwnedByScheduler", 2)
+			arrivedName = if node ~= nil then node.Name else nil
+		end)
+		w:step()
+		local delayed = sEnv.Instance.new("Folder")
+		delayed.Name = "OwnedByScheduler"
+		delayed.Parent = sRS
+		w:converge()
+		sert.eq(arrivedName, "OwnedByScheduler")
+	end)
 end)

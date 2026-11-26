@@ -75,6 +75,8 @@ export type Options = {
 	datastoreBudget: number?,
 	latency: { [string]: number }?,
 	coarse: boolean?,
+	signalBehavior: Signal.SignalBehavior?,
+	strictRemotes: boolean?,
 }
 
 local PROFILES: { [string]: Faults } = {
@@ -253,6 +255,8 @@ export type World = typeof(World) & {
 	swarm: boolean,
 	autoRestart: boolean,
 	coarse: boolean,
+	signalBehavior: Signal.SignalBehavior,
+	strictRemotes: boolean,
 	backing: any,
 	http: any,
 	pendingCloud: number,
@@ -312,12 +316,17 @@ end
 
 local function makeWorldSignal(w: any, owner: any, spawnEach: boolean): any
 	local s = w.scheduler
+	local behavior: Signal.SignalBehavior = w.signalBehavior or "Deferred"
 	return Signal.new({
+		signalBehavior = behavior,
 		shouldPark = function(): boolean return s ~= nil and (s:running() or coroutine.running() == s.testThread) end,
 		park = function(onPark: (co: thread) -> ()): ...any
 			if s:running() then onPark(coroutine.running()) end
 			return s:park()
 		end,
+		deferSignal = if s ~= nil
+			then function(fn: (...any) -> (), ...: any) s:deferSignal(owner, fn, ...) end
+			else nil,
 		dispatch = if s ~= nil and owner ~= nil
 			then if spawnEach
 				then function(fn: (...any) -> (), ...: any) s:spawn(owner, fn, ...) end
@@ -432,6 +441,8 @@ function World.new(options: Options?): World
 		faults = faults,
 		swarm = swarm,
 		autoRestart = autoRestart,
+		signalBehavior = o.signalBehavior or "Deferred",
+		strictRemotes = o.strictRemotes == true,
 		servers = {},
 		count = 0,
 		slots = 0,
@@ -1061,6 +1072,8 @@ function World.server(w: any, options: { [string]: any }?): Server
 	if slot == nil then
 		w.slots += 1
 		slot = w.slots
+	elseif slot > w.slots then
+		w.slots = slot
 	end
 	local restarts = o.restarts or 0
 	local pinnedSkew = o.skew ~= nil
@@ -1114,7 +1127,7 @@ function World.server(w: any, options: { [string]: any }?): Server
 
 	if not w.coarse then server.stopFrame = s:onFrame(function(dt: number) server:_stepFrame(dt) end, server, true) end
 
-	if slot ~= nil and w.servers[slot] ~= nil and w.servers[slot].state ~= "up" then
+	if slot ~= nil and (w.servers[slot] == nil or w.servers[slot].state ~= "up") then
 		w.servers[slot] = server
 	else
 		table.insert(w.servers, server)
@@ -1168,6 +1181,8 @@ function Server.env(server: any, options: Env.Options?): any
 	merged.server = server
 	merged.isServer = true
 	merged.isClient = false
+	if merged.signalBehavior == nil then merged.signalBehavior = server.world.signalBehavior end
+	if merged.strictRemotes == nil then merged.strictRemotes = server.world.strictRemotes end
 	local created = Env.new(merged)
 	server._env = created
 	Fabric.bindServerEnv(server.world, server, created)
@@ -1296,6 +1311,8 @@ function Client.env(client: any, options: Env.Options?): any
 	merged.isServer = false
 	merged.isClient = true
 	merged.localPlayer = { UserId = client.userId, Name = client.name }
+	if merged.signalBehavior == nil then merged.signalBehavior = client.world.signalBehavior end
+	if merged.strictRemotes == nil then merged.strictRemotes = client.world.strictRemotes end
 	local created = Env.new(merged)
 	client._env = created
 	Fabric.bindClientEnv(client.world, client, created)
