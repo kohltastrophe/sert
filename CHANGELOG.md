@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-26
+
+### Added
+
+- Improve diffs, stack traces, flake controls, and strict types. ([12de963](https://github.com/kohltastrophe/sert/commit/12de963ee785f8e51a72935b672714e33b62b823))
+- Expand Roblox parity, conformance, and remote rebinding. ([80be2b8](https://github.com/kohltastrophe/sert/commit/80be2b8c6697dab8716cca1521ce0c173ea4718c))
+- Add watch mode, CI annotations, and zero-config onboarding. ([86cbb23](https://github.com/kohltastrophe/sert/commit/86cbb236bce35c1c8f8c2b0f94a0272b39105617))
+- Add Wally and Pesde manifests and update guides. ([f90ab39](https://github.com/kohltastrophe/sert/commit/f90ab398a9042837aa365ca0e15d1a59c9d33c7c))
+
+### Changed
+
+- Add sert.mutant(), trace routing, adaptive batching, and syntax peeling. ([fa77d6a](https://github.com/kohltastrophe/sert/commit/fa77d6afce4c1db77e278248918fbb2a40c3aefe))
+
 ## [0.2.1] - 2026-11-21
 
 ### Fixed
@@ -41,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-boilerplate Roblox Studio (`sert studio`) and Open Cloud (`sert cloud`) runners with `.roblox`/`.server`/`.client` target tags, `--device` viewport emulation, `--clients` multi-player sessions, `--warm` live Studio reloads, `Layout` audits, `Flicker` stability checks, `fuzzRemote`, and LIFO `sweep` cleanup.
 - Stdlib Python 3.11+ CLI (`init`, `fetch`, `lint`, `run`, `coverage`, `mutate`, `check`, `studio`, `cloud`), SHA-256 `sert.lock` verification, dual-solver positive and `-- expect-error` negative type probes, pure-Python `luau_lex` token-stream mutation testing, reproducible `pack.py` archives, and `kohltastrophe/sert/actions/setup@v0.1.0`.
 
+[0.3.0]: https://github.com/kohltastrophe/sert/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kohltastrophe/sert/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kohltastrophe/sert/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kohltastrophe/sert/releases/tag/v0.1.0

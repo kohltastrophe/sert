@@ -36,7 +36,7 @@ end)
 ### Full CLI toolchain (Python 3.11+ and Rokit)
 
 ```sh
-curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.2.1/tools/sert.py
+curl -fsSL --create-dirs -o tools/sert.py https://raw.githubusercontent.com/kohltastrophe/sert/v0.3.0/tools/sert.py
 python3 tools/sert.py init --fetch
 rokit install
 python3 tools/sert.py run
@@ -45,7 +45,7 @@ python3 tools/sert.py run
 On Windows, download `tools/sert.py` with PowerShell and run `python` instead of `python3`:
 
 ```powershell
-mkdir -Force tools; iwr https://raw.githubusercontent.com/kohltastrophe/sert/v0.2.1/tools/sert.py -OutFile tools/sert.py
+mkdir -Force tools; iwr https://raw.githubusercontent.com/kohltastrophe/sert/v0.3.0/tools/sert.py -OutFile tools/sert.py
 python tools/sert.py init --fetch
 rokit install
 python tools/sert.py run
@@ -59,12 +59,12 @@ Add `sert` directly in `wally.toml` or `pesde.toml` if you run tests through sta
 
 ```toml
 # wally.toml ([dependencies] or [dev-dependencies])
-Sert = "kohltastrophe/sert@0.2.1"
+Sert = "kohltastrophe/sert@0.3.0"
 ```
 
 ```toml
 # pesde.toml ([dependencies] or [dev_dependencies])
-sert = { name = "kohltastrophe/sert", version = "^0.2.1" }
+sert = { name = "kohltastrophe/sert", version = "^0.3.0" }
 ```
 
 To share headless Roblox datatype globals (`Vector3`, `CFrame`, `Color3`, `UDim2`, `Enum`) without reaching into internal modules, call `sert.env.installGlobals()` from your test setup file.
@@ -202,7 +202,7 @@ python3 tools/sert.py check --changed --agent
 | [docs/sim.md](docs/sim.md) | Multi-peer `sert.sim`, unified `Spec<State, Sut>`, VOPR fault injection, replay tokens, bounded `explore` (`stateHash`), and linearizability checks (`sert.sim.linearizable`). |
 | [docs/roblox.md](docs/roblox.md) | Zero-boilerplate `sert studio` and `sert cloud`, target tags, `--device`, `--clients`, `--warm`, `sert.roblox.conformance`, `Layout`, `Flicker`, `fuzzRemote`, and `sweep`. |
 | [docs/cli.md](docs/cli.md) | All CLI commands (`check`, `run`, `fuzz`, `audit`, `bench`, `coverage`, `mutate`, `studio`, `cloud`, `lint`, `init`, `fetch`), `sert.toml`, and `sert.lock`. |
-| [docs/ci.md](docs/ci.md) | GitHub Actions setup (`kohltastrophe/sert/actions/setup@v0.2.1`), lockfile caching, coverage, audit, benchmark and mutation gates, and Open Cloud secrets. |
+| [docs/ci.md](docs/ci.md) | GitHub Actions setup (`kohltastrophe/sert/actions/setup@v0.3.0`), lockfile caching, coverage, audit, benchmark and mutation gates, and Open Cloud secrets. |
 | [docs/migration.md](docs/migration.md) | Side-by-side migration recipes from Jest-Lua, TestEZ, and frktest. |
 | [docs/compatibility.md](docs/compatibility.md) | Runtime matrix (`luau`, `lute`, `lune`, Studio, Open Cloud), `sert.env` fidelity vs stubs, platform notes, and TIA boundaries. |
 
@@ -214,7 +214,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: kohltastrophe/sert/actions/setup@v0.2.1
+      - uses: kohltastrophe/sert/actions/setup@v0.3.0
       - run: python3 tools/sert.py check
       - run: python3 tools/sert.py mutate --diff origin/main
 ```

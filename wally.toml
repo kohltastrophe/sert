@@ -2,7 +2,7 @@
 name = "kohltastrophe/sert"
 description = "Testing, property shrinking, deterministic simulation, and Studio verification for Luau and Roblox."
 authors = ["Kohl <hi@kohl.gg>"]
-version = "0.2.1"
+version = "0.3.0"
 license = "MIT"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
