@@ -528,4 +528,5 @@ local function _probeEnvEngineApis(e: sert.Env)
 	label.RichText = true
 	label.Text = "<b>Hi</b>"
 	local _contentText: string = label.ContentText
+	local _activeMutant: number? = sert.mutant()
 end

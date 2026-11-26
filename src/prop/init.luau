@@ -60,6 +60,7 @@ export type PropOptions = typeof(table.freeze({} :: {
 	focus: boolean?,
 	file: string?,
 	target: Target?,
+	capMutant: boolean?,
 }))
 
 export type PropResult = {
@@ -149,7 +150,7 @@ local DEFAULT_BASE = 0x5EED
 local SHRINK_ATTEMPTS = 500
 local SHRINK_SECONDS = 2
 local TRACE_LINES = 200
-local MUTANT_RUNS = 15
+local MUTANT_RUNS = 5
 local MUTANT_SHRINK: ShrinkBudget = { tries = 0, seconds = 0 }
 local FLOAT_STEPS = U32 - 1
 
@@ -161,6 +162,7 @@ local fnv1a32 = rng.fnv1a32
 local mutant = registry.mutant
 
 local PROP_OPTIONS = {
+	"capMutant",
 	"exhaustive",
 	"file",
 	"focus",
@@ -1283,6 +1285,7 @@ local function runProperty(
 		else "?"
 	local shortName: string = shortNameOverride or trailingSegment(name)
 	local isMutant = capMutant == true
+		and options.capMutant ~= false
 		and (run.mutant ~= nil or run.mutants ~= nil or (registry.isolateDepth == 0 and mutant.get() ~= nil))
 	local shrinkLimits: ShrinkBudget? = if isMutant then MUTANT_SHRINK else options.shrinkBudget
 
@@ -1913,7 +1916,9 @@ local function definePropEntry(
 			cloned.replay = seeded
 			runOpts = cloned
 		end
-		local result = runProperty(fullName, current.name, fn, options or {}, runOpts, current.last, current.file, name)
+		local capMutant = (runOpts ~= nil and (runOpts.mutant ~= nil or runOpts.mutants ~= nil))
+			or (registry.isolateDepth == 0 and mutant.get() ~= nil)
+		local result = runProperty(fullName, current.name, fn, options or {}, runOpts, capMutant, current.file, name)
 		if not result.ok then
 			if result.seed ~= nil then registry.recordInlineSeed(current.name, result.seed) end
 			error(result.report or result.message or "property failed", 0)

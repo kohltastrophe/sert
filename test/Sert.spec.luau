@@ -6,6 +6,7 @@ local utilCore = require("../src/core/util")
 
 local EXPECTED_PUBLIC_KEYS: { string } = {
 	"isRoblox",
+	"mutant",
 	"gen",
 	"laws",
 	"model",

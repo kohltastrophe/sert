@@ -174,6 +174,7 @@ local publicSim: {
 local sert = {
 	-- Runtime & Subsystems
 	isRoblox = IS_ROBLOX,
+	mutant = registry.mutant.get,
 	gen = gen,
 	laws = laws,
 	model = model,

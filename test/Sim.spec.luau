@@ -2085,4 +2085,71 @@ describe("Scheduler.explore and Sim.explore state-hashed pruning", function()
 		sert.near(dtSum, 61, 1e-6)
 		sert.le(heartbeats, 4)
 	end)
+
+	test(
+		"auto-caps inline prop, Sim.check (BFS + VOPR), and Sim.explore under mutation unless capMutant = false",
+		function()
+			local spec = Sim.spec({
+				init = function() return { n = 0 } end,
+				commands = {
+					inc = {
+						args = { 1, 2, 3 },
+						pre = function(s: { n: number }) return s.n < 100 end,
+						next = function(s: { n: number }, d: number)
+							s.n += d
+							return nil
+						end,
+					},
+				},
+				invariants = {
+					nonNeg = function(s: { n: number }, _sut: any, _w: any?): any return s.n >= 0 end,
+				},
+			})
+
+			local propCappedRuns, propUncappedRuns = 0, 0
+			local bfsCapped: SimMod.CheckResult? = nil
+			local bfsUncapped: SimMod.CheckResult? = nil
+			local voprCapped: SimMod.CheckResult? = nil
+			local voprUncapped: SimMod.CheckResult? = nil
+			local expCapped: SimMod.ExploreOutcome? = nil
+			local expUncapped: SimMod.ExploreOutcome? = nil
+
+			local res = runSimIsolated(function()
+				sert.test("capped runs under active mutant batch", function()
+					sert.prop("inline prop", function(_g)
+						propCappedRuns += 1
+					end, { runs = 40 })
+					sert.prop("opt-out prop", function(_g)
+						propUncappedRuns += 1
+					end, { runs = 22, capMutant = false })
+					bfsCapped = Sim.check(spec, { bfs = true, vopr = false, maxStates = 80 })
+					bfsUncapped = Sim.check(spec, { bfs = true, vopr = false, maxStates = 40, capMutant = false })
+					voprCapped = Sim.check(spec, { bfs = false, vopr = true, runs = 12, steps = 2 })
+					voprUncapped = Sim.check(spec, { bfs = false, vopr = true, runs = 6, steps = 2, capMutant = false })
+					expCapped = Sim.explore({ maxRuns = 20 }, function(w: sert.SimWorld)
+						w.scheduler:choose(2, "a")
+						w.scheduler:choose(2, "b")
+						w.scheduler:choose(2, "c")
+						w.scheduler:choose(2, "d")
+					end)
+					expUncapped = Sim.explore({ maxRuns = 8, capMutant = false }, function(w: sert.SimWorld)
+						w.scheduler:choose(2, "a")
+						w.scheduler:choose(2, "b")
+						w.scheduler:choose(2, "c")
+						w.scheduler:choose(2, "d")
+					end)
+				end)
+			end, { mutants = { 900010 } })
+
+			sert.eq(res.failed, 0)
+			sert.le(propCappedRuns, 15)
+			sert.eq(propUncappedRuns, 22)
+			sert.eq((bfsCapped :: SimMod.CheckResult).states, 20)
+			sert.eq((bfsUncapped :: SimMod.CheckResult).states, 40)
+			sert.le((voprCapped :: SimMod.CheckResult).cases, 3)
+			sert.eq((voprUncapped :: SimMod.CheckResult).cases, 6)
+			sert.le((expCapped :: SimMod.ExploreOutcome).runs, 3)
+			sert.eq((expUncapped :: SimMod.ExploreOutcome).runs, 8)
+		end
+	)
 end)

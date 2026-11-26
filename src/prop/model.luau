@@ -49,6 +49,7 @@ export type Options = typeof(table.freeze({} :: {
 	focus: boolean?,
 	file: string?,
 	target: registry.Target?,
+	capMutant: boolean?,
 	init: nil,
 	commands: nil,
 }))
@@ -122,6 +123,7 @@ local SPEC_FIELDS = {
 }
 
 local OPTION_KEYS = {
+	"capMutant",
 	"exhaustive",
 	"file",
 	"focus",
@@ -440,7 +442,7 @@ function model.check<State, Sut>(rawSpec: Spec<State, Sut>, options: Options?): 
 		runOpts = cloned
 	end
 	local name = spec.name or "model"
-	local result = prop.run(name, propFn, propOpts, runOpts, false, name)
+	local result = prop.run(name, propFn, propOpts, runOpts, options == nil or options.capMutant ~= false, name)
 	if not result.ok and (options == nil or options.raise ~= false) then
 		error(result.report or result.message or "model check failed", util.outside())
 	end
@@ -526,7 +528,9 @@ local function registerModelProp(
 		if cloned.replay == nil then cloned.replay = replayOpt end
 		local optsCopy: any = table.clone(propOpts)
 		if optsCopy.file == nil and current.file ~= "?" then optsCopy.file = current.file end
-		local res = prop.run(`{current.name} > {name}`, propFn, optsCopy, cloned, current.last, current.name)
+		local capMutant = (cloned.mutant ~= nil or cloned.mutants ~= nil)
+			or (registry.isolateDepth == 0 and registry.mutant.get() ~= nil)
+		local res = prop.run(`{current.name} > {name}`, propFn, optsCopy, cloned, capMutant, current.name)
 		if not res.ok then
 			if res.seed ~= nil then registry.recordInlineSeed(current.name, res.seed) end
 			error(res.report or res.message or "model check failed", 0)

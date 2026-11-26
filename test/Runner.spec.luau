@@ -520,10 +520,36 @@ sert.describe("CLI flag edges, output modes, selection arrays, and chained modif
 		sert.eq(batchMut.filter, "fast_suite")
 		sert.eq(batchMut.failFast, true)
 
+		local routedSingle = sert.parseCliArgs("--mutant=42@3+1:@file=Fast.spec")
+		registry.mutant.parsed = prevParsed
+		registry.mutant.set(prevMutant)
+		sert.eq(routedSingle.mutant, 42)
+		sert.eq(routedSingle.filter, "@file=Fast.spec")
+		sert.eq(routedSingle.mutantTests, { [42] = { 3, 1 } })
+
+		local routedBatch = sert.parseCliArgs("--mutants=10@2+5,11@1:suite")
+		sert.eq(routedBatch.mutants, { 10, 11 })
+		sert.eq(routedBatch.mutantTests, { [10] = { 2, 5 }, [11] = { 1 } })
+		sert.eq(routedBatch.filter, "suite")
+
+		local prevLoadHits = registry.mutant.traceLoadHits
+		local traceOpts = sert.parseCliArgs("--trace-mutants")
+		local traceLoadHits = registry.mutant.traceLoadHits
+		local traceMutId = sert.mutant()
+		local traceSlotId = registry.mutant._slot.id
+		registry.mutant.traceLoadHits = prevLoadHits
+		registry.mutant.set(prevMutant)
+		sert.eq(traceOpts.traceMutants, true)
+		sert.eq(type(traceLoadHits), "table")
+		sert.eq(traceMutId, nil)
+		sert.eq(traceSlotId, -1)
+
 		sert.throws(function() sert.parseCliArgs("--filter") end, "--filter expects a value")
 		sert.throws(function() sert.parseCliArgs("--grep", "--quiet") end, "--grep expects a value")
 		sert.throws(function() sert.parseCliArgs("--mutant=abc") end, "--mutant expects a mutant id")
+		sert.throws(function() sert.parseCliArgs("--mutant=9@+1") end, "valid @idx%+idx")
 		sert.throws(function() sert.parseCliArgs("--mutants=1,bad") end, "--mutants expects mutant ids")
+		sert.throws(function() sert.parseCliArgs("--mutants=1,") end, "--mutants expects mutant ids")
 		sert.throws(function() sert.parseCliArgs("--fail-fast=maybe") end, "--fail-fast expects true or false")
 		sert.throws(function() sert.parseCliArgs("--no-sweep=1") end, "--no-sweep takes no value")
 		sert.throws(function() sert.parseCliArgs("--compact=true") end, "--compact takes no value")
@@ -870,6 +896,103 @@ sert.describe("runner teardown, yield driver, mutant batches, and prop shrinking
 		sert.contains(mutText, "[sert-mutant] 900001=KILLED")
 		sert.contains(mutText, "[sert-mutant] 900002=KILLED")
 		sert.contains(mutText, "[sert-mutant] 900003=SURVIVED")
+	end)
+
+	sert.test("exposes sert.mutant(), traces per-test mutant hits, and runs mutantTests subsets", function(ctx)
+		sert.eq(sert.mutant(), nil)
+
+		local slot = registry.mutant._slot
+		local prevLoad = registry.mutant.traceLoadHits
+		local prevMut = registry.mutant.get()
+		ctx:defer(function()
+			registry.mutant.traceLoadHits = prevLoad
+			registry.mutant.set(prevMut)
+		end)
+
+		local observedInTrace: { any } = {}
+		local traceLines = sert.capture(function()
+			local loadHits: { [number]: boolean } = { [101] = true }
+			registry.mutant.traceLoadHits = loadHits
+			local traceRes = runIsolated(function()
+				sert.describe("traced suite", function()
+					sert.beforeAll(function() slot.h(202) end)
+					sert.test("first throws after hit", function()
+						table.insert(observedInTrace, sert.mutant())
+						slot.h(303)
+						error("boom inside traced test", 0)
+					end)
+					sert.test("second runs cleanly after error", function()
+						table.insert(observedInTrace, slot.id)
+						slot.h(404)
+					end)
+					sert.afterAll(function() slot.h(999) end)
+				end)
+			end, { traceMutants = true })
+			sert.eq(traceRes.passed, 1)
+			sert.eq(traceRes.failed, 1)
+		end)
+		sert.eq(observedInTrace, { -1 })
+		sert.eq(registry.mutant.get(), nil)
+		sert.eq(slot.id, 0)
+
+		local traceText = table.concat(traceLines, "\n")
+		sert.contains(traceText, "[sert-trace] 1|")
+		sert.contains(traceText, "|101,202,303|")
+		sert.contains(traceText, "[sert-trace] 2|")
+		sert.contains(traceText, "|101,202,404|")
+		sert.eq(string.find(traceText, "999", 1, true), nil)
+
+		-- Batch `mutantTests` runs ONLY specified indices in exact order, skipping unrelated slow tests.
+		local ranByMutant: { [number]: { string } } = {}
+		local batchRes = runIsolated(function()
+			local function record(name: string)
+				local id = sert.mutant()
+				if id ~= nil then
+					local list = ranByMutant[id]
+					if list == nil then
+						list = {}
+						ranByMutant[id] = list
+					end
+					table.insert(list, name)
+				end
+			end
+			sert.test("test 1", function() record("t1") end)
+			sert.test("test 2", function()
+				record("t2")
+				sert.ne(sert.mutant(), 12)
+			end)
+			sert.test("test 3", function()
+				record("t3")
+				sert.ne(sert.mutant(), 11)
+			end)
+		end, {
+			mutants = { 11, 12, 13 },
+			mutantTests = { [11] = { 3, 1 }, [12] = { 2 }, [13] = { 1 } },
+		})
+		sert.eq(batchRes.mutants, {
+			{ id = 11, killed = true },
+			{ id = 12, killed = true },
+			{ id = 13, killed = false },
+		})
+		sert.eq(ranByMutant[11], { "t3" })
+		sert.eq(ranByMutant[12], { "t2" })
+		sert.eq(ranByMutant[13], { "t1" })
+
+		-- Single `mutant` with `mutantTests` also restricts and orders selected tests.
+		local singleRan: { string } = {}
+		local singleRes = runIsolated(function()
+			sert.test("s1", function() table.insert(singleRan, `s1:{tostring(sert.mutant())}`) end)
+			sert.test("s2", function() table.insert(singleRan, `s2:{tostring(sert.mutant())}`) end)
+			sert.test("s3", function()
+				table.insert(singleRan, `s3:{tostring(sert.mutant())}`)
+				sert.fail("killed by s3")
+			end)
+		end, {
+			mutant = 77,
+			mutantTests = { [77] = { 2, 3 } },
+		})
+		sert.eq(singleRes.failed, 1)
+		sert.eq(singleRan, { "s2:77", "s3:77" })
 	end)
 
 	sert.test("formats sert.prop shrinker reports, seeds/replay roundtrips, and exhaustive/budget edges", function()

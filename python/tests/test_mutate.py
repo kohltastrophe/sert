@@ -9,7 +9,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from helpers import REPO, Case, copy_sert_src, have
@@ -1167,6 +1169,240 @@ class MutateSchemaTest(Case):
         code2, out2, err2 = self.sert("mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1")
         self.assertEqual((code2, out2.strip()), (0, "100.0"), err2)
         self.assertNotIn("test/DeletedSpec.spec.luau", graph.load_coverage_map(root)["specs"])
+
+    def test_multi_mutant_line_shares_line_key(self):
+        src = "\n".join(
+            [
+                "local M = {}",
+                "function M.add(a: number, b: number): number?",
+                "\treturn a + b",
+                "end",
+                "return M",
+            ]
+        )
+        instrumented, muts = mutate.instrument_source(src, {3: True}, operators=("arith_op", "ret_val"))
+        self.assertGreaterEqual(len(muts), 2)
+        ops = {m.op for m in muts}
+        self.assertEqual(ops, {"arith_op", "ret_val"})
+        keys = {m.line_key for m in muts}
+        self.assertEqual(len(keys), 1)
+        expected_key = next(iter(keys))
+        self.assertEqual(expected_key, muts[0].id)
+        self.assertIn(f"_SERT_M.h({expected_key})", instrumented)
+
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_per_test_trace_routing_skips_unrelated_tests_and_formats_batch_args(self):
+        cmd_batch = mutate._mutant_batch_command(
+            "luau", "luau", ".sert/run.luau", [1, 2], "@file=test/Calc.spec.luau", mutant_tests={1: (3, 1)}
+        )
+        self.assertIn("--mutants=1@3+1,2:@file=test/Calc.spec.luau", cmd_batch)
+        cmd_one = mutate._mutant_command(
+            "luau", "luau", ".sert/run.luau", 1, "@file=test/Calc.spec.luau", mutant_tests={1: (3, 1)}
+        )
+        self.assertIn("--mutant=1@3+1:@file=test/Calc.spec.luau", cmd_one)
+
+        root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n',
+            name="trace_routing",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src").mkdir()
+        (root / "src/Calc.luau").write_text(
+            "\n".join(
+                [
+                    "local C = {}",
+                    "function C.add(a: number, b: number): number",
+                    "\treturn a + b",
+                    "end",
+                    "function C.sub(a: number, b: number): number",
+                    "\treturn a - b",
+                    "end",
+                    "return C",
+                ]
+            )
+            + "\n"
+        )
+        (root / "test").mkdir()
+        (root / "test/Calc.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local C = require("@lib/Calc")',
+                    'sert.test("add weak", function()',
+                    "\tsert.ne(C.add(2, 3), nil)",
+                    "end)",
+                    'sert.test("unrelated fails if run under mutant", function()',
+                    "\tlocal mid = sert.mutant()",
+                    "\tsert.ok(mid == nil or mid == -1)",
+                    "end)",
+                    'sert.test("sub strong", function()',
+                    "\tsert.eq(C.sub(10, 3), 7)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "coverage.out").write_text("SF:src/Calc.luau\nDA:3,1\nDA:6,1\nend_of_record\n")
+
+        seen_mt: list[tuple[int, tuple[int, ...] | None]] = []
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def spy_batch(batch, *args, **kwargs):
+            mt = kwargs.get("mutant_tests") or {}
+            for m in batch:
+                seen_mt.append((m.line, mt.get(m.id)))
+            return orig_eval_batch(batch, *args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=spy_batch):
+            code, out, err = self.sert(
+                "mutate", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--no-cache", "-j", "1"
+            )
+        # Line 3 (`C.add`) survives because Test 2 was skipped by trace routing; Line 6 (`C.sub`) is killed by Test 3.
+        self.assertEqual((code, out.strip()), (0, "50.0"), err)
+        self.assertEqual(dict(seen_mt), {3: (1,), 6: (3,)})
+        trace_data = json.loads((root / ".sert/mutate/trace-map.json").read_text())
+        self.assertEqual(len(trace_data["specs"]["test/Calc.spec.luau"]["tests"]), 3)
+
+    @unittest.skipUnless(have("luau"), "luau not fetched or on PATH")
+    def test_scoped_vs_strict_cache_mode_with_shared_harness(self):
+        root = self.project(
+            '[test]\nspecs = ["test/**/*.spec.luau"]\n[coverage]\ninclude = ["src"]\n[mutate]\ninclude = ["src"]\n',
+            name="cache_modes",
+        )
+        copy_sert_src(root / ".sert/repo/src")
+        (root / ".luaurc").write_text('{"aliases": {"sert": "./.sert/repo/src", "lib": "./src"}}\n')
+        (root / "src").mkdir()
+        (root / "src/Math.luau").write_text(
+            "local M = {}\nfunction M.add(a: number, b: number): number\n\treturn a + b\nend\nreturn M\n"
+        )
+        other = root / "src/Other.luau"
+        other.write_text("local O = {}\nfunction O.tag(): number\n\treturn 1\nend\nreturn O\n")
+        (root / "test/helpers").mkdir(parents=True)
+        (root / "test/helpers/harness.luau").write_text(
+            'local Math = require("@lib/Math")\nlocal Other = require("@lib/Other")\nreturn { Math = Math, Other = Other }\n'
+        )
+        (root / "test/Math.spec.luau").write_text(
+            "\n".join(
+                [
+                    'local sert = require("@sert")',
+                    'local H = require("./helpers/harness")',
+                    'sert.test("adds", function()',
+                    "\tsert.eq(H.Math.add(2, 3), 5)",
+                    "end)",
+                    "return {}",
+                ]
+            )
+            + "\n"
+        )
+        (root / "coverage.out").write_text("SF:src/Math.luau\nDA:3,1\nend_of_record\n")
+
+        # 1. Cold scoped run evaluates and caches `src/Math.luau`
+        code1, out1, err1 = self.sert(
+            "mutate", "src/Math.luau", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+        )
+        self.assertEqual((code1, out1.strip()), (0, "100.0"), err1)
+
+        # 2. Editing unmutated `src/Other.luau` (reachable via `harness.luau`, not imported by `Math.luau`):
+        # default `scoped` cache keeps `Math.luau` cached with zero mutant evaluations.
+        other.write_text("local O = {}\nfunction O.tag(): number\n\treturn 2\nend\nreturn O\n")
+        with (
+            mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=AssertionError("scoped should hit cache")),
+            mock.patch.object(mutate, "_evaluate_one_mutant", side_effect=AssertionError("scoped should hit cache")),
+        ):
+            code2, out2, err2 = self.sert(
+                "mutate", "src/Math.luau", "--root", root, "--no-coverage-run", "--operators", "arith_op", "-j", "1"
+            )
+        self.assertEqual((code2, out2.strip()), (0, "100.0"), err2)
+
+        # 3. `--strict-cache` includes transitive deps through `harness.luau` and invalidates cleanly.
+        strict_calls = 0
+        orig_eval_batch = mutate._evaluate_mutant_batch
+
+        def count_strict(*args, **kwargs):
+            nonlocal strict_calls
+            strict_calls += 1
+            return orig_eval_batch(*args, **kwargs)
+
+        with mock.patch.object(mutate, "_evaluate_mutant_batch", side_effect=count_strict):
+            code3, out3, err3 = self.sert(
+                "mutate", "src/Math.luau", "--root", root, "--no-coverage-run", "--operators", "arith_op", "--strict-cache", "-j", "1"
+            )
+        self.assertEqual((code3, out3.strip()), (0, "100.0"), err3)
+        self.assertGreater(strict_calls, 0)
+
+    def test_compile_and_stage_file_peels_by_error_line_and_falls_back_to_bisect(self):
+        orig = "\n".join(
+            [
+                "local M = {}",
+                "local a = 1",
+                "local b = 2",
+                "local c = 3",
+                "local d = 4",
+                "return M",
+            ]
+        )
+        inst = "\n".join(
+            [
+                "local M = {}",
+                "local a = _M(1)",
+                "local b = _M(2)",
+                "local c = _M(3)",
+                "local d = _M(4)",
+                "return M",
+            ]
+        )
+        muts = [
+            mutate.Mutant(id=i, file="src/A.luau", line=ln, op="arith_op", original=f"orig{ln}", mutated=f"mut{ln}")
+            for i, ln in enumerate((2, 3, 4, 5), start=1)
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            staged = Path(td) / "staged.luau"
+            calls = 0
+
+            def fake_peel_err(_luau_bin, path, runner="luau"):
+                nonlocal calls
+                calls += 1
+                text = path.read_text(encoding="utf-8")
+                if "_M(1)" in text:
+                    return False, f"{path}:3: Expected ')' (to close '(' at line 2), got 'local'"
+                if "_M(4)" in text:
+                    return False, f"{path}:5: syntax error"
+                return True, ""
+
+            with mock.patch.object(mutate, "_check_staged_compile_err", side_effect=fake_peel_err):
+                valid = mutate.compile_and_stage_file("luau", orig, inst, muts, staged, wrap=True)
+            self.assertEqual(calls, 3)
+            self.assertEqual([m.line for m in valid], [3, 4])
+
+            staged_bisect = Path(td) / "staged_bisect.luau"
+
+            def fake_no_line_err(_luau_bin, path, runner="luau"):
+                text = path.read_text(encoding="utf-8")
+                if "_M(3)" in text:
+                    return False, "opaque compiler error with no line reference"
+                return True, ""
+
+            with mock.patch.object(mutate, "_check_staged_compile_err", side_effect=fake_no_line_err):
+                valid_bisect = mutate.compile_and_stage_file("luau", orig, inst, muts, staged_bisect, wrap=False)
+            self.assertEqual([m.line for m in valid_bisect], [2, 3, 5])
+
+    def test_pack_adaptive_batches_uses_weight_by_id(self):
+        muts = [
+            mutate.Mutant(id=i, file="src/A.luau", line=i, op="stmt_del", original="x = 1", mutated="--")
+            for i in range(1, 5)
+        ]
+        est_ms = {m.id: 8000.0 for m in muts}
+        stage0_chunks = mutate._pack_adaptive_batches(
+            muts, est_ms, worker_count=1, total_ready=10, target_ms=12000.0, weight_by_id={m.id: 0.30 for m in muts}
+        )
+        late_chunks = mutate._pack_adaptive_batches(
+            muts, est_ms, worker_count=1, total_ready=10, target_ms=12000.0, weight_by_id={m.id: 0.90 for m in muts}
+        )
+        self.assertEqual([len(ch) for ch, _ms in stage0_chunks], [4])
+        self.assertEqual([len(ch) for ch, _ms in late_chunks], [1, 1, 1, 1])
 
 
 if __name__ == "__main__":

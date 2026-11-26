@@ -32,6 +32,16 @@ export type Recorder = Linearize.Recorder
 export type OperationHandle = Linearize.OperationHandle
 export type ExploreOutcome = Scheduler.ExploreOutcome
 
+local MUTANT_SIM_RUNS = 3
+local MUTANT_SIM_MAX_STATES = 20
+local MUTANT_SIM_EXPLORE_RUNS = 3
+
+local function isMutantActive(runOptions: registry.RunOptions?, optCap: boolean?): boolean
+	if optCap == false then return false end
+	return (runOptions ~= nil and (runOptions.mutant ~= nil or runOptions.mutants ~= nil))
+		or (registry.isolateDepth == 0 and registry.mutant.get() ~= nil)
+end
+
 export type VoprOptions = {
 	runs: number?,
 	steps: number?,
@@ -44,6 +54,7 @@ export type VoprOptions = {
 	converge: boolean?,
 	shrinkBudget: registry.ShrinkBudget?,
 	timeout: number?,
+	capMutant: boolean?,
 }
 
 export type CheckOptions = VoprOptions & BfsOptions & {
@@ -286,8 +297,14 @@ local function runVoprSuite<State, Sut>(
 	local bestSteps: { string }? = nil
 	local bestErrText: string? = nil
 
+	local effectiveRuns = opts.runs or 50
+	local effectiveCap = capMutant == true and opts.capMutant ~= false
+	if effectiveCap and isMutantActive(runOptions, opts.capMutant) then
+		effectiveRuns = math.min(effectiveRuns, MUTANT_SIM_RUNS)
+	end
+
 	local propOpts: any = {
-		runs = opts.runs or 50,
+		runs = effectiveRuns,
 		size = size,
 		seed = opts.seed,
 		shrinkBudget = opts.shrinkBudget,
@@ -317,7 +334,7 @@ local function runVoprSuite<State, Sut>(
 			end
 			error(msg, 0)
 		end
-	end, propOpts, effectiveRunOpts, capMutant == true, name)
+	end, propOpts, effectiveRunOpts, effectiveCap, name)
 
 	if res.ok then return true, nil, res.cases end
 
@@ -439,18 +456,24 @@ function Sim.new(options: WorldOptions?): World return World.new(options) end
 function Sim.check<State, Sut>(spec: Spec<State, Sut>, options: CheckOptions?): CheckResult
 	Spec.define(spec)
 	local o: CheckOptions = options or {}
+	local curRunOpts = registry.currentOptions()
+	local mutantActive = isMutantActive(curRunOpts, o.capMutant)
 	local bfsRes: BfsResult? = nil
 
 	local doBfs = if o.bfs ~= nil then o.bfs else (o.replay == nil and hasFiniteModel(spec))
-	if doBfs then bfsRes = Spec.bfsCheck(spec, {
-		maxStates = o.maxStates,
-		maxDepth = o.maxDepth,
-	}) end
+	if doBfs then
+		local maxStates = o.maxStates
+		if mutantActive then maxStates = math.min(maxStates or 2000, MUTANT_SIM_MAX_STATES) end
+		bfsRes = Spec.bfsCheck(spec, {
+			maxStates = maxStates,
+			maxDepth = o.maxDepth,
+		})
+	end
 
 	local doVopr = if o.vopr ~= nil then o.vopr else (hasRuntimeCommands(spec) or o.replay ~= nil or o.runs ~= nil)
 	local cases = 0
 	if doVopr then
-		local ok, report, ranCases = runVoprSuite(spec.name or "Sim.check", spec, o, registry.currentOptions(), false)
+		local ok, report, ranCases = runVoprSuite(spec.name or "Sim.check", spec, o, curRunOpts, o.capMutant ~= false)
 		cases = ranCases
 		if not ok then error(report or "Sim.check failed", util.outside()) end
 	end
@@ -469,6 +492,7 @@ export type ExploreOptions = WorldOptions & {
 	maxRuns: number?,
 	maxBranch: number?,
 	stateHash: (false | "backing" | ((world: World) -> (string | number)?))?,
+	capMutant: boolean?,
 }
 
 local function sortedStringKeys(tbl: { [any]: any }): { any }
@@ -676,6 +700,11 @@ function Sim.explore(optsOrName: any, maybeFn: any?, maybeOpts: ExploreOptions?)
 		end
 	end
 
+	local maxRuns = opts.maxRuns
+	if isMutantActive(registry.currentOptions(), opts.capMutant) then
+		maxRuns = math.min(maxRuns or 10000, MUTANT_SIM_EXPLORE_RUNS)
+	end
+
 	local failedWorld: World? = nil
 	local outcome = Scheduler.explore(function(chooser: Scheduler.Chooser)
 		activeWorld = nil
@@ -705,7 +734,7 @@ function Sim.explore(optsOrName: any, maybeFn: any?, maybeOpts: ExploreOptions?)
 		end
 	end, {
 		maxChoices = opts.maxChoices,
-		maxRuns = opts.maxRuns,
+		maxRuns = maxRuns,
 		maxBranch = opts.maxBranch,
 		stateHash = exploreStateHash,
 	})

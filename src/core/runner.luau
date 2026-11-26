@@ -118,6 +118,8 @@ local function invoke(fn: () -> (), timeout: number): (boolean, any)
 	local saved = table.clone(curState)
 	local depth = registry.isolateDepth
 	local activeMut = mutant.get()
+	local activeSlotId = mutant._slot.id
+	local activeHits = mutant._slot.hits
 	local sinkDepth = output.depth()
 
 	local function restore()
@@ -137,7 +139,11 @@ local function invoke(fn: () -> (), timeout: number): (boolean, any)
 		end
 		registry.replaceState(saved)
 		registry.isolateDepth = depth
-		mutant.set(activeMut)
+		if activeSlotId < 0 then
+			mutant.setTrace(true, activeHits)
+		else
+			mutant.set(activeMut)
+		end
 		output.trim(sinkDepth)
 	end
 
@@ -255,7 +261,12 @@ local function runTest(
 			local seeded = if opts.seeds ~= nil then opts.seeds[test.name] else nil
 			if seeded ~= nil and runOptions.replay == nil then runOptions.replay = seeded end
 			local ok, err = invoke(
-				function() result = property.exec(runOptions, registry.isolateDepth == 0) end,
+				function()
+					result = property.exec(
+						runOptions,
+						(opts.mutant ~= nil or opts.mutants ~= nil) or registry.isolateDepth == 0
+					)
+				end,
 				timeout
 			)
 			tracker = registry.endTestAssertions()
@@ -318,7 +329,39 @@ type Outcome = {
 	zeroAssertion: boolean,
 	tautologies: { TautologyRecord },
 	ms: number,
+	traceCsv: string?,
 }
+
+local function mergeHits(dst: { [number]: boolean }, src: { [number]: boolean }?)
+	if src == nil then return end
+	for k in next, src do
+		dst[k] = true
+	end
+end
+
+local function formatTraceCsv(
+	loadHits: { [number]: boolean }?,
+	chain: { Hooks },
+	scopeHits: { [Hooks]: { [number]: boolean } },
+	testHits: { [number]: boolean }?
+): string
+	local merged: { [number]: boolean } = {}
+	mergeHits(merged, loadHits)
+	for _, hooks in chain do
+		mergeHits(merged, scopeHits[hooks])
+	end
+	mergeHits(merged, testHits)
+	local keyNums: { number } = {}
+	for k in next, merged do
+		table.insert(keyNums, k)
+	end
+	table.sort(keyNums)
+	local keyStrs = table.create(#keyNums)
+	for i, k in keyNums do
+		keyStrs[i] = tostring(k)
+	end
+	return table.concat(keyStrs, ",")
+end
 
 local function execute(
 	order: { number },
@@ -353,11 +396,18 @@ local function execute(
 	local timeout = resolveTimeout(opts)
 	local started: { Hooks }, finished: { [Hooks]: boolean } = {}, {}
 	local beforeAllErr: { [Hooks]: string }, deferred: { [Hooks]: { HookFn } } = {}, {}
+	local tracing = opts.traceMutants == true
+	local scopeHits: { [Hooks]: { [number]: boolean } } = {}
 
 	local function enter(hooks: Hooks)
 		table.insert(started, hooks)
 		local list: { HookFn } = {}
 		deferred[hooks], state.deferred = list, list
+		if tracing then
+			local sHits: { [number]: boolean } = {}
+			scopeHits[hooks] = sHits
+			mutant.setTrace(true, sHits)
+		end
 		for _, hook in hooks.beforeAll do
 			local ok, err = invoke(hook, timeout)
 			if not ok then
@@ -365,6 +415,7 @@ local function execute(
 				break
 			end
 		end
+		if tracing then mutant.setTrace(true, nil) end
 		state.deferred = nil
 	end
 
@@ -373,6 +424,7 @@ local function execute(
 		finished[hooks] = true
 		local list = deferred[hooks] :: { HookFn }
 		local errAcc: string? = nil
+		if tracing then mutant.setTrace(true, nil) end
 		-- Skip `afterAll` if `beforeAll` for this scope threw; still drain any `defer`/spy cleanups registered before the throw.
 		if beforeAllErr[hooks] == nil then
 			state.deferred = list
@@ -407,7 +459,12 @@ local function execute(
 		local detail: string?, seed: number?, inlineSeeds: { [string]: number } = nil, nil, {}
 		local zeroAssertion = false
 		local tautologies: { TautologyRecord } = EMPTY_TAUTOLOGIES
+		local testHits: { [number]: boolean }? = nil
 		if failure == nil then
+			if tracing then
+				testHits = {}
+				mutant.setTrace(true, testHits)
+			end
 			state.running = {
 				name = test.name,
 				file = test.file,
@@ -416,7 +473,9 @@ local function execute(
 			}
 			failure, detail, seed, inlineSeeds, zeroAssertion, tautologies = runTest(test, chain, opts)
 			state.running = nil
+			if tracing then mutant.setTrace(true, nil) end
 		end
+		local traceCsv = if tracing then formatTraceCsv(mutant.traceLoadHits, chain, scopeHits, testHits) else nil
 		for c = #chain, 1, -1 do
 			local hooks = chain[c]
 			if last[hooks] == position then
@@ -435,6 +494,7 @@ local function execute(
 				zeroAssertion = zeroAssertion,
 				tautologies = tautologies,
 				ms = math.round((os.clock() - clock) * 1000),
+				traceCsv = traceCsv,
 			})
 		then
 			if pass ~= nil and plan ~= nil then
@@ -476,15 +536,23 @@ end
 local function enterMutant(opts: RunOptions): (boolean, () -> ())
 	local state = registry.state
 	local batch = opts.mutants
-	local ownsMutant = opts.mutant ~= nil or batch ~= nil
+	local isTrace = opts.traceMutants == true
+	local ownsMutant = opts.mutant ~= nil or batch ~= nil or isTrace
 	local outerMutant: number? = mutant.get()
+	local outerSlotId = mutant._slot.id
+	local outerHits = mutant._slot.hits
+	local outerLoadHits = mutant.traceLoadHits
 	local parsed = mutant.parsed
 	if parsed ~= nil and parsed.id == opts.mutant then
 		outerMutant, mutant.parsed = parsed.outer, nil
 	end
-	local mutantRun = ownsMutant or (registry.isolateDepth == 0 and mutant.get() ~= nil)
+	local mutantRun = opts.mutant ~= nil or batch ~= nil or (registry.isolateDepth == 0 and mutant.get() ~= nil)
 	if mutantRun and opts.failFast == nil then opts.failFast = true end
-	if batch ~= nil then
+	if isTrace then
+		opts.quiet = true
+		if mutant.traceLoadHits == nil then mutant.traceLoadHits = {} end
+		mutant.setTrace(true, mutant.traceLoadHits)
+	elseif batch ~= nil then
 		opts.quiet = true
 		mutant.set(nil)
 	elseif opts.mutant ~= nil then
@@ -494,7 +562,14 @@ local function enterMutant(opts: RunOptions): (boolean, () -> ())
 	return mutantRun,
 		function()
 			registry.state.options = outerOptions
-			if ownsMutant then mutant.set(outerMutant) end
+			if ownsMutant then
+				mutant.traceLoadHits = outerLoadHits
+				if outerSlotId < 0 then
+					mutant.setTrace(true, outerHits)
+				else
+					mutant.set(outerMutant)
+				end
+			end
 		end
 end
 
@@ -691,6 +766,23 @@ end
 
 local function runOrder(opts: RunOptions, mutantRun: boolean): { number }
 	local tests = registry.state.tests
+	if opts.mutant ~= nil and opts.mutantTests ~= nil then
+		local allowed = opts.mutantTests[opts.mutant]
+		if allowed ~= nil then
+			local order: { number } = {}
+			local seen: { [number]: boolean } = {}
+			for _, index in allowed do
+				if tests[index] ~= nil and not seen[index] then
+					seen[index] = true
+					table.insert(order, index)
+				end
+			end
+			for index = 1, #tests do
+				if not seen[index] then table.insert(order, index) end
+			end
+			return order
+		end
+	end
 	local order: { number } = {}
 	if opts.failFast and mutantRun then
 		local slow: { number } = {}
@@ -723,31 +815,78 @@ local function runBatch(batch: { number }, order: { number }, plan: { string }, 
 	local tests = registry.state.tests
 	local globals = registry.globalChain()
 	local runnable: { number } = {}
+	local runnableSet: { [number]: boolean } = {}
 	local chainByIndex: { [number]: { Hooks } } = {}
 	for _, index in order do
 		if plan[index] == "run" then
 			table.insert(runnable, index)
+			runnableSet[index] = true
 			chainByIndex[index] = registry.chainOf(tests[index], globals)
 		end
 	end
+	local mutantTests = opts.mutantTests
+	local hasUntraced = false
+	for _, id in batch do
+		if mutantTests == nil or mutantTests[id] == nil then
+			hasUntraced = true
+			break
+		end
+	end
+	local testMs: { [number]: number } = {}
+	local untracedSorted = false
 	local verdicts, lastKiller: number?, fastKillers: { number } = {}, nil, {}
 	local inFast: { [number]: boolean } = {}
 	results.total = 0
-	for _, id in batch do
+	for batchIdx, id in batch do
 		mutant.set(id)
-		local sequence = table.create(#runnable) :: { number }
-		if lastKiller ~= nil then table.insert(sequence, lastKiller) end
-		for _, index in fastKillers do
-			if index ~= lastKiller then table.insert(sequence, index) end
-		end
-		for _, index in runnable do
-			if index ~= lastKiller and not inFast[index] then table.insert(sequence, index) end
+		local allowed = if mutantTests ~= nil then mutantTests[id] else nil
+		local sequence: { number }
+		if allowed ~= nil then
+			local allowedSet: { [number]: boolean } = {}
+			for _, idx in allowed do
+				if runnableSet[idx] then allowedSet[idx] = true end
+			end
+			sequence = table.create(#allowed) :: { number }
+			local added: { [number]: boolean } = {}
+			if lastKiller ~= nil and allowedSet[lastKiller] then
+				table.insert(sequence, lastKiller)
+				added[lastKiller] = true
+			end
+			for _, idx in fastKillers do
+				if allowedSet[idx] and not added[idx] then
+					table.insert(sequence, idx)
+					added[idx] = true
+				end
+			end
+			for _, idx in allowed do
+				if allowedSet[idx] and not added[idx] then
+					table.insert(sequence, idx)
+					added[idx] = true
+				end
+			end
+		else
+			if hasUntraced and not untracedSorted and batchIdx > 1 and next(testMs) ~= nil then
+				table.sort(
+					runnable,
+					function(a: number, b: number): boolean return (testMs[a] or math.huge) < (testMs[b] or math.huge) end
+				)
+				untracedSorted = true
+			end
+			sequence = table.create(#runnable) :: { number }
+			if lastKiller ~= nil then table.insert(sequence, lastKiller) end
+			for _, index in fastKillers do
+				if index ~= lastKiller then table.insert(sequence, index) end
+			end
+			for _, index in runnable do
+				if index ~= lastKiller and not inFast[index] then table.insert(sequence, index) end
+			end
 		end
 		local killed = false
 		local leftovers = execute(sequence, nil, opts, false, function(outcome: Outcome): boolean
 			results.total += 1
 			if outcome.failure == nil then
 				results.passed += 1
+				testMs[outcome.index] = outcome.ms
 				return false
 			end
 			results.failed += 1
@@ -817,6 +956,9 @@ local function runSelection(
 					for _, taut in outcome.tautologies do
 						table.insert(results.tautologies, taut)
 					end
+				end
+				if opts.traceMutants == true and outcome.traceCsv ~= nil then
+					output.print(`[sert-trace] {outcome.index}|{outcome.ms}|{outcome.traceCsv}|{test.file}|{test.name}`)
 				end
 				if failure ~= nil then
 					for key, seed in next, outcome.inlineSeeds do
@@ -1159,6 +1301,18 @@ function runner.run(options: RunOptions?): Results
 
 	local shard, selected, matchesEntry = selector(opts)
 	local plan, properties, focusedRan = planTests(opts, selected, shard)
+	if opts.mutant ~= nil and opts.mutantTests ~= nil then
+		local allowed = opts.mutantTests[opts.mutant]
+		if allowed ~= nil then
+			local allowedSet: { [number]: boolean } = {}
+			for _, idx in allowed do
+				allowedSet[idx] = true
+			end
+			for idx = 1, #plan do
+				if plan[idx] == "run" and not allowedSet[idx] then plan[idx] = "out" end
+			end
+		end
+	end
 	if opts.list then
 		listTests(plan, results, emitMarker)
 		finish()
@@ -1258,17 +1412,9 @@ function runner.run(options: RunOptions?): Results
 	return results
 end
 
-local function idList(csv: string): { number }
-	local list: { number } = {}
-	for digits in string.gmatch(csv, "%d+") do
-		table.insert(list, tonumber(digits) :: number)
-	end
-	return list
-end
-
 local KNOWN_FLAGS = "--filter, --grep/-g, --exclude, --file, --seed, --replay, --runs, --budget, --test-timeout, "
 	.. "--repeat, --slowest, --exhaustive, --list, --markers, --quiet, --silent, --compact, --ci, --allow-focused, "
-	.. "--all, --no-sweep, -x/--fail-fast, --mutant, --mutants, --shard, --update-snapshots/-u, "
+	.. "--all, --no-sweep, -x/--fail-fast, --mutant, --mutants, --trace-mutants, --shard, --update-snapshots/-u, "
 	.. "--strict-assertions, --bench"
 
 local NUMERIC_FLAGS: { [string]: string } = {
@@ -1292,10 +1438,57 @@ local SWITCH_FLAGS: { [string]: string } = {
 	all = "allTargets",
 	["update-snapshots"] = "updateSnapshots",
 	["strict-assertions"] = "strictAssertions",
+	["trace-mutants"] = "traceMutants",
 	bench = "bench",
 }
 
 local function failCli(message: string): never error(`sert.parseCliArgs: {message}`, 0) end
+
+local function parseMutantItems(ids: string, flag: string, rawVal: string): ({ number }, { [number]: { number } }?)
+	if
+		ids == ""
+		or string.sub(ids, 1, 1) == ","
+		or string.sub(ids, -1) == ","
+		or string.find(ids, ",,", 1, true) ~= nil
+	then
+		failCli(`--{flag} expects {if flag == "mutant" then "a mutant id" else "mutant ids"}, got "{rawVal}"`)
+	end
+	local list: { number } = {}
+	local testsMap: { [number]: { number } }? = nil
+	local pos = 1
+	while pos <= #ids do
+		local comma = string.find(ids, ",", pos, true)
+		local item = if comma ~= nil then string.sub(ids, pos, comma - 1) else string.sub(ids, pos)
+		pos = if comma ~= nil then comma + 1 else #ids + 1
+		local idStr, tail = string.match(item, "^(%d+)(.*)$")
+		local idNum = if idStr ~= nil then tonumber(idStr) else nil
+		if idNum == nil or tail == nil then
+			failCli(`--{flag} expects {if flag == "mutant" then "a mutant id" else "mutant ids"}, got "{rawVal}"`)
+		end
+		table.insert(list, idNum :: number)
+		local tailStr = tail :: string
+		if tailStr ~= "" then
+			local idxBody = if string.sub(tailStr, 1, 1) == "@" then string.sub(tailStr, 2) else ""
+			if
+				idxBody == ""
+				or string.match(idxBody, "^[%d+]+$") == nil
+				or string.sub(idxBody, 1, 1) == "+"
+				or string.sub(idxBody, -1) == "+"
+				or string.find(idxBody, "++", 1, true) ~= nil
+			then
+				failCli(`--{flag} expects valid @idx+idx test indices, got "{rawVal}"`)
+			end
+			if testsMap == nil then testsMap = {} end
+			local idxs: { number } = {}
+			for digits in string.gmatch(idxBody, "%d+") do
+				table.insert(idxs, tonumber(digits) :: number)
+			end
+			(testsMap :: { [number]: { number } })[idNum :: number] = idxs
+		end
+	end
+	if flag == "mutant" and #list ~= 1 then failCli(`--{flag} expects a mutant id, got "{rawVal}"`) end
+	return list, testsMap
+end
 
 --- Parses CLI arguments (`...` or `{ ... }`) into `RunOptions`.
 function runner.parseCliArgs(...: any): RunOptions
@@ -1349,16 +1542,15 @@ function runner.parseCliArgs(...: any): RunOptions
 			failCli(`unknown flag {arg} (known: {KNOWN_FLAGS})`)
 		elseif flag == "mutant" or flag == "mutants" then
 			local val = takeValue()
-			local ids, rest = string.match(val, "^([%d,]+):(.*)$")
+			local ids, rest = string.match(val, "^([%d,@+]+):(.*)$")
 			ids = ids or val
-			if string.match(ids :: string, if flag == "mutant" then "^%d+$" else "^[%d,]+$") == nil then
-				failCli(`--{flag} expects {if flag == "mutant" then "a mutant id" else "mutant ids"}, got "{val}"`)
-			end
+			local list, testsMap = parseMutantItems(ids :: string, flag, val)
 			if flag == "mutant" then
-				opts.mutant = tonumber(ids)
+				opts.mutant = list[1]
 			else
-				opts.mutants = idList(ids :: string)
+				opts.mutants = list
 			end
+			if testsMap ~= nil then opts.mutantTests = testsMap end
 			if rest ~= nil and rest ~= "" then mutantFilter = rest end
 			opts.failFast = true
 		elseif flag == "fail-fast" then
@@ -1430,6 +1622,10 @@ function runner.parseCliArgs(...: any): RunOptions
 	if opts.mutant ~= nil then
 		mutant.parsed = { id = opts.mutant, outer = mutant.get() or 0 }
 		mutant.set(opts.mutant)
+	elseif opts.traceMutants == true then
+		local loadHits: { [number]: boolean } = {}
+		mutant.traceLoadHits = loadHits
+		mutant.setTrace(true, loadHits)
 	end
 	return opts :: any
 end

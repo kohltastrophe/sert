@@ -55,6 +55,8 @@ export type RunOptions = {
 	requireTests: boolean?,
 	mutant: number?,
 	mutants: { number }?,
+	mutantTests: { [number]: { number } }?,
+	traceMutants: boolean?,
 	updateSnapshots: boolean?,
 	strictAssertions: boolean?,
 	regressions: { [string]: { string } }?,
@@ -297,6 +299,7 @@ local mutant = {
 	_slot = mutantSlot,
 	installCallerGlobals = nil :: (() -> ())?,
 	parsed = nil :: { id: number, outer: number }?,
+	traceLoadHits = nil :: { [number]: boolean }?,
 }
 
 local function maybeInstallCallerGlobals()
@@ -313,7 +316,15 @@ end
 function mutant.set(id: number?)
 	local nextId = if id ~= nil and id > 0 then id else 0
 	mutantSlot.id = nextId
+	mutantSlot.hits = nil
 	rawset(SHARED_G, "__SERT_MUTANT", if nextId > 0 then nextId else nil)
+end
+
+function mutant.setTrace(active: boolean, hits: { [number]: boolean }?)
+	mutantSlot.id = if active then -1 else 0
+	local nextHits: { [number]: boolean }? = if active then hits else nil
+	mutantSlot.hits = nextHits
+	rawset(SHARED_G, "__SERT_MUTANT", nil)
 end
 
 function mutant.waitGuard()
@@ -543,6 +554,7 @@ local RUN_OPTIONS = {
 	"markers",
 	"mutant",
 	"mutants",
+	"mutantTests",
 	"names",
 	"quiet",
 	"raise",
@@ -562,6 +574,7 @@ local RUN_OPTIONS = {
 	"targets",
 	"testTimeout",
 	"timeout",
+	"traceMutants",
 	"updateSnapshots",
 }
 local VALID_TARGETS: { [string]: boolean } = { portable = true, roblox = true, server = true, client = true }
